@@ -25,9 +25,42 @@ limits apply cumulatively across the recursive tree and resumes. Conservative
 UTF-8 byte bounds reserve model input/output capacity; actual provider usage replaces
 reservations. Subscription output reservations are estimates: that backend has no
 server token cap. Unknown/interrupted usage is marked estimated. Root elapsed
-time includes waiting/downtime; summed session time can overlap.
+time includes waiting/downtime for autonomous/goal runs. Interactive roots use
+cumulative aggregate execution seconds, including descendants, instead of spending
+the budget while the human thinks or the conversation is detached and idle. Child
+execution times can overlap. An interrupted turn's recovery estimate remains conservative.
 
 ## Control
+
+`threadweave` and `threadweave chat` open a persistent interactive root, initially
+idle until the first message. `--workspace` defaults to cwd; `--config` overrides
+coding-config discovery. `--continue` selects the most recently updated root for
+that workspace; `--resume ID` opens a specific root and its original workspace and
+config. No IDs are needed for subsequent messages. A plain model reply yields to
+input; successful independent coding verification also yields without destroying
+the session. Tool-only responses continue the existing runtime loop.
+
+Chat uses user data storage outside the repository by default (XDG_DATA_HOME or
+~/.local/share/threadweave); existing workspace-local .threadweave stores are reused.
+Explicit --data always wins. Administrative commands retain their legacy default
+of cwd/.threadweave, so specify the chat's data directory when scripting controls.
+Input history is stored there with mode 0600, alongside private runtime data.
+
+Live model text appears incrementally in a bounded prompt toolbar; final Markdown
+and bounded tool results enter scrollback. prompt_toolkit handles redraw, editing,
+history and multiline paste. Alt-Enter/Ctrl-J adds a newline; Enter submits.
+Ctrl-C pauses the current session's turn, not its children; use /tree to inspect them.
+At an idle prompt Ctrl-C clears input. /exit and Ctrl-D on empty input detach.
+Typing while busy queues a durable intervention for the next safe turn boundary.
+Partial external actions are not assumed rolled back after cancellation.
+
+Slash controls: /help, /status, /usage, /tree, /diff, /history, /experiments,
+/compact, /pause, /resume, /new, /exit. Diff and manual compaction require the
+session to be idle/paused. /new retains prior sessions and does not stop their work.
+--json gives debug events; --verbose adds low-level event/artifact details.
+Clients reconnect to an already restarted daemon without changing session identity.
+On a daemon upgrade, stop the old daemon explicitly and reopen chat; no automatic
+daemon shutdown is performed while another client may be using it.
 
 Commands: run, attach, list, status, tree, history, usage, diff, experiments, verify,
 input, pause, resume, stop, fork, doctor. Additional controls: config, states, refine,

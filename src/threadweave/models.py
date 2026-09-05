@@ -286,7 +286,7 @@ class Session(Record):
     kernel_id: str
     lifecycle: Lifecycle = Lifecycle.ADMITTED
     outcome: Outcome = Outcome.ACTIVE
-    mode: Literal["autonomous", "goal", "heartbeat"] = "autonomous"
+    mode: Literal["autonomous", "goal", "heartbeat", "interactive"] = "autonomous"
     runnable: bool = True
     paused: bool = False
     turns: int = 0

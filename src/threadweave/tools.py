@@ -280,7 +280,7 @@ def builtins() -> ToolRegistry:
         ][:1000]
 
     async def artifact_read(c, a):
-        return c.runtime.artifacts.read(c.session_id, **a.model_dump())
+        return c.runtime.artifacts.read(c.session_id, a.artifact_id, offset=a.offset, limit=a.limit)
 
     async def artifact_load(c, a):
         return c.runtime.artifacts.load(c.session_id, a.artifact_id)

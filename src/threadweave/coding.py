@@ -100,7 +100,7 @@ class CodingTask:
             kind: getattr(task, field) or metadata["suggested_commands"].get(kind, [])
             for kind, field in KINDS.items()
         }
-        if task.require_tests and not commands["test"]:
+        if task.require_tests and not commands["test"] and context.session.mode != "interactive":
             raise ValueError("Coding tasks require test commands: configure task.test_commands")
         if any(commands.values()) and "process" not in store.config(context.session_id).permissions:
             raise PermissionError("Coding baseline/verification requires process permission")
@@ -152,6 +152,8 @@ class CodingTask:
         original = baseline(context)
         git = GitWorkspace(context)
         violations, results, regressions = [], {}, []
+        if task.require_tests and not original["commands"]["test"]:
+            violations.append("No test commands configured; coding completion cannot be verified")
         patch = git.diff(original["checkpoint_id"])
         if task.require_change and not patch.strip():
             violations.append("A nonempty change is required")

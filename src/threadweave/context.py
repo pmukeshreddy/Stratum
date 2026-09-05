@@ -89,6 +89,23 @@ class Context:
             {"role": "system", "content": FOUNDATION},
             {"role": "user", "content": "Session: " + encode(metadata) + "\nTask: " + task},
         ]
+        if session.mode == "interactive":
+            messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": (
+                        "This is an interactive conversation in the SAME persistent session. Follow the "
+                        "latest human messages. For questions, inspection, or a progress report, a text "
+                        "reply without tool calls yields to the human; it does not claim verified task "
+                        "completion. After tools, continue until you can answer or need user input. "
+                        "For an implemented coding change, call finish to request independent verification. "
+                        "Do not claim a fix is verified without passing that gate. A successful finish "
+                        "returns to the human without destroying the conversation. Do not edit merely "
+                        "to satisfy require_change when the user only asked a question."
+                    ),
+                },
+            )
         supplemental = self.supplemental(sid)
         if supplemental:
             messages.append(

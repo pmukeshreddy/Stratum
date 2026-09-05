@@ -56,6 +56,46 @@ def bounded_session(session):
     return result
 
 
+def chat_payload(kind, payload):
+    """Human event projections keep display fields when full payloads are huge.
+
+    Only the socket response is projected; append-only events/artifacts are unchanged.
+    """
+    purpose = payload.get("purpose") or payload.get("metadata", {}).get("purpose", "agent")
+    if kind in {"model_response", "model_stream"} and purpose != "agent":
+        return {"text": "", "purpose": purpose}
+    if kind == "model_response":
+        return {
+            "text": payload.get("text", "")[:32000],
+            "purpose": payload.get("metadata", {}).get("purpose", "agent"),
+        }
+    if kind == "coding_command":
+        return {k: payload.get(k) for k in ("passed", "exit_code", "duration", "kind")} | {
+            "stdout": payload.get("stdout", "")[-2400:],
+            "failures": payload.get("failures", [])[:3],
+        }
+    if kind == "tool_call":
+        return {
+            "name": payload["name"],
+            "action_id": payload["action_id"],
+            "arguments": {
+                k: str(v)[:4000] if k == "patch" else str(v)[:400]
+                for k, v in payload.get("arguments", {}).items()
+            },
+        }
+    if kind == "tool_result":
+        result = payload.get("result", {})
+        return {
+            "action_id": payload["action_id"],
+            "result": {
+                "artifact_id": result.get("artifact_id"),
+                "error": result.get("error"),
+            },
+        }
+    raw = json.dumps(payload, ensure_ascii=False)
+    return payload if len(raw) < 4000 else {"preview": raw[:4000], "truncated": True}
+
+
 class Daemon:
     def __init__(self, directory: Path, *, concurrency=8, idle_seconds=60):
         self.directory = directory.resolve()
@@ -74,7 +114,12 @@ class Daemon:
     async def dispatch(self, method, args):
         runtime, store = self.runtime, self.runtime.store
         if method == "ping":
-            return {"pid": os.getpid(), "data": str(self.directory), "schema_version": 2}
+            return {
+                "pid": os.getpid(),
+                "data": str(self.directory),
+                "schema_version": 2,
+                "capabilities": ["interactive_chat"],
+            }
         if method == "create":
             config = RunConfig.model_validate(args.pop("config", {}))
             return bounded_session(runtime.create(config=config, **args))
@@ -92,13 +137,19 @@ class Daemon:
                 "usage": store.usage(sid).model_dump(),
                 "tree_usage": store.usage(sid, tree=True).model_dump(),
                 "elapsed_seconds": runtime._elapsed(store.session(sid).root_id),
+                "environment_prepared": bool(
+                    store.events(sid, kind="environment_prepared", limit=1)
+                ),
             }
         if method == "config":
             return store.config(args["session_id"]).model_dump(mode="json")
-        if method == "history":
+        if method in {"history", "chat_events"}:
             sid = args.pop("session_id")
             rows = store.events(sid, **args)
             for row in rows:
+                if method == "chat_events":
+                    row["payload"] = chat_payload(row["type"], row["payload"])
+                    continue
                 raw = json.dumps(row["payload"], ensure_ascii=False)
                 if len(raw) > 4000:
                     row["payload"] = {
@@ -109,6 +160,41 @@ class Daemon:
             return rows
         if method == "input":
             return {"message_id": runtime.message(None, args["session_id"], args["body"])}
+        if method == "chat_input":
+            return {"message_id": runtime.interact(args["session_id"], args["body"])}
+        if method == "chat_open":
+            sid = args["session_id"]
+            session = store.session(sid)
+            if session.parent_id:
+                raise ValueError("Interactive chat requires a root session")
+            if args.get("accept_current_baseline"):
+                if sid in runtime.tasks or store.events(sid, kind="environment_prepared", limit=1):
+                    raise ValueError(
+                        "Cannot change the baseline policy of a prepared/running session"
+                    )
+                config = store.config(sid).model_copy(deep=True)
+                config.task.require_clean_baseline = False
+                body = json.dumps(config.model_dump(mode="json"), sort_keys=True)
+                config_id = hashlib.sha256(body.encode()).hexdigest()
+                with store.transaction():
+                    store.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (config_id, body))
+                    store.update(sid, config_id=config_id)
+                    store.event(
+                        sid,
+                        "dirty_baseline_consent",
+                        {
+                            "previous_config": session.config_id,
+                            "config_id": config_id,
+                            "scope": "unprepared_session",
+                        },
+                    )
+            if session.mode != "interactive":
+                store.update(sid, mode="interactive")
+                store.event(sid, "interactive_attached", {"previous_mode": session.mode})
+            return bounded_session(store.session(sid))
+        if method == "chat_detach":
+            store.event(args["session_id"], "client_detached", {"client": "chat"})
+            return {"detached": True}
         if method == "resume":
             runtime.resume(args["session_id"])
             return {"resumed": args["session_id"]}

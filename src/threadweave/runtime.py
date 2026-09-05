@@ -166,6 +166,8 @@ class Runtime(MemoryServices):
                     "workspace": str(path),
                 },
             )
+            if mode == "interactive":
+                session = self.store.transition(session.id, Lifecycle.IDLE, runnable=False)
         self._wake.set()
         return session
 
@@ -314,6 +316,19 @@ class Runtime(MemoryServices):
 
         return self.store.receive(sid, render, limit=20)
 
+    def interact(self, sid, body):
+        """Atomic human input + continuation; no client-side input/resume race."""
+        if not body.strip():
+            raise ValueError("Message cannot be empty")
+        session = self.store.session(sid)
+        if session.outcome == Outcome.LIMITED:
+            raise ValueError("Session resource limit reached; use /new or fork a new run")
+        with self.store.transaction():
+            mid = self.message(None, sid, body)
+            if session.paused or session.outcome != Outcome.ACTIVE:
+                self.resume(sid)
+        return mid
+
     def defer(self, sid, seconds):
         session = self.store.session(sid)
         if self.store.messages(sid, pending=True, limit=1) and not session.paused:
@@ -413,6 +428,13 @@ class Runtime(MemoryServices):
 
     def _elapsed(self, root_id):
         root = self.store.session(root_id)
+        if root.mode == "interactive":
+            # Human think time / detached idle time is not execution. Count aggregate
+            # descendant execution seconds conservatively, without resetting budgets.
+            sessions = self.store.sessions(root_id=root_id)
+            return self.store.usage(root_id, tree=True).wall_seconds + sum(
+                max(0, now() - s.running_since) for s in sessions if s.running_since
+            )
         return max(0, now() - root.started_at) if root.started_at else 0
 
     def _check_limits(self, sid: str, *, resource: str | None = None, input_bound=0, provider=None):
@@ -661,7 +683,11 @@ class Runtime(MemoryServices):
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 response, response_event = await self._invoke(sid)
-                if not response.actions and config.task.adapter == "coding":
+                if (
+                    not response.actions
+                    and config.task.adapter == "coding"
+                    and self.store.session(sid).mode != "interactive"
+                ):
                     from .guardrails import observe
 
                     if observe(self, sid, "model_no_actions", {}):
@@ -753,7 +779,21 @@ class Runtime(MemoryServices):
                     self.defer(sid, 0.2)
                 elif explicit_ok or verifier_ok:
                     self.store.apply_refinements(sid)
-                    self.store.finish(sid, Outcome.COMPLETED, completion or "Task verifier passed")
+                    if self.store.session(sid).mode == "interactive":
+                        self.store.update(sid, result=completion or "Task verifier passed")
+                        self.store.event(
+                            sid,
+                            "conversation_completed",
+                            {
+                                "result": completion or "Task verifier passed",
+                                "verified": True,
+                            },
+                        )
+                        self.store.update(sid, runnable=False, wake_at=None)
+                    else:
+                        self.store.finish(
+                            sid, Outcome.COMPLETED, completion or "Task verifier passed"
+                        )
                     if self.store.session(sid).parent_id:
                         self.message(
                             sid,
@@ -763,6 +803,14 @@ class Runtime(MemoryServices):
                 current = self.store.session(sid)
                 self.store.update(sid, pending_turn=None, turns=current.turns + 1)
                 self.store.event(sid, "turn_completed", {"turn": current.turns})
+                if current.mode == "interactive":
+                    if not response.actions:
+                        self.store.update(sid, runnable=False, wake_at=None)
+                        self.store.event(sid, "conversation_reply", {"verified": False})
+                    # Interventions arriving during a response or verifier must not
+                    # be stranded by that response's conversational stop boundary.
+                    if self.store.messages(sid, pending=True, limit=1) and not current.paused:
+                        self.store.update(sid, runnable=True, wake_at=None)
                 if current.mode == "heartbeat" and current.outcome == Outcome.ACTIVE:
                     pending_input = bool(self.store.messages(sid, pending=True, limit=1))
                     self.store.update(sid, runnable=pending_input and not current.paused)
@@ -900,6 +948,7 @@ class Runtime(MemoryServices):
                                 "turn": session.turns,
                                 "provider": provider.name,
                                 "model": provider.model,
+                                "purpose": request.metadata.get("purpose", "agent"),
                             },
                         )
                         cost = (
@@ -915,12 +964,23 @@ class Runtime(MemoryServices):
                 except BudgetBusy:
                     await asyncio.sleep(0.05)
             buffer = []
+            last_flush = 0.0
 
             async def emit(delta, buffer=buffer, eid=eid):
+                nonlocal last_flush
                 buffer.append(delta)
-                if sum(map(len, buffer)) >= 512:
-                    self.store.event(sid, "model_stream", {"text": "".join(buffer)}, parent=eid)
+                if sum(map(len, buffer)) >= 512 or now() - last_flush >= 0.1:
+                    self.store.event(
+                        sid,
+                        "model_stream",
+                        {
+                            "text": "".join(buffer),
+                            "purpose": request.metadata.get("purpose", "agent"),
+                        },
+                        parent=eid,
+                    )
                     buffer.clear()
+                    last_flush = now()
 
             try:
                 async with asyncio.timeout(
@@ -935,7 +995,17 @@ class Runtime(MemoryServices):
                 ):
                     response = await self.providers[provider.name].invoke(request, emit)
                 if buffer:
-                    self.store.event(sid, "model_stream", {"text": "".join(buffer)}, parent=eid)
+                    self.store.event(
+                        sid,
+                        "model_stream",
+                        {
+                            "text": "".join(buffer),
+                            "purpose": request.metadata.get("purpose", "agent"),
+                        },
+                        parent=eid,
+                    )
+                if not persist_turn:
+                    response.metadata["purpose"] = request.metadata.get("purpose", "auxiliary")
                 if not response.usage_reported:
                     response.usage.estimated_calls += 1
                 with self.store.transaction():

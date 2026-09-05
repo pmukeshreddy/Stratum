@@ -87,6 +87,19 @@ async def test_artifact_retention_explicit_selection_and_tree_permissions(runtim
     assert runtime.artifacts.load(branch.id, exposed["artifact_id"]) == value
 
 
+async def test_model_artifact_read_tool_maps_public_id_to_storage(runtime, tmp_path):
+    root = runtime.create("Inspect retained output", tmp_path)
+    artifact = runtime.artifacts.put_bytes(root.id, b"abcdefgh", "text/plain")
+    event = runtime.store.event(root.id, "test", {})
+    result = await runtime.tools.call(
+        ToolContext(runtime, root.id, "action", event),
+        "artifact_read",
+        {"artifact_id": artifact, "offset": 2, "limit": 3},
+    )
+    assert result["text"] == "cde"
+    assert result["next_offset"] == 5
+
+
 async def test_pause_keeps_messages_queued_until_resume(runtime, tmp_path, config):
     runtime.providers["mock"] = ScriptedProvider(
         {"root": [response("agent_wait", seconds=300), response("finish", result="Resumed")]}

@@ -20,17 +20,55 @@ uv run threadweave auth login
 # Once per client revision: requires git and Rust/cargo, downloads/builds official libraries.
 uv run threadweave auth install-client
 
-uv run threadweave --data /absolute/path/to/agent-state doctor --config configs/coding.json
-uv run threadweave --data /absolute/path/to/agent-state run \
-  "Fix the failing parser tests without weakening the tests." \
-  --workspace /absolute/path/to/repository \
-  --config configs/coding.json --attach
+uv run threadweave doctor --config configs/coding.json
+uv run threadweave
+# Or open another repository:
+uv run threadweave --workspace /absolute/path/to/repository
 ```
+
+This opens one interactive conversation backed by the Threadweave daemon. Keep
+typing in the same terminal; you do not need session IDs or separate input/attach
+commands. `threadweave chat` is an alias for the default experience.
+
+```text
+> inspect this repository
+> now inspect the agent loop
+> fix that issue and verify it
+> /diff
+> /usage
+> /exit
+```
+
+Use `uv run threadweave --continue` to return to the most recent conversation for
+the current workspace, or `--resume SESSION_ID` to choose one. `/help` lists
+`/status`, `/usage`, `/tree`, `/diff`, `/history`, `/experiments`, `/compact`,
+`/pause`, `/resume`, `/new`, and `/exit`. New sessions use `configs/coding.json`
+from the workspace, then the current directory when available; `--config PATH`
+overrides discovery. Otherwise a subscription-backed coding configuration is used.
+Resumed sessions keep their persisted config and cumulative budgets.
+
+Enter sends; Alt-Enter or Ctrl-J inserts a newline. Arrow keys recall input history,
+and multiline paste is supported. Model text streams into a bounded live area below
+the input, then moves into scrollback as Markdown. Tool activity and child labels
+appear above the prompt. Input stays usable during work: messages are queued at the
+next safe turn boundary. Ctrl-C interrupts the current session's work without losing
+state; at an idle prompt it clears input. `/exit` or Ctrl-D on empty input detaches
+without killing background work. `--json` exposes debug events, `--verbose` adds
+event/artifact details. Non-TTY stdin accepts line-delimited input and EOF detaches.
+
+Chat stores new state outside the repository under
+`${XDG_DATA_HOME:-~/.local/share}/threadweave`, unless `--data` is supplied or the
+workspace already has a legacy `.threadweave/history.sqlite3`. A dirty repository
+prompts to continue with current files as baseline, show status, or exit; it never
+automatically commits or stashes. Conversations can inspect repositories with no
+configured tests, but coding completion still fails a required-tests verification
+gate until tests are configured. Ordinary conversation replies are **not** claims
+of verified coding completion; implemented fixes should use the `finish` tool.
 
 [configs/coding.json](configs/coding.json) and [configs/kernel.json](configs/kernel.json)
 use `codex_subscription`. No `OPENAI_API_KEY` is needed. `auth models` lists the
 account's current model catalog. Omit `provider.model` to use Codex's configured/default
-model, or select one explicitly with `--model`. Model and reasoning settings are
+model, or set `provider.model` in the config (`run` also accepts `--model`). Model and reasoning settings are
 resolved and stored before CLI run admission. `provider.parameters.reasoning_effort`
 can override the Codex setting. There is no automatic API-billing fallback.
 
@@ -95,8 +133,8 @@ host REPL workers are not sandboxed by the command executor.
 
 ## Persistent sessions and isolated coding children
 
-The detached daemon owns sessions independently of clients. Ctrl-C detaches without
-cancelling work. SQLite preserves session IDs, recursive relationships, messages,
+The detached daemon owns sessions independently of clients. `/exit` detaches; Ctrl-C
+in chat interrupts the current turn. SQLite preserves session IDs, recursive relationships, messages,
 action journals, goals, contexts, accounting and versioned state.
 
 Python variables persist across turns. Supported codecs and explicit reconstruction
@@ -108,6 +146,8 @@ Coding children receive private Git copies of the parent's captured working stat
 including uncommitted inputs. Parents explicitly inspect/apply candidate patches;
 nothing merges automatically. Child usage, findings, verification, patch production,
 consumption and acceptance are recorded.
+
+Administrative/automation commands remain available (use chat for normal conversations):
 
 ```sh
 uv run threadweave --data /absolute/path/to/agent-state list

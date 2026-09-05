@@ -66,8 +66,12 @@ async def attach(directory, sid, *, follow=True, after=0):
 
 
 async def execute(args):
-    directory = args.data.resolve()
-    command = args.command
+    command = args.command or "chat"
+    if command == "chat":
+        from .chat import chat
+
+        return await chat(args)
+    directory = (args.data or Path.cwd() / ".threadweave").resolve()
     if command == "auth":
         from .codex_auth import CodexControl
         from .native_client import client_path, install_client
@@ -288,9 +292,13 @@ async def resolved_config(config):
 def parser():
     p = argparse.ArgumentParser(description="Persistent coding agents for real repositories")
     p.add_argument(
-        "--data", type=Path, default=Path.cwd() / ".threadweave", help="Durable data directory"
+        "--data", type=Path, help="Durable data directory (chat defaults to user data storage)"
     )
-    sub = p.add_subparsers(dest="command", required=True)
+    chat_arguments(p)
+    sub = p.add_subparsers(dest="command")
+    interactive = sub.add_parser("chat", help="Talk continuously in one persistent coding session")
+    chat_arguments(interactive, suppress=True)
+    interactive.add_argument("--data", type=Path, default=argparse.SUPPRESS)
     auth = sub.add_parser(
         "auth", help="Manage the shared official Codex ChatGPT login; logout also signs Codex out"
     )
@@ -383,6 +391,29 @@ def parser():
     analysis = sub.add_parser("analyze", help="Aggregate measured evaluation results")
     analysis.add_argument("results", type=Path)
     return p
+
+
+def chat_arguments(parser, *, suppress=False):
+    default = argparse.SUPPRESS if suppress else None
+    parser.add_argument("--workspace", type=Path, default=default, help="Repository (default: cwd)")
+    parser.add_argument("--config", type=Path, default=default, help="Run config (auto-discovered)")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--resume", dest="resume_id", default=default, help="Reopen a root session"
+    )
+    selection.add_argument(
+        "--continue",
+        dest="continue_recent",
+        action="store_true",
+        default=default,
+        help="Reopen the most recent root in this workspace",
+    )
+    parser.add_argument(
+        "--json", action="store_true", default=default, help="Emit JSON debug events"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", default=default, help="Show extra activity"
+    )
 
 
 def main():
