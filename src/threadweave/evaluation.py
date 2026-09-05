@@ -323,7 +323,6 @@ def analyze(path):
     totals = {
         key: sum(r.get("metrics", {}).get(key, 0) or 0 for r in rows)
         for key in (
-            "cost",
             "turns",
             "tool_calls",
             "subagent_count",
@@ -340,12 +339,14 @@ def analyze(path):
             "reverted_edits",
         )
     }
+    costs = [r.get("metrics", {}).get("cost") for r in rows]
+    totals["cost"] = None if any(cost is None for cost in costs) else sum(costs)
     return {
         "runs": len(rows),
         "solved": solved,
         "success_rate": solved / len(rows) if rows else None,
         "cost_per_solved": totals["cost"] / solved
-        if solved and all(r.get("metrics", {}).get("cost") is not None for r in rows)
+        if solved and totals["cost"] is not None
         else None,
         "turns_per_solved": totals["turns"] / solved if solved else None,
         "tool_calls_per_solved": totals["tool_calls"] / solved if solved else None,

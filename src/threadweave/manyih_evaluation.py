@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -19,7 +21,7 @@ from pathlib import Path
 from .cli import resolved_config
 from .configuration import load_config
 from .evaluation import metrics as trajectory_metrics
-from .models import TaskConfig
+from .models import TaskConfig, Usage
 from .runtime import Runtime
 
 HARNESS_ROOT = Path(__file__).resolve().parents[2]
@@ -62,7 +64,8 @@ async def official(source, python, operation, payload):
         )
     except BaseException:
         if process.returncode is None:
-            process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             await process.wait()
         raise
     if process.returncode:
@@ -102,6 +105,8 @@ async def evaluate_manyih(source, python, config, output, *, start=0, limit=2):
     config.limits.max_subagents = 0
     # Automatic refinement is disabled in this fixed smoke configuration, not reported as an ablation.
     config.refinement.enabled = False
+    if output.exists() and any(output.iterdir()):
+        raise ValueError("Output is not empty; use a new directory to preserve prior trajectories")
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     provenance = {
         "benchmark": "ManyIH Coding",
@@ -183,6 +188,7 @@ async def evaluate_manyih(source, python, config, output, *, start=0, limit=2):
             await runtime.start()
             finished = await runtime.wait(session.id, timeout=config.limits.wall_seconds + 15)
             # Exactly one independent official judgment after the agent has stopped.
+            runtime.store.charge(session.id, Usage(verifier_calls=1))
             grade = await official(
                 source,
                 python,

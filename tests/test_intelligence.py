@@ -288,3 +288,43 @@ async def test_explicit_refinement_request_runs_at_boundary_without_periodic_pol
         )
     finally:
         await runtime.shutdown()
+
+
+@pytest.mark.parametrize("unknown", [{"metrics": {"cost": None}}, {"metrics": {}}, {}])
+@pytest.mark.parametrize("known", [[], [{"solved": True, "metrics": {"cost": 3}}]])
+@pytest.mark.parametrize("solved", [False, True])
+def test_analyze_unknown_cost(tmp_path, unknown, known, solved):
+    path = tmp_path / "results.jsonl"
+    rows = known + [{"solved": solved, **unknown}]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    summary = analyze(path)
+    assert summary["totals"]["cost"] is None
+    assert summary["cost_per_solved"] is None
+    assert summary["runs"] == len(rows)
+    assert summary["solved"] == sum(row["solved"] for row in rows)
+
+
+@pytest.mark.parametrize("costs", [[0, 0, 0], [1.5, 2.5, 4]])
+@pytest.mark.parametrize("solved", [False, True])
+def test_analyze_known_costs(tmp_path, costs, solved):
+    path = tmp_path / "results.jsonl"
+    rows = [
+        {"solved": solved and i < 2, "metrics": {"cost": cost, "turns": 2}}
+        for i, cost in enumerate(costs)
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    summary = analyze(path)
+    assert summary["totals"]["cost"] == sum(costs)
+    assert summary["cost_per_solved"] == (sum(costs) / 2 if solved else None)
+    assert summary["totals"]["turns"] == 6
+
+
+@pytest.mark.parametrize("content", ["", "\n  \n"])
+def test_analyze_empty_file(tmp_path, content):
+    path = tmp_path / "results.jsonl"
+    path.write_text(content)
+    summary = analyze(path)
+    assert summary["runs"] == summary["solved"] == 0
+    assert summary["success_rate"] is None
+    assert summary["cost_per_solved"] is None
+    assert all(total == 0 for total in summary["totals"].values())

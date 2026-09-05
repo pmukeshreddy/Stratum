@@ -202,7 +202,8 @@ mod tests {
                         http::header::AUTHORIZATION,
                         http::HeaderValue::from_static("Bearer SECRET"),
                     )]
-                    .into(),
+                    .into_iter()
+                    .collect(),
                 ),
                 body: Some("SECRET".into()),
             }));

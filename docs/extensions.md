@@ -28,17 +28,25 @@ providers exist only in tests.
 from threadweave.models import Record
 from threadweave.tools import Tool
 
+
 class InspectArgs(Record):
     path: str
+
 
 async def inspect(context, args):
     return {"bytes": context.path(args.path).stat().st_size}
 
+
 def install(runtime):
-    runtime.tools.register(Tool(
-        "inspect_size", "Inspect a permitted file.",
-        InspectArgs, inspect, permissions=("workspace.read",),
-    ))
+    runtime.tools.register(
+        Tool(
+            "inspect_size",
+            "Inspect a permitted file.",
+            InspectArgs,
+            inspect,
+            permissions=("workspace.read",),
+        )
+    )
 ```
 
 Return JSON-compatible structured results. Full results become artifacts; model
