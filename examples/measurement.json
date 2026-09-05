@@ -1,0 +1,12 @@
+{
+  "provider": {"name": "chat", "model": "REPLACE_WITH_YOUR_MODEL_ID"},
+  "extensions": ["examples.extension:install"],
+  "task": {
+    "adapter": "measurement",
+    "specification": {"instruction": "Produce measurement.json with the measured error."},
+    "verifier": "measurement",
+    "verifier_options": {"maximum_error": 0.01},
+    "success_metrics": {"error": "lower is better"},
+    "require_verifier": true
+  }
+}

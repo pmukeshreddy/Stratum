@@ -1,0 +1,11 @@
+{
+  "provider": {"name": "demo", "model": "offline-demo", "streaming": false},
+  "task": {
+    "adapter": "workspace",
+    "verifier": "file",
+    "verifier_options": {"path": "answer.txt", "equals": "499500"},
+    "verify_each_turn": false,
+    "require_verifier": true
+  },
+  "limits": {"max_turns": 30, "wall_seconds": 120, "concurrency": 4}
+}
