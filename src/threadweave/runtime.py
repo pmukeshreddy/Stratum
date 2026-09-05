@@ -109,7 +109,9 @@ class Runtime(MemoryServices):
         for provider in providers:
             if provider.name not in self.providers:
                 raise ValueError(f"Unknown provider: {provider.name}; configure a real provider")
-            if not provider.model.strip() or provider.model.startswith("REPLACE_"):
+            if (
+                not provider.model.strip() and provider.name != "codex_subscription"
+            ) or provider.model.startswith("REPLACE_"):
                 raise ValueError(
                     "Explicit provider.model is required; pass --config with a real model ID"
                 )
@@ -866,6 +868,21 @@ class Runtime(MemoryServices):
         config = self.store.config(sid)
         session = self.store.session(sid)
         size, provider = request.input_token_bound, request.config
+        if provider.name == "codex_subscription":
+            previous = provider
+            provider, _ = await self.providers[provider.name].resolve(provider)
+            self.store.pin_provider(sid, previous, provider)
+            request = request.model_copy(update={"config": provider})
+            self.store.event(
+                sid,
+                "subscription_model_selected",
+                {
+                    "model": provider.model,
+                    "parameters": provider.parameters,
+                    "billing": "subscription",
+                    "output_limit_enforcement": "client_observed_bytes; server token cap unavailable",
+                },
+            )
         for attempt in range(config.retry.attempts):
             while True:
                 try:

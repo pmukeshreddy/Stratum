@@ -181,4 +181,6 @@ class ChatProvider:
 
 
 def default_providers() -> dict[str, Provider]:
-    return {"chat": ChatProvider()}
+    from .subscription import SubscriptionProvider
+
+    return {"codex_subscription": SubscriptionProvider(), "chat": ChatProvider()}

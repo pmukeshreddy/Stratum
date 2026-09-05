@@ -52,16 +52,38 @@ class HarnessError(Exception):
 
 
 class ProviderConfig(Record):
-    name: str = "chat"
+    name: str = "codex_subscription"
     model: str = ""
-    base_url: str = "https://api.openai.com/v1"
-    api_key_env: str = "OPENAI_API_KEY"
+    base_url: str = ""
+    api_key_env: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
     streaming: bool = True
     timeout_seconds: float = Field(default=120, gt=0)
     max_output_tokens: int = Field(default=2048, gt=0)
     input_cost_per_million: float | None = Field(default=None, ge=0)
     output_cost_per_million: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def optional_api_defaults(cls, value):
+        if isinstance(value, dict) and value.get("name") == "chat":
+            value = dict(value)
+            value.setdefault("api_key_env", "OPENAI_API_KEY")
+            value.setdefault("base_url", "https://api.openai.com/v1")
+        return value
+
+    @model_validator(mode="after")
+    def subscription_auth_only(self):
+        if self.name == "codex_subscription" and (
+            self.api_key_env
+            or self.base_url
+            or self.input_cost_per_million is not None
+            or self.output_cost_per_million is not None
+        ):
+            raise ValueError(
+                "codex_subscription uses managed ChatGPT auth, a fixed subscription endpoint, and no API prices"
+            )
+        return self
 
 
 class ContextPolicy(Record):
@@ -284,6 +306,8 @@ class Session(Record):
 class Usage(Record):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int = Field(default=0, ge=0)
+    reasoning_output_tokens: int = Field(default=0, ge=0)
     model_calls: int = Field(default=0, ge=0)
     tool_calls: int = Field(default=0, ge=0)
     python_executions: int = Field(default=0, ge=0)
@@ -292,7 +316,7 @@ class Usage(Record):
     verifier_calls: int = Field(default=0, ge=0)
     subagent_count: int = Field(default=0, ge=0)
     turns: int = Field(default=0, ge=0)
-    cost: float = Field(default=0, ge=0)
+    cost: float | None = Field(default=0, ge=0)
     estimated_calls: int = Field(default=0, ge=0)
 
 
@@ -321,6 +345,7 @@ class ModelResponse(Record):
     usage: Usage = Field(default_factory=Usage)
     usage_reported: bool = True
     provider_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Verification(Record):

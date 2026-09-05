@@ -16,7 +16,9 @@ malformed responses; never include credentials/headers in errors. The runtime ow
 timeouts, retries, reservations and accounting for normal and auxiliary calls.
 Unknown usage must be marked usage_reported=false with conservative bounds.
 
-The built-in chat provider handles streamed tool fragments, usage, nonstreamed
+The default codex_subscription provider uses official Codex client/auth libraries
+for individual model requests, without a Codex agent loop. See [transport](subscription.md).
+The optional chat provider handles streamed tool fragments, usage, nonstreamed
 responses, environment credentials and compatible base URLs. Deterministic response
 providers exist only in tests.
 

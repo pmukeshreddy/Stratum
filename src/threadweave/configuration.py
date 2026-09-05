@@ -27,17 +27,20 @@ def load_config(path, model_override=None):
             provider["model"] = os.environ[name]
     config = RunConfig.model_validate(raw)
     selected = config.models[config.routing.default] if config.routing.default else config.provider
-    if not selected.model or selected.model.startswith("REPLACE_"):
+    if (not selected.model and selected.name != "codex_subscription") or selected.model.startswith(
+        "REPLACE_"
+    ):
         raise ValueError("Configure provider.model or an explicit routing.default model")
     return config
 
 
-def doctor(directory, config=None):
+def doctor(directory, config=None, *, subscription_status=None):
     directory = Path(directory).resolve()
     capabilities = {
         name: shutil.which(name)
         for name in (
             "git",
+            "codex",
             "rg",
             "docker",
             "podman",
@@ -61,6 +64,20 @@ def doctor(directory, config=None):
     if config:
         for provider in [config.provider, *config.models.values()]:
             if not provider.model and config.routing.default:
+                continue
+            if provider.name == "codex_subscription":
+                status = subscription_status or {
+                    "usable": False,
+                    "issue": "Run the CLI doctor for live Codex account checks",
+                }
+                providers.append({"provider": provider.name, **status})
+                if not status.get("usable"):
+                    issues.append(
+                        status.get(
+                            "issue",
+                            "Codex subscription provider is unavailable; run threadweave auth status",
+                        )
+                    )
                 continue
             credential = not provider.api_key_env or bool(os.environ.get(provider.api_key_env))
             providers.append(

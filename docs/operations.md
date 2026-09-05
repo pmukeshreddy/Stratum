@@ -2,10 +2,12 @@
 
 ## Configuration and budgets
 
-configs/coding.json requires an explicit provider.model or THREADWEAVE_MODEL.
-Provider configuration supports a compatible base URL, credential-variable name,
-parameters, streaming, timeout, output limit and optional prices. Missing models,
-unknown providers and missing credentials fail clearly.
+configs/coding.json uses the existing ChatGPT/Codex subscription. An omitted model
+uses Codex's configured/default model, resolved from the live catalog. Run auth status
+and auth install-client before first use. See [subscription details](subscription.md).
+The optional chat provider accepts explicit API model/base URL/credential-variable
+configuration. Unknown providers, unavailable models and missing authentication fail
+without a fake-provider or API-billing fallback.
 
 Task configuration includes repository/base_commit; allowed_paths/forbidden_paths;
 argv test/build/lint/typecheck commands; capture_baseline/require_clean_baseline;
@@ -16,11 +18,13 @@ explicit commands because target names and build directories vary.
 models maps aliases to full provider configurations. routing supports fixed or
 role_based policies, a default alias, and mappings such as agent, reviewer,
 compaction and refinement. agent_spawn can specify a role. Every decision/reason is
-recorded. Cost budgets require prices for every routed model.
+recorded. Cost budgets require prices for every routed API model; subscription
+usage has null monetary cost and cannot use dollar budgets.
 
 limits apply cumulatively across the recursive tree and resumes. Conservative
 UTF-8 byte bounds reserve model input/output capacity; actual provider usage replaces
-reservations. Unknown/interrupted calls are charged conservatively. Root elapsed
+reservations. Subscription output reservations are estimates: that backend has no
+server token cap. Unknown/interrupted usage is marked estimated. Root elapsed
 time includes waiting/downtime; summed session time can overlap.
 
 ## Control

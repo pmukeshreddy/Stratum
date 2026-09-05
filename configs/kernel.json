@@ -1,5 +1,5 @@
 {
-  "provider": {"name": "chat", "model": "${THREADWEAVE_MODEL}", "api_key_env": "OPENAI_API_KEY", "streaming": true, "max_output_tokens": 4096},
+  "provider": {"name": "codex_subscription", "streaming": true, "max_output_tokens": 4096},
   "task": {
     "adapter": "coding",
     "test_commands": [["make", "correctness"]],

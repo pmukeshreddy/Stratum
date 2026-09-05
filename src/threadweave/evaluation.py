@@ -344,7 +344,9 @@ def analyze(path):
         "runs": len(rows),
         "solved": solved,
         "success_rate": solved / len(rows) if rows else None,
-        "cost_per_solved": totals["cost"] / solved if solved else None,
+        "cost_per_solved": totals["cost"] / solved
+        if solved and all(r.get("metrics", {}).get("cost") is not None for r in rows)
+        else None,
         "turns_per_solved": totals["turns"] / solved if solved else None,
         "tool_calls_per_solved": totals["tool_calls"] / solved if solved else None,
         "mean_repeated_action_rate": sum(

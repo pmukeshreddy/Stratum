@@ -1,9 +1,6 @@
 {
   "provider": {
-    "name": "chat",
-    "model": "${THREADWEAVE_MODEL}",
-    "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY",
+    "name": "codex_subscription",
     "streaming": true,
     "max_output_tokens": 4096,
     "timeout_seconds": 180

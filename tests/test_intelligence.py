@@ -240,9 +240,9 @@ def test_external_long_context_and_kernel_configuration_errors(tmp_path, reposit
 async def test_production_rejects_missing_model_and_demo_provider(tmp_path, repository):
     runtime = Runtime(tmp_path / "state")
     try:
-        assert set(runtime.providers) == {"chat"}
+        assert set(runtime.providers) == {"chat", "codex_subscription"}
         with pytest.raises(ValueError, match="Explicit provider.model"):
-            runtime.create("Fix", repository)
+            runtime.create("Fix", repository, config=RunConfig(provider={"name": "chat"}))
         with pytest.raises(ValueError, match="Unknown provider"):
             runtime.create(
                 "Fix", repository, config=RunConfig(provider={"name": "demo", "model": "not-real"})
@@ -255,7 +255,9 @@ async def test_production_rejects_missing_model_and_demo_provider(tmp_path, repo
 def test_config_environment_resolution_doctor_and_no_secret_printing(tmp_path, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text(
-        json.dumps({"provider": {"model": "${TEST_MODEL}", "api_key_env": "TEST_KEY"}})
+        json.dumps(
+            {"provider": {"name": "chat", "model": "${TEST_MODEL}", "api_key_env": "TEST_KEY"}}
+        )
     )
     with pytest.raises(ValueError, match="Set TEST_MODEL"):
         load_config(config)

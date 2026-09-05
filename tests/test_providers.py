@@ -19,6 +19,7 @@ def request_config(**changes):
         tools=[],
         input_token_bound=500,
         config=ProviderConfig(
+            name="chat",
             model="user-selected-model",
             api_key_env="",
             base_url="https://provider.test/v1",

@@ -231,7 +231,17 @@ class Store:
         with self.transaction():
             self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (config_id, body))
             self._save(session)
-            self.db.execute("INSERT INTO usage VALUES(?,?)", (sid, Usage().model_dump_json()))
+            subscription = any(
+                p.name == "codex_subscription"
+                for p in [
+                    *config.models.values(),
+                    *([config.provider] if not config.routing.default else []),
+                ]
+            )
+            self.db.execute(
+                "INSERT INTO usage VALUES(?,?)",
+                (sid, Usage(cost=None if subscription else 0).model_dump_json()),
+            )
             self.event(sid, "session_transition", {"from": None, "to": Lifecycle.ADMITTED})
             if mode == "goal":
                 self.db.execute(
@@ -352,13 +362,44 @@ class Store:
     def charge(self, sid: str, usage: Usage, *, parent=None):
         with self.transaction():
             old = self.usage(sid)
-            values = {k: getattr(old, k) + v for k, v in usage.model_dump().items()}
+            values = {
+                k: None if getattr(old, k) is None or v is None else getattr(old, k) + v
+                for k, v in usage.model_dump().items()
+            }
             self.db.execute(
                 "UPDATE usage SET body=? WHERE session_id=?",
                 (Usage(**values).model_dump_json(), sid),
             )
             self.event(
                 sid, "resource_usage", usage.model_dump(), parent=parent, usage=usage.model_dump()
+            )
+
+    def pin_provider(self, sid, previous, resolved):
+        """Persist account-default resolution without overwriting an old config snapshot."""
+        if previous == resolved:
+            return
+        config = self.config(sid)
+        if config.provider == previous:
+            config.provider = resolved
+        for alias, provider in config.models.items():
+            if provider == previous:
+                config.models[alias] = resolved
+        body = encode(config.model_dump(mode="json"))
+        identifier = hashlib.sha256(body.encode()).hexdigest()
+        with self.transaction():
+            old = self.session(sid).config_id
+            self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (identifier, body))
+            self.update(sid, config_id=identifier)
+            self.event(
+                sid,
+                "provider_config_resolved",
+                {
+                    "previous_config_id": old,
+                    "config_id": identifier,
+                    "provider": resolved.name,
+                    "model": resolved.model,
+                    "parameters": resolved.parameters,
+                },
             )
 
     def usage(self, sid: str, *, tree=False) -> Usage:
@@ -371,7 +412,7 @@ class Store:
         total = Usage().model_dump()
         for session in sessions:
             for key, value in self.usage(session.id).model_dump().items():
-                total[key] += value
+                total[key] = None if total[key] is None or value is None else total[key] + value
         return Usage(**total)
 
     def reserved(self, root_id: str) -> tuple[int, float]:

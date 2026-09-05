@@ -80,7 +80,8 @@ JSONL records append durably; each run stores an eval_runs SQLite row and final.
 Fields include solved/unsolved, external verifier score, errors/outcome, elapsed
 time, tokens, optional cost, turns, tool/Python calls, test/build runs, children,
 experiments, retries, compactions, diff size and measured benchmark evidence.
-Zero cost with no configured/reported price is not evidence of a free provider.
+Subscription cost is null/unavailable, including cost per solved task. For optional
+API providers, zero cost with no configured/reported price is not evidence of free usage.
 
 Analysis reports descriptive success rate, aggregate cost/turns/tool calls per
 solved task, repeated actions/failed commands, retrieval/compactions, verifier

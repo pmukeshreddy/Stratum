@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .configuration import doctor, load_config
 from .daemon import request
+from .models import HarnessError
 
 
 def show(value):
@@ -67,6 +68,43 @@ async def attach(directory, sid, *, follow=True, after=0):
 async def execute(args):
     directory = args.data.resolve()
     command = args.command
+    if command == "auth":
+        from .codex_auth import CodexControl
+        from .native_client import client_path, install_client
+
+        if args.action == "install-client":
+            print(
+                "Building pinned official Codex client libraries; logs stay in the user cache.",
+                file=sys.stderr,
+            )
+            show({"client": str(await asyncio.to_thread(install_client)), "installed": True})
+            return 0
+        async with CodexControl() as control:
+            if args.action == "login":
+                import webbrowser
+
+                def present(reply):
+                    url = reply.get("authUrl") or reply.get("verificationUrl")
+                    if url:
+                        print(f"Authorize with ChatGPT: {url}", flush=True)
+                        if not args.device:
+                            webbrowser.open(url)
+                    if reply.get("userCode"):
+                        print(f"Device code: {reply['userCode']}", flush=True)
+
+                result = await control.login(present, device=args.device)
+            elif args.action == "logout":
+                result = await control.logout()
+                result["notice"] = "Signed out of the shared Codex credential store"
+            elif args.action == "models":
+                show(await control.models())
+                return 0
+            else:
+                result = await control.status()
+            result["client_installed"] = client_path().is_file()
+            result["usable"] = result["logged_in"] and result["client_installed"]
+            show(result)
+            return 0 if result["logged_in"] or args.action == "logout" else 1
     if command == "daemon":
         if args.action == "start":
             show(await ensure_daemon(directory, concurrency=args.concurrency))
@@ -74,7 +112,45 @@ async def execute(args):
             show(await request(directory, "shutdown" if args.action == "stop" else "ping"))
         return 0
     if command == "doctor":
-        result = doctor(directory, load_config(args.config) if args.config else None)
+        config = load_config(args.config) if args.config else None
+        status = None
+        if config and any(
+            p.name == "codex_subscription" for p in [config.provider, *config.models.values()]
+        ):
+            from .codex_auth import CodexControl
+            from .native_client import client_path
+            from .subscription import SubscriptionProvider
+
+            try:
+                async with CodexControl() as control:
+                    status = await control.status()
+                provider = next(
+                    p
+                    for p in [config.provider, *config.models.values()]
+                    if p.name == "codex_subscription"
+                )
+                resolved, _ = await SubscriptionProvider().resolve(provider)
+                version = await asyncio.create_subprocess_exec(
+                    "codex",
+                    "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await version.communicate()
+                status.update(
+                    codex_version=stdout.decode().strip(),
+                    model=resolved.model,
+                    parameters=resolved.parameters,
+                    transport="official_codex_responses_client",
+                    client_installed=client_path().is_file(),
+                    usable=status["logged_in"] and client_path().is_file(),
+                    output_limit="client-observed byte guard; no server token cap",
+                )
+                if not status["client_installed"]:
+                    status["issue"] = "Run threadweave auth install-client"
+            except HarnessError as exc:
+                status = {"usable": False, "issue": exc.failure.message, "code": exc.failure.code}
+        result = await asyncio.to_thread(doctor, directory, config, subscription_status=status)
         show(result)
         return 0 if result["ok"] else 1
     if command == "eval":
@@ -83,7 +159,7 @@ async def execute(args):
         show(
             await evaluate(
                 args.tasks,
-                load_config(args.config),
+                await resolved_config(load_config(args.config)),
                 directory,
                 repetitions=args.repetitions,
                 seed=args.seed,
@@ -97,7 +173,7 @@ async def execute(args):
         show(analyze(args.results))
         return 0
     if command == "run":
-        config = load_config(args.config, model_override=args.model)
+        config = await resolved_config(load_config(args.config, model_override=args.model))
         config.task.adapter = "coding"
         await ensure_daemon(directory)
         session = await request(
@@ -195,12 +271,33 @@ async def execute(args):
     return 0
 
 
+async def resolved_config(config):
+    """Pin discovered model/effort in the run snapshot before daemon admission."""
+    from .subscription import SubscriptionProvider
+
+    configs = list(config.models.values()) + (
+        [config.provider] if not config.routing.default else []
+    )
+    for provider in configs:
+        if provider.name == "codex_subscription":
+            resolved, _ = await SubscriptionProvider().resolve(provider)
+            provider.model, provider.parameters = resolved.model, resolved.parameters
+    return config
+
+
 def parser():
     p = argparse.ArgumentParser(description="Persistent coding agents for real repositories")
     p.add_argument(
         "--data", type=Path, default=Path.cwd() / ".threadweave", help="Durable data directory"
     )
     sub = p.add_subparsers(dest="command", required=True)
+    auth = sub.add_parser(
+        "auth", help="Manage the shared official Codex ChatGPT login; logout also signs Codex out"
+    )
+    auth.add_argument("action", choices=["status", "login", "logout", "models", "install-client"])
+    auth.add_argument(
+        "--device", action="store_true", help="Use Codex's official device-code login flow"
+    )
     daemon = sub.add_parser("daemon", help="Control the detached local daemon")
     daemon.add_argument("action", choices=["start", "status", "stop"])
     daemon.add_argument("--concurrency", type=int, default=8)
@@ -295,7 +392,7 @@ def main():
     except KeyboardInterrupt:
         print("Detached. The daemon and session continue running.", file=sys.stderr)
         code = 0
-    except (OSError, ValueError, RuntimeError, KeyError) as exc:
+    except (OSError, ValueError, RuntimeError, KeyError, HarnessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         code = 1
     raise SystemExit(code)

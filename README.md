@@ -6,7 +6,7 @@ checks the resulting repository against configured tests and constraints before
 accepting completion.
 
 Python 3.11+ on macOS/Linux. Local execution requires trusted code and tool access.
-No provider or model is selected silently.
+The default provider uses your existing ChatGPT/Codex subscription login.
 
 ## Configure a real model and run
 
@@ -14,8 +14,11 @@ Install the harness and the target repository's dependencies first:
 
 ```sh
 uv sync --extra dev
-export OPENAI_API_KEY='your-provider-key'
-export THREADWEAVE_MODEL='an-explicit-model-id-available-at-your-endpoint'
+uv run threadweave auth status
+# Only if not already signed into Codex:
+uv run threadweave auth login
+# Once per client revision: requires git and Rust/cargo, downloads/builds official libraries.
+uv run threadweave auth install-client
 
 uv run threadweave --data /absolute/path/to/agent-state doctor --config configs/coding.json
 uv run threadweave --data /absolute/path/to/agent-state run \
@@ -24,13 +27,30 @@ uv run threadweave --data /absolute/path/to/agent-state run \
   --config configs/coding.json --attach
 ```
 
-Set an actual model ID, not the illustrative text above.
-[configs/coding.json](configs/coding.json) resolves THREADWEAVE_MODEL explicitly
-and invokes the streaming chat provider. Alternatively put the ID directly in
-provider.model. Compatible endpoints can configure provider.base_url and
-provider.api_key_env; an empty credential-variable name means no authentication.
-Credentials must exist before daemon startup. Restart the daemon after changing
-its environment.
+[configs/coding.json](configs/coding.json) and [configs/kernel.json](configs/kernel.json)
+use `codex_subscription`. No `OPENAI_API_KEY` is needed. `auth models` lists the
+account's current model catalog. Omit `provider.model` to use Codex's configured/default
+model, or select one explicitly with `--model`. Model and reasoning settings are
+resolved and stored before CLI run admission. `provider.parameters.reasoning_effort`
+can override the Codex setting. There is no automatic API-billing fallback.
+
+Authentication uses the official app-server account protocol. Inference uses the
+official Codex Rust Responses client and auth manager, pinned to a source revision.
+The bridge makes one model request: it creates no Codex agent or conversation and
+executes no tools. Threadweave supplies the context and schemas and executes returned
+structured calls. Codex owns credentials and refresh; Threadweave never exports tokens.
+`auth logout` signs out of the **shared Codex login**, not just Threadweave.
+
+The subscription backend currently rejects a server `max_output_tokens` parameter.
+Threadweave therefore applies a client-observed output-byte guard (four bytes per
+configured output token), plus timeouts and cumulative accounting. This is **not a
+hard server token cap**; hidden reasoning/in-flight usage can exceed reservations.
+Reported usage is authoritative; interrupted usage is marked estimated. Subscription
+monetary cost is `null`, and dollar budgets/API prices are rejected for this provider.
+See [subscription transport](docs/subscription.md) for installation and limitations.
+
+The optional `chat` provider remains available for intentionally configured API
+usage; see [optional API configuration](docs/subscription.md#optional-api-provider).
 
 Configure repository-specific argv arrays in task.test_commands, build_commands,
 lint_commands and typecheck_commands. Empty groups use available Python/Cargo/Go/npm
