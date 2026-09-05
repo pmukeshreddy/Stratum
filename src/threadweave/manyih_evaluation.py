@@ -22,6 +22,8 @@ from .evaluation import metrics as trajectory_metrics
 from .models import TaskConfig
 from .runtime import Runtime
 
+HARNESS_ROOT = Path(__file__).resolve().parents[2]
+
 OFFICIAL_CALL = """
 import json,sys
 sys.path.insert(0, sys.argv[1])
@@ -107,7 +109,7 @@ async def evaluate_manyih(source, python, config, output, *, start=0, limit=2):
             await asyncio.to_thread(
                 subprocess.check_output,
                 ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).resolve().parents[2],
+                cwd=HARNESS_ROOT,
                 text=True,
             )
         ).strip(),
