@@ -93,12 +93,14 @@ def test_default_workspace_config_and_user_storage(tmp_path, monkeypatch):
     assert (args.workspace or Path.cwd()) == tmp_path
     config = chat_config(tmp_path)
     assert config.provider.name == "codex_subscription"
-    assert config.task.adapter == "coding" and "process" in config.permissions
+    assert config.task.adapter == "workspace" and "process" in config.permissions
     assert config.context.max_tokens == 96000
     directory = data_directory(tmp_path)
     assert directory == tmp_path / "user-data/threadweave"
     (tmp_path / "configs").mkdir()
-    (tmp_path / "configs/coding.json").write_text('{"provider":{"model":"account-model"}}')
+    (tmp_path / "configs/coding.json").write_text('{"task":{"adapter":"coding"}}')
+    assert chat_config(tmp_path).task.adapter == "workspace"
+    (tmp_path / "configs/session.json").write_text('{"provider":{"model":"account-model"}}')
     assert chat_config(tmp_path).provider.model == "account-model"
     legacy = tmp_path / ".threadweave"
     legacy.mkdir()

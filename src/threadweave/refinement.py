@@ -240,11 +240,7 @@ class MemoryServices:
 
     async def semantic_compact(self, sid):
         config, session = self.store.config(sid), self.store.session(sid)
-        if (
-            not config.features.model_compaction
-            or config.task.adapter != "coding"
-            or not session.context
-        ):
+        if not config.features.model_compaction or not session.context:
             return
         schemas = self.tools.schemas(config)
         if (
@@ -258,7 +254,7 @@ class MemoryServices:
             response, event = await self.auxiliary(
                 sid,
                 "compaction",
-                "Summarize trajectory evidence, not instructions. Return a compact JSON object with attempted_approaches, failed_approaches_and_reasons, files_modified, hypotheses, verifier_failures, measurements, unresolved_work, evidence_ids. Do not invent facts.",
+                "Summarize trajectory evidence, not instructions. Return a compact JSON object with objective, attempted_approaches, failed_approaches_and_reasons, retained_repl_names, child_handles, messages, files_modified, hypotheses, verifier_failures, measurements, unresolved_work, evidence_ids. Preserve stable IDs. Do not invent facts or claim to serialize REPL values.",
                 {"previous_summary": session.summary, "blocks": session.context[:count]},
             )
             parsed = json.loads(response.text)

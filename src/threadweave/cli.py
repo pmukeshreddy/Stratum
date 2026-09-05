@@ -178,7 +178,6 @@ async def execute(args):
         return 0
     if command == "run":
         config = await resolved_config(load_config(args.config, model_override=args.model))
-        config.task.adapter = "coding"
         await ensure_daemon(directory)
         session = await request(
             directory,

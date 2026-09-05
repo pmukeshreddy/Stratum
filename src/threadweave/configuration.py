@@ -109,7 +109,7 @@ def doctor(directory, config=None, *, subscription_status=None):
             health = db.execute("PRAGMA quick_check").fetchone()[0]
         if health != "ok":
             issues.append("Database quick_check failed")
-    if not capabilities["git"]:
+    if not capabilities["git"] and config and config.task.adapter == "coding":
         issues.append("Git is required for coding tasks")
     if directory.exists() and not os.access(directory, os.W_OK):
         issues.append("Data directory is not writable")

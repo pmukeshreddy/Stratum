@@ -59,7 +59,6 @@ class Tool:
     execute: Callable[[ToolContext, Any], Awaitable[Any]]
     permissions: tuple[str, ...] = ()
     python_callable: bool = True
-    coding_only: bool = False
     feature: str | None = None
 
     def schema(self):
@@ -89,7 +88,6 @@ class ToolRegistry:
             and set(tool.permissions) <= set(config.permissions)
             and (not config.execution.read_only or "workspace.write" not in tool.permissions)
             and (config.tool_allowlist is None or name in config.tool_allowlist)
-            and (not tool.coding_only or config.task.adapter == "coding")
             and (not tool.feature or getattr(config.features, tool.feature))
             and (
                 name != "run_profile"
@@ -97,7 +95,7 @@ class ToolRegistry:
                 or shutil.which("ncu")
                 or shutil.which("nsys")
             )
-            and (name != "agent_spawn" or config.features.subagents)
+            and (name not in {"agent_spawn", "rlm"} or config.features.subagents)
             and (
                 name not in {"history_read", "history_get", "history_search", "artifact_search"}
                 or config.features.history_retrieval
@@ -312,6 +310,9 @@ def builtins() -> ToolRegistry:
             c.runtime.store.ensure_related(c.session_id, sid)
         return c.runtime.inspect(sid)
 
+    async def information(c, a):
+        return c.runtime.information(c.session_id)
+
     async def waiting(c, a):
         c.runtime.defer(c.session_id, a.seconds)
         return {"waiting_seconds": a.seconds, "wake_on_message": True}
@@ -417,6 +418,13 @@ def builtins() -> ToolRegistry:
         artifact_load,
     )
     add(
+        "rlm",
+        "Schedule a persistent recursive child and immediately return its stable handle. The child runs independently; communicate through agent_message/agent_receive.",
+        SpawnArgs,
+        spawn,
+        ("agents",),
+    )
+    add(
         "agent_spawn",
         "Create a persistent child and immediately return its stable ID.",
         SpawnArgs,
@@ -443,6 +451,12 @@ def builtins() -> ToolRegistry:
         "Inspect self or a related session, full instruction, goal, and usage.",
         InspectArgs,
         inspect_session,
+    )
+    add(
+        "information_inspect",
+        "Inspect L1/L2/L3 metadata without loading stored values into active context.",
+        Empty,
+        information,
     )
     add(
         "agent_wait",

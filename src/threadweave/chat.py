@@ -15,6 +15,8 @@ from .terminal import EventRenderer, Terminal
 
 HELP = """/help         Show commands
 /status       Session status and workspace
+/state        Inspect L1 / L2 / L3 metadata (not stored values)
+/states       Inspect Continual Harness entries and versions
 /usage        Recursive tokens, calls, turns and execution time
 /tree         Persistent child sessions
 /diff         Current Git diff (pause first if working)
@@ -46,14 +48,14 @@ def data_directory(workspace, explicit=None):
 
 
 def chat_config(workspace, explicit=None):
-    path = explicit or workspace / "configs/coding.json"
-    if not explicit and not path.is_file() and (Path.cwd() / "configs/coding.json").is_file():
-        path = Path.cwd() / "configs/coding.json"
+    path = explicit or workspace / "configs/session.json"
+    if not explicit and not path.is_file() and (Path.cwd() / "configs/session.json").is_file():
+        path = Path.cwd() / "configs/session.json"
     if explicit or path.is_file():
         config = load_config(path)
     else:
         config = RunConfig(
-            task={"adapter": "coding"},
+            task={"adapter": "workspace"},
             context={"max_tokens": 96000, "result_chars": 2400, "summary_chars": 6000},
             limits={"token_budget": 3_000_000, "wall_seconds": 7200},
             permissions=[
@@ -65,7 +67,6 @@ def chat_config(workspace, explicit=None):
                 "state",
             ],
         )
-    config.task.adapter = "coding"
     return config
 
 
@@ -107,6 +108,8 @@ class Chat:
             await self.terminal.write(text)
 
     async def dirty_consent(self, config):
+        if config.task.adapter != "coding" or not config.task.require_clean_baseline:
+            return True
         status = await asyncio.to_thread(
             git, self.workspace, "status", "--porcelain=v1", "--untracked-files=all"
         )
@@ -170,7 +173,7 @@ class Chat:
                 return False
             self.session = await self.call(
                 "create",
-                instruction="Assist the user with this repository. Follow their latest messages; preserve unrelated changes.",
+                instruction="Assist the user in this persistent session. Follow their latest messages. Choose tools or delegation only when useful; preserve unrelated workspace changes.",
                 workspace=str(self.workspace),
                 config=self.config.model_dump(mode="json"),
                 name="root",
@@ -303,6 +306,8 @@ class Chat:
             return opened
         if command not in {
             "status",
+            "state",
+            "states",
             "usage",
             "tree",
             "diff",
@@ -315,7 +320,7 @@ class Chat:
             await self.notice("Unknown command. Type /help.")
             return True
         result = await self.current(
-            "status" if command == "usage" else command,
+            "status" if command == "usage" else "information" if command == "state" else command,
             **({"limit": 40, "tree": True} if command == "history" else {}),
         )
         if self.terminal.json_mode:
@@ -335,6 +340,19 @@ class Chat:
             )
         elif command == "tree":
             await self.notice(render_tree(result))
+        elif command == "state":
+            await self.notice(
+                f"L1 · {result['L1']['blocks']} active blocks · {result['L1']['selected_entries']} selected entries\n"
+                f"L2 · kernel {result['L2']['kernel_id']} · {len(result['L2']['children'])} children · {result['L2']['checkpointed_variables']} checkpointed variables\n"
+                f"L3 · {result['L3']['events']} events · {result['L3']['artifacts']} artifacts · {result['L3']['pending_messages']} pending messages"
+            )
+        elif command == "states":
+            for entry in result:
+                await self.notice(
+                    f"{entry['id']} · {entry['kind']} · v{entry['version']} · {entry['title']}{' · deleted' if entry['deleted'] else ''}"
+                )
+            if not result:
+                await self.notice("No selected or reusable state entries have been stored.")
         elif command == "diff":
             await self.terminal.write(result["patch"] or "No changes.", code="diff")
             if len(result["patch"]) >= 16000:
@@ -453,7 +471,9 @@ async def chat(args):
     if not args.resume_id and not args.continue_recent:
         config = await resolved_config(chat_config(workspace, args.config))
     info = await ensure_daemon(directory)
-    if "interactive_chat" not in info.get("capabilities", []):
+    if not {"interactive_chat", "information_hierarchy", "recursive_sessions"} <= set(
+        info.get("capabilities", [])
+    ):
         raise ValueError(
             f"An older daemon owns {directory}. Stop it with threadweave --data {directory} daemon stop, then retry; sessions are preserved."
         )

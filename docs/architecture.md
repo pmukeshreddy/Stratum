@@ -1,119 +1,170 @@
 # Architecture
 
 ```text
-CLI / future UI -> private Unix socket -> daemon + async scheduler
-                                           |
-                       persistent root / isolated recursive children
-                                           |
-                        context -> routed model -> chosen actions
-                                           |
-               repository index / editor / Git / executor / experiments
-                                           |
-                         evidence <- independent coding verifier
-                                           |
-                             per-session Python worker
-                                           |
-               SQLite WAL + private artifacts + worker checkpoints
+                         Human
+                           ↕
+                      Agents View
+                           ↕
+                      Root Session
+                     ↙     ↕      ↘
+           rlm() / messages ↕       actions / observations
+                   ↙       ↕                ↘
+      Recursive Subagents  ↕             Environment
+              ↕            ↕                 ↕
+              +--------- Daemon -------------+
+                           ↕
+                    Continual Harness
 
-L1: objective, selected/recent evidence, bounded summary, selected durable state
-L2: Python values, retained tool outputs, active sessions and stable handles
-L3: immutable history, artifacts, versions, indexes, experiments and relationships
+L1  Selected active model context
+L2  Persistent Python REPLs, retained values, recursive sessions/handles
+L3  Disk-backed history, artifacts, versions, sessions, messages
+
+Long-horizon controls: autonomous turns · persistent goals · heartbeats
+                      bounded across root + descendants
 ```
 
-The existing scheduler, worker protocol, session/action journal, messaging and
-root-wide accounting remain the foundation. Coding adds an adapter and primitives,
-not a mandatory planning graph.
+## Agents View ↔ Root Session
 
-## Sessions and turns
+chat.py and terminal.py implement the Agents View; daemon.py exposes its private
+Unix-socket API. Clients submit durable input, read bounded streaming events,
+inspect history/tree/usage/layers, pause, resume and detach. They do not invoke
+models or execute tools. Attachment does not change existing execution mode;
+disconnection does not cancel work. The daemon owns lifecycle and scheduling.
 
-Stable IDs preserve roots, parents, children and branch ancestry. Lifecycle
-ADMITTED -> RUNNING -> IDLE -> INACTIVE describes loading independently of outcome.
-One runtime owns a data directory under an OS lock. Clients own no sessions.
+The default configs/session.json uses an ordinary workspace, not a coding task.
+A greeting requires neither Git, tests nor edits. Explicit coding interactive
+inspection defers baseline preparation until an action requires it.
 
-Each turn applies queued state edits, receives messages, prepares the task once,
-optionally refines/compacts selected evidence, assembles context and routes a model
-call. Resources are reserved before invocation. The response and ordered actions
-are persisted before execution; action receipts/cursors prevent blind replay.
-Completion requests go through independent task verification before acceptance.
+## Root Session ↔ Environment
 
-Auxiliary compaction/refinement uses the same retry, reservation and accounting path
-without replacing the main pending turn. Routing is fixed or explicitly role-based;
-there is no learned routing claim.
+models.Session and runtime.Runtime implement the persistent session loop:
 
-The scheduler enforces global/per-root concurrency, depth/subagent limits,
-cancellation and tree-wide resource budgets. Children have independent histories,
-contexts and workers. Failed children notify parents without deciding root outcome.
+1. At a safe boundary apply queued refinements and receive messages.
+2. Assemble selected L1 context and invoke the configured model.
+3. Persist the response/action cursor before executing chosen tools.
+4. Retain observations externally, select bounded results for L1, continue.
 
-## Coding components
+No mandatory planning/action graph exists. finish requests completion; only a
+configured verifier/end-condition supplies independent verification. Interactive
+text replies yield to the human. Neither text nor unverified finish is reported as
+independent verification.
 
-repository.py stats files and reparses changed entries with Python AST or lexical
-multi-language extraction. It excludes common generated/vendor directories, binary
-files and files over 2 MB. It is not a language server or an OS file watcher.
+environment.Environment owns adapter admission, preparation, coding checkpoints,
+candidate isolation and external-effect recovery. TaskAdapters retain their
+prepare/verify interface. tools.ToolRegistry exposes typed permission-controlled
+primitives. Files/processes/repository/editor/Git/tests/builds/experiments/profilers
+are capabilities, not stages. Tools are exposed independently of the task adapter;
+missing prerequisites return structured errors. Standalone build/test actions run
+configured/detected commands without requiring a baseline.
 
-editing.py validates all hunks, journals exact prior contents and hashes, then writes
-files atomically. On application failure it restores changes. On restart a prepared
-edit is rolled back or paused if external edits conflict. Visibility is serialized
-within this runtime, not a filesystem-wide transaction against unrelated writers.
-Direct Python/process/build/test actions receive before/after file checkpoints and
-workspace-effect events. Recovery observes interrupted effects rather than replaying
-commands. Identical artifact contents are reused within a session.
+## Root → rlm() → Recursive Subagents
 
-gitops.py checkpoints tracked/nonignored files without changing the user's index or
-commits. Children and coding forks get private Git copies with captured inputs as
-private baseline commits. Copies include uncommitted inputs. Checkpoint files over
-64 MiB fail explicitly. Parents select candidate patches and apply them through the
-same editor. Symlink escapes are rejected.
+The model tool rlm and Python helper rlm(instruction, name=None, **options) use
+Runtime.spawn and its existing scheduler. agent_spawn is a compatible spelling.
+They return JSON-safe metadata containing the stable session ID, not a child
+answer. Creation does not await child model execution.
 
-coding.py captures the baseline once and reruns configured commands for completion.
-An explicit option can tolerate identified unchanged baseline failing tests; new
-failures remain regressions. protect_tests can prohibit all test edits beyond default
-deletion checks. Verifiers are trusted configuration, not model completion claims.
+Children use the same Session, model loop, history, permissions and worker
+implementation as roots, with independent context/kernel identity. They can call
+rlm recursively. Root values are not implicitly copied. Generic environments share
+workspace metadata. Explicit coding environments isolate writable candidates
+before admission: a large copy may delay admission, but never waits for the
+child's reasoning/result. Candidate patches require explicit acceptance.
 
-execution.py owns command process groups, capture, timeout and cleanup. Full outputs
-stay in artifacts. Local execution has host authority. The container executor
-restricts the command environment, mount, resources and network; it does not
-sandbox the host Python worker.
+agent_message, agent_receive, agent_sessions, session_inspect and agent_wait expose
+persistent communication/inspection. Parent/child and permitted sibling messages
+are queued in SQLite, timestamped, referenced by events and delivered at boundaries.
+Paused or terminated recipients retain messages; terminated sessions need explicit
+resumption. Completed children preserve identity/history/recoverable state.
+Failure reports reach parents without automatically terminating them.
 
-## Information and adaptive state
+## Sessions ↔ Daemon
 
-FTS5 indexes events (including messages, result summaries, refinements and experiment
-conclusions) plus the first 16 KB of text artifacts. Retrieval is scoped to a tree
-and explicit branch ancestry. Complete artifacts remain readable by ID. Context
-assembly selects bounded current evidence, never the entire index/history.
+daemon.Daemon owns Runtime under an exclusive data-directory lock. Runtime owns
+live workers, concurrent turns and model calls. The scheduler enforces global and
+per-root concurrency, depth/subagent limits and cancellation.
 
-Model compaction records structured facts and its response/source IDs. Extractive
-fallback records failure provenance. Summaries may omit details; original events
-remain authoritative.
+Lifecycle ADMITTED → RUNNING → IDLE → INACTIVE describes loading, separately from
+outcome and execution mode. INACTIVE means recoverable, not deleted. Pause interrupts
+one session without clearing state; stop explicitly cancels a tree. Detach affects
+neither. Shutdown checkpoints workers. Restart restores registry/tree and runnable
+work; a service manager or opening the CLI restarts the daemon after reboot.
 
-State entries are prompt notes, memories, executable skills or subagent specs.
-Updates/deletion/rollback append immutable versions. Automatic proposals must cite
-selected evidence and an intended effect. Skill schemas/syntax/permissions are
-validated; per-version outcomes support quarantine. Failed verifiers create
-searchable failure memories. Foundational policy and model weights are immutable.
+## Daemon ↔ Continual Harness
 
-Experiments and experiment runs are separate durable entities. Runs retain source
-checkpoints, patches, correctness evidence, measurements and conclusion provenance.
-Measurements do not establish causality or statistical significance.
+storage.Store and refinement.MemoryServices implement the existing Continual
+Harness: append-only history and typed, versioned memories, executable skills,
+prompt notes and reusable subagent specifications.
 
-## Persistence and recovery
+refine(edit=StateEdit(...)) queues create/update/delete/rollback operations with
+source events, intended effect and optional expected_version. Runtime applies them
+at turn boundaries. Deletion and rollback append versions, never overwrite history.
+Entries have session-local or explicitly permitted global scope. state_list,
+state_read, state_select, skill_search, skill_inspect and skill_run provide access.
 
-Schema v2 migrates v1 forward without rewriting historical sessions/configs/events.
-SQLite uses WAL, foreign keys and full synchronization. Events and state versions
-have immutable-table triggers.
+Only selected entries enter supplemental L1. Skills validate syntax/input schemas/
+declared permissions, record outcomes and quarantine repeatedly failing versions.
+This is not a sandbox. Automatic refinement optionally proposes evidence-backed
+state at configured boundaries. Auxiliary calls use the same provider retry,
+reservation and accounting path. Foundational policy/model weights are unchanged.
 
-Restart retains identities, tree, queues, contexts, goals, versions, artifacts,
-indexes, checkpoints, experiments and usage. Workers are recreated using explicit
-codecs and opted-in recipes. Unsupported objects are reported; action history is
-never replayed as reconstruction.
-Coding forks rebind explicit Path codecs into the new workspace and do not copy
-potentially source-bound reconstruction recipes. Missing recipes are reported for
-review. Arbitrary strings are not assumed to be filesystem handles.
+## L1 / L2 / L3
 
-A persisted response resumes its cursor. Finished Python actions can recover
-checkpoint receipts. Actions started without a durable receipt become uncertain and
-are not automatically repeated. Interrupted model reservations are conservatively
-charged. Interrupted experiments remain explicit interrupted entities.
+context.Context assembles L1 from foundational instructions, objective, metadata,
+selected entries, bounded summaries, recent complete model/tool blocks and messages.
+It does not automatically dump arbitrary REPL values or disk history.
 
-No distributed scheduling, arbitrary object serialization, automatic dependency
-installation, disk quotas, external-system snapshots or exactly-once external
-effects are claimed.
+kernel.Kernel and kernel_worker.Worker implement L2, one persistent process per
+loaded session. Variables survive incremental executions. Top-level await,
+tools.call, tools.acall, rlm, workspace, forget and remember_recipe are available.
+Full programmatic results can stay in Python. Printing/returning them is explicit
+selection, with bounded capture and full retained artifacts.
+
+SQLite WAL/full synchronization, private artifacts and kernel checkpoints implement
+L3: events, messages, metadata/tree, contexts, compactions, versions, goals,
+schedules, action receipts and usage. FTS/history/artifact retrieval is scoped to
+the tree and explicit branch ancestry.
+
+Model compaction works in every environment, with recorded extractive fallback.
+It changes L1 only: events, workers and children remain intact. /state and
+information_inspect return bounded metadata, not variable contents. Checkpointed
+names describe recoverable values, not arbitrary live-object serialization.
+
+Recovery restores explicit codecs and opted-in reconstruction recipes; unsupported
+objects are reported. Python trajectory history is never blindly replayed.
+Receipts/cursors prevent blind action repetition; unreceipted external effects are
+marked uncertain. Branching creates new IDs/explicit ancestry and preserves the
+original trajectory. Isolated forks rebind Path codecs, not arbitrary strings or
+potentially source-bound reconstruction recipes.
+
+## Long-horizon execution controls
+
+run --mode autonomous continues chosen turns until explicit completion, an
+end-condition, failure or limits. --mode goal additionally persists objective/
+status across continuations. --mode heartbeat yields after each triggered turn.
+schedule_turn and daemon schedule controls store intervals or five-field UTC cron
+triggers for existing sessions. Missed ticks coalesce.
+
+Root accounting includes all descendants: model/input/output/cached/reasoning tokens,
+tools, Python, retries, verifier calls, subagents, turns and execution time.
+Reservations prevent concurrent delegation from hiding spend. Autonomous/goal wall
+budgets include elapsed run time; interactive budgets exclude human idle time and
+conservatively sum execution time. Subscription cost is null, not fabricated from
+API prices. Resume/detach never resets limits.
+
+## Connection tests
+
+| Connection/control | Tests |
+| --- | --- |
+| Agents View ↔ Root, input/intervention/detach | test_chat.py, test_chat_terminal.py, test_architecture.py |
+| Root ↔ Environment, no coding prerequisite | test_architecture.py, test_tools_and_controls.py |
+| Root → rlm → children ↔ Environment → messages | test_architecture.py, test_parallel_environment.py |
+| Recursive descendants/sibling permissions/failure isolation | test_runtime.py, test_storage.py |
+| Sessions ↔ Daemon, hard restart, same IDs | test_daemon.py, test_chat_terminal.py |
+| Daemon ↔ Continual Harness, versions/provenance/rollback | test_architecture.py, test_storage.py, test_intelligence.py |
+| L1/L2/L3, compaction, persistent Python/recovery | test_architecture.py, test_context.py, test_kernel.py |
+| Autonomous/goal/heartbeat, gates, budgets/accounting | test_runtime.py, test_tools_and_controls.py, test_architecture.py |
+| Real subscription + CLI + children + compaction + hard restart | opt-in test_architecture_live.py |
+
+No distributed daemon, arbitrary-object serialization, exactly-once external
+effects or host-execution sandbox is claimed.

@@ -19,8 +19,8 @@ from pathlib import Path
 from croniter import croniter
 
 from .artifacts import Artifacts
-from .coding import CodingTask
 from .context import Context
+from .environment import Environment
 from .execution import environment
 from .kernel import Kernel, fork_checkpoint
 from .models import (
@@ -40,7 +40,6 @@ from .providers import default_providers
 from .refinement import MemoryServices
 from .routing import route
 from .storage import Store, encode
-from .tasks import WorkspaceTask
 from .tools import ToolContext, builtins
 
 log = logging.getLogger("threadweave.runtime")
@@ -78,11 +77,8 @@ class Runtime(MemoryServices):
         self.artifacts = Artifacts(self.store)
         self.context = Context(self.store)
         self.providers = providers if providers is not None else default_providers()
-        self.adapters = (
-            adapters
-            if adapters is not None
-            else {"workspace": WorkspaceTask(), "coding": CodingTask()}
-        )
+        self.environment = Environment(self, adapters)
+        self.adapters = self.environment.adapters  # Extension registration remains compatible.
         self.tools = tools if tools is not None else builtins()
         self.concurrency, self.idle_seconds = concurrency, idle_seconds
         self.kernels: dict[str, Kernel] = {}
@@ -143,10 +139,7 @@ class Runtime(MemoryServices):
     ):
         config = config or RunConfig()
         config = config.model_copy(deep=True)
-        if config.task.adapter == "coding":
-            config.task.verifier = "coding"
-            config.task.require_verifier = True
-            config.task.verify_each_turn = False
+        self.environment.configure(config)
         self.validate_config(config)
         path = Path(workspace).resolve()
         if not path.is_dir():
@@ -189,31 +182,7 @@ class Runtime(MemoryServices):
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
-        workspace = parent.workspace
-        checkpoint = None
-        if config.task.adapter == "coding":
-            from .gitops import GitWorkspace
-
-            event = self.store.event(parent_id, "candidate_preparing", {"instruction": instruction})
-            git = GitWorkspace(ToolContext(self, parent_id, new_id(), event))
-            checkpoint = git.snapshot("candidate-source")
-            isolated = git.isolate(checkpoint)
-            workspace = Workspace(
-                path=str(isolated),
-                metadata={
-                    "source_session": parent_id,
-                    "source_checkpoint": checkpoint,
-                    "isolation": "private_git_copy",
-                },
-            )
-            config.task.repository = str(isolated)
-            config.task.base_commit = None
-            config.task.require_change = False
-        # Completion gates belong to each task. Children receive their own instructions;
-        # they must not complete the root by observing its verifier artifact.
-        config.task.verifier = "coding" if checkpoint else "none"
-        config.task.require_verifier = bool(checkpoint)
-        config.task.verifier_options = {}
+        workspace, checkpoint = self.environment.continuation_workspace(parent, config, child=True)
         config.refinement.selected_entries = [
             eid
             for eid in parent.selected_state
@@ -282,6 +251,58 @@ class Runtime(MemoryServices):
             "root_elapsed_seconds": self._elapsed(session.root_id),
             "config": config.model_dump(mode="json"),
             "messages": self.store.messages(sid, limit=10),
+            "information": self.information(sid),
+        }
+
+    def information(self, sid: str):
+        """Bounded layer metadata. Never implicitly serialize L2 variables or L3 contents."""
+        session = self.store.session(sid)
+        checkpoint = self.store.directory / "kernels" / session.kernel_id / "checkpoint.json"
+        names, missing = [], []
+        if checkpoint.is_file():
+            data = json.loads(checkpoint.read_text())
+            names = sorted(set(data.get("values", {})) | set(data.get("recipes", {})))
+            missing = sorted(data.get("missing", {}))
+
+        def count(table, clause=""):
+            return self.store.db.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE session_id=?{clause}", (sid,)
+            ).fetchone()[0]
+
+        children = [s for s in self.store.sessions(root_id=session.root_id) if s.parent_id == sid]
+        return {
+            "L1": {
+                "blocks": len(session.context),
+                "summary_chars": len(session.summary),
+                "selected_entries": len(session.selected_state),
+                "selected_entry_ids": session.selected_state[:50],
+                "context_limit": self.store.config(sid).context.max_tokens,
+            },
+            "L2": {
+                "kernel_id": session.kernel_id,
+                "worker_live": sid in self.kernels and self.kernels[sid].process is not None,
+                "checkpointed_variables": len(names),
+                "checkpointed_names": names[:100],
+                "unrecoverable_names": missing[:100],
+                "children": [
+                    {"id": s.id, "name": s.name, "lifecycle": s.lifecycle, "outcome": s.outcome}
+                    for s in children
+                ],
+                "values_included": False,
+            },
+            "L3": {
+                "events": count("events"),
+                "artifacts": count("artifacts"),
+                "compactions": count("compactions"),
+                "state_entries": len(self.store.states(sid, include_deleted=True)),
+                "pending_messages": self.store.db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND received_at IS NULL",
+                    (sid,),
+                ).fetchone()[0],
+                "schedules": count("schedules", " AND enabled=1"),
+                "goal": self.store.goal(sid),
+                "history_append_only": True,
+            },
         }
 
     def message(self, sender_id, recipient_id, body):
@@ -491,14 +512,7 @@ class Runtime(MemoryServices):
         self._scheduler_task = asyncio.create_task(self._scheduler(), name="session-scheduler")
 
     async def recover(self):
-        from .editing import recover_edits
-        from .execution import recover_containers
-        from .gitops import recover_workspace_effects
-
-        recover_edits(self)
-        await recover_containers(self)
-        await recover_workspace_effects(self)
-        self.store.db.execute("UPDATE experiments SET status='interrupted' WHERE status='running'")
+        await self.environment.recover()
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
         for row in self.store.db.execute("SELECT * FROM reservations").fetchall():
@@ -683,11 +697,7 @@ class Runtime(MemoryServices):
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 response, response_event = await self._invoke(sid)
-                if (
-                    not response.actions
-                    and config.task.adapter == "coding"
-                    and self.store.session(sid).mode != "interactive"
-                ):
+                if not response.actions and self.store.session(sid).mode in {"autonomous", "goal"}:
                     from .guardrails import observe
 
                     if observe(self, sid, "model_no_actions", {}):
@@ -786,7 +796,7 @@ class Runtime(MemoryServices):
                             "conversation_completed",
                             {
                                 "result": completion or "Task verifier passed",
-                                "verified": True,
+                                "verified": verifier_ok,
                             },
                         )
                         self.store.update(sid, runnable=False, wake_at=None)
@@ -876,22 +886,7 @@ class Runtime(MemoryServices):
         self.store.db.execute("UPDATE candidates SET body=? WHERE child_id=?", (encode(body), sid))
 
     async def _prepare(self, sid):
-        if self.store.events(sid, kind="environment_prepared", limit=1):
-            return
-        config = self.store.config(sid)
-        event = self.store.event(sid, "environment_prepare", {})
-        try:
-            async with asyncio.timeout(config.limits.tool_timeout_seconds):
-                result = await self.adapters[config.task.adapter].prepare(
-                    ToolContext(self, sid, new_id(), event), config.task
-                )
-        except Exception as exc:
-            raise HarnessError("environment", "prepare_failed", str(exc)) from exc
-        eid = self.store.event(sid, "environment_prepared", {"result": result}, parent=event)
-        selected = self.artifacts.expose(sid, result, source_event=eid)
-        self.store.add_context(
-            sid, eid, [{"role": "user", "content": "Task environment: " + encode(selected)}]
-        )
+        await self.environment.prepare(sid)
 
     async def _invoke(self, sid):
         config = self.store.config(sid)
@@ -1111,9 +1106,7 @@ class Runtime(MemoryServices):
         from .guardrails import observe
 
         if observe(self, sid, action.name, action.arguments):
-            raise LimitReached(
-                "Configured repeated-action limit reached without repository progress"
-            )
+            raise LimitReached("Configured repeated-action limit reached without progress")
         with self.store.transaction():
             eid = self.store.event(
                 sid,
@@ -1135,34 +1128,7 @@ class Runtime(MemoryServices):
         context = ToolContext(self, sid, action_id, eid, from_python)
         external_checkpoint = None
         try:
-            if (
-                config.task.adapter == "coding"
-                and not from_python
-                and action.name
-                in {
-                    "python",
-                    "skill_run",
-                    "process_run",
-                    "run_tests",
-                    "run_targeted_tests",
-                    "run_build",
-                    "run_lint",
-                    "run_typecheck",
-                    "run_benchmark",
-                    "run_profile",
-                    "experiment_run",
-                }
-                and self.tools.allowed(action.name, config)
-            ):
-                from .gitops import GitWorkspace
-
-                external_checkpoint = GitWorkspace(context).snapshot("before-external-action")
-                self.store.event(
-                    sid,
-                    "workspace_observation_started",
-                    {"action_id": action_id, "checkpoint_id": external_checkpoint},
-                    parent=eid,
-                )
+            external_checkpoint = await self.environment.before_action(context, action.name)
             timeout = (
                 config.limits.python_timeout_seconds + 25
                 if action.name in ("python", "skill_run")
@@ -1199,17 +1165,7 @@ class Runtime(MemoryServices):
             raw = {"error": failure.model_dump()}
             self.store.event(sid, "failure", failure.model_dump(), parent=eid)
         finally:
-            if external_checkpoint:
-                try:
-                    GitWorkspace(context).observe_effects(external_checkpoint, action_id)
-                except (ValueError, OSError) as exc:
-                    self.store.event(
-                        sid,
-                        "workspace_observation_failed",
-                        {"action_id": action_id, "reason": str(exc)},
-                        parent=eid,
-                    )
-                    self.store.update(sid, paused=True, runnable=False)
+            self.environment.after_action(context, external_checkpoint)
         result = self._action_result(sid, action_id, raw, eid)
         # Python receives full values for computation, while the action journal/context
         # always stores a bounded preview plus the durable artifact.
@@ -1329,6 +1285,7 @@ class Runtime(MemoryServices):
             eid = self.store.event(sid, "verifier_started", {"attempt": attempt + 1}, parent=parent)
             try:
                 async with asyncio.timeout(config.limits.tool_timeout_seconds):
+                    await self.environment.prepare(sid, force=True)
                     verification = await self.adapters[config.task.adapter].verify(
                         ToolContext(self, sid, new_id(), eid), config.task
                     )
@@ -1424,20 +1381,8 @@ class Runtime(MemoryServices):
         if sid in self.tasks:
             raise ValueError("Pause the source session before forking it")
         last = self.store.events(sid, limit=1)
-        workspace, config = source.workspace, self.store.config(sid).model_copy(deep=True)
-        if config.task.adapter == "coding":
-            from .gitops import GitWorkspace
-
-            event = self.store.event(sid, "fork_workspace", {})
-            git = GitWorkspace(ToolContext(self, sid, new_id(), event))
-            checkpoint = git.snapshot("fork-source")
-            isolated = git.isolate(checkpoint)
-            workspace = Workspace(
-                path=str(isolated),
-                metadata={"isolation": "private_git_copy", "source_checkpoint": checkpoint},
-            )
-            config.task.repository = str(isolated)
-            config.task.base_commit = None
+        config = self.store.config(sid).model_copy(deep=True)
+        workspace, _ = self.environment.continuation_workspace(source, config)
         with self.store.transaction():
             branch = self.store.create(
                 source.instruction,
@@ -1504,7 +1449,7 @@ class Runtime(MemoryServices):
                 target_dir.mkdir(parents=True, exist_ok=True)
                 checkpoint = source_dir / "checkpoint.json"
                 if checkpoint.exists():
-                    if config.task.adapter == "coding":
+                    if workspace.path != source.workspace.path:
                         fork_checkpoint(
                             checkpoint,
                             target_dir / "checkpoint.json",

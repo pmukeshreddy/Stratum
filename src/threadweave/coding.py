@@ -51,7 +51,15 @@ def baseline(context):
 
 
 async def run_checks(context, kind, *, targets=None):
-    commands = baseline(context)["commands"].get(kind, [])
+    config = context.runtime.store.config(context.session_id)
+    # Standalone Environment actions don't require enrolling in a coding task,
+    # capturing a baseline or invoking other commands first.
+    commands = (
+        baseline(context)["commands"].get(kind, [])
+        if config.task.adapter == "coding"
+        else getattr(config.task, KINDS[kind])
+        or detect(context.path("."))["suggested_commands"].get(kind, [])
+    )
     if not commands:
         raise ValueError(f"No {kind} commands configured; add task.{KINDS[kind]}")
     if targets:

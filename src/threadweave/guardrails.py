@@ -1,17 +1,24 @@
 """No-progress evidence, not a planner. Recovery is allowed before the configured stop threshold."""
 
 import hashlib
+import json
 
 from .storage import encode
 
 
 def state_fingerprint(runtime, sid):
-    if runtime.store.config(sid).task.adapter != "coding":
-        return "generic"
-    index = runtime.index(sid)
-    return hashlib.sha256(
-        encode([(r["path"], r["sha256"]) for r in index.entries()]).encode()
-    ).hexdigest()
+    store, session = runtime.store, runtime.store.session(sid)
+    state = {}
+    checkpoint = store.directory / "kernels" / session.kernel_id / "checkpoint.json"
+    if checkpoint.is_file():
+        data = json.loads(checkpoint.read_text())
+        # Receipts change every execution even when computation made no progress.
+        state["repl"] = {k: data.get(k) for k in ("values", "recipes", "missing")}
+    state["messages"] = [m["id"] for m in store.messages(sid, limit=20)]
+    state["entries"] = [(e["id"], e["version"]) for e in store.states(sid)]
+    if store.config(sid).task.adapter == "coding":
+        state["files"] = [(r["path"], r["sha256"]) for r in runtime.index(sid).entries()]
+    return hashlib.sha256(encode(state).encode()).hexdigest()
 
 
 def observe(runtime, sid, name, arguments):

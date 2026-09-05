@@ -1,226 +1,158 @@
 # Threadweave
 
-A persistent coding-agent harness for real Git repositories. A model chooses how
-to search, edit, execute commands, delegate, and experiment. A separate verifier
-checks the resulting repository against configured tests and constraints before
-accepting completion.
+Threadweave is a persistent recursive agent harness. An interactive Agents View
+attaches to a daemon-owned Root Session. The model selects computation, tools,
+environment actions, recursive children, messages or completion. Each session owns
+its context and persistent Python REPL; history and reusable state live on disk.
+Ordinary conversation does not require a repository or a coding workflow.
 
-Python 3.11+ on macOS/Linux. Local execution requires trusted code and tool access.
-The default provider uses your existing ChatGPT/Codex subscription login.
-
-## Configure a real model and run
-
-Install the harness and the target repository's dependencies first:
+## Open the Agents View
 
 ```sh
 uv sync --extra dev
 uv run threadweave auth status
-# Only if not already signed into Codex:
+# Only if the shared Codex ChatGPT login is absent:
 uv run threadweave auth login
-# Once per client revision: requires git and Rust/cargo, downloads/builds official libraries.
-uv run threadweave auth install-client
-
-uv run threadweave doctor --config configs/coding.json
+uv run threadweave doctor --config configs/session.json
 uv run threadweave
-# Or open another repository:
-uv run threadweave --workspace /absolute/path/to/repository
 ```
 
-This opens one interactive conversation backed by the Threadweave daemon. Keep
-typing in the same terminal; you do not need session IDs or separate input/attach
-commands. `threadweave chat` is an alias for the default experience.
+The default uses the current directory and configs/session.json when available,
+otherwise an equivalent subscription-backed workspace configuration. It does not
+select configs/coding.json implicitly. --workspace and --config override discovery;
+threadweave chat is the same interface.
 
 ```text
-> inspect this repository
-> now inspect the agent loop
-> fix that issue and verify it
-> /diff
-> /usage
+> hi
+> Use Python to create x = 123 and remember it.
+> Read x from your existing REPL.
+> Create two independent children with rlm(), then continue working locally.
+> /tree
+> /compact
+> Read x again.
+> /state
 > /exit
 ```
 
-Use `uv run threadweave --continue` to return to the most recent conversation for
-the current workspace, or `--resume SESSION_ID` to choose one. `/help` lists
-`/status`, `/usage`, `/tree`, `/diff`, `/history`, `/experiments`, `/compact`,
-`/pause`, `/resume`, `/new`, and `/exit`. New sessions use `configs/coding.json`
-from the workspace, then the current directory when available; `--config PATH`
-overrides discovery. Otherwise a subscription-backed coding configuration is used.
-Resumed sessions keep their persisted config and cumulative budgets.
+Use `uv run threadweave --continue` for the most recent root in this workspace,
+or --resume SESSION_ID to choose one. Attachment does not change execution mode or
+reset accounting. Enter sends; Alt-Enter/Ctrl-J inserts a newline; arrow keys recall
+input. Input stays available during work; interventions are queued at a safe turn
+boundary. Ctrl-C pauses the current turn or clears idle input. Ctrl-D and /exit
+detach without killing work.
 
-Enter sends; Alt-Enter or Ctrl-J inserts a newline. Arrow keys recall input history,
-and multiline paste is supported. Model text streams into a bounded live area below
-the input, then moves into scrollback as Markdown. Tool activity and child labels
-appear above the prompt. Input stays usable during work: messages are queued at the
-next safe turn boundary. Ctrl-C interrupts the current session's work without losing
-state; at an idle prompt it clears input. `/exit` or Ctrl-D on empty input detaches
-without killing background work. `--json` exposes debug events, `--verbose` adds
-event/artifact details. Non-TTY stdin accepts line-delimited input and EOF detaches.
+/help lists /status, /state, /states, /usage, /tree, /history, /compact, /pause,
+/resume, /new, /exit, and optional Environment inspections /diff and /experiments.
+Model text streams. Large tool outputs remain in artifacts; --json and --verbose
+expose debugging detail.
 
-Chat stores new state outside the repository under
-`${XDG_DATA_HOME:-~/.local/share}/threadweave`, unless `--data` is supplied or the
-workspace already has a legacy `.threadweave/history.sqlite3`. A dirty repository
-prompts to continue with current files as baseline, show status, or exit; it never
-automatically commits or stashes. Conversations can inspect repositories with no
-configured tests, but coding completion still fails a required-tests verification
-gate until tests are configured. Ordinary conversation replies are **not** claims
-of verified coding completion; implemented fixes should use the `finish` tool.
+## Authentication
 
-[configs/coding.json](configs/coding.json) and [configs/kernel.json](configs/kernel.json)
-use `codex_subscription`. No `OPENAI_API_KEY` is needed. `auth models` lists the
-account's current model catalog. Omit `provider.model` to use Codex's configured/default
-model, or set `provider.model` in the config (`run` also accepts `--model`). Model and reasoning settings are
-resolved and stored before CLI run admission. `provider.parameters.reasoning_effort`
-can override the Codex setting. There is no automatic API-billing fallback.
+The normal provider is codex_subscription, reusing the official shared Codex
+ChatGPT login. No OPENAI_API_KEY is required. auth models lists supported models.
+Omit provider.model to resolve the account default, or select a supported model.
+provider.parameters.reasoning_effort overrides account settings.
 
-Authentication uses the official app-server account protocol. Inference uses the
-official Codex Rust Responses client and auth manager, pinned to a source revision.
-The bridge makes one model request: it creates no Codex agent or conversation and
-executes no tools. Threadweave supplies the context and schemas and executes returned
-structured calls. Codex owns credentials and refresh; Threadweave never exports tokens.
-`auth logout` signs out of the **shared Codex login**, not just Threadweave.
+Authentication/refresh remain owned by Codex. The official-client inference bridge
+makes model requests only: Threadweave supplies context/tool schemas and executes
+returned calls. It does not invoke another agent to solve tasks. There is no API
+billing fallback. Subscription dollar cost is null. The backend does not expose a
+server-enforced output-token cap; a client-observed byte guard and time budgets
+apply. [Provider details and optional API mode](docs/subscription.md).
+auth logout signs out of the shared Codex login.
 
-The subscription backend currently rejects a server `max_output_tokens` parameter.
-Threadweave therefore applies a client-observed output-byte guard (four bytes per
-configured output token), plus timeouts and cumulative accounting. This is **not a
-hard server token cap**; hidden reasoning/in-flight usage can exceed reservations.
-Reported usage is authoritative; interrupted usage is marked estimated. Subscription
-monetary cost is `null`, and dollar budgets/API prices are rejected for this provider.
-See [subscription transport](docs/subscription.md) for installation and limitations.
+## Architecture
 
-The optional `chat` provider remains available for intentionally configured API
-usage; see [optional API configuration](docs/subscription.md#optional-api-provider).
+```text
+Human ↔ Agents View ↔ Root Session ↔ Environment
+                          ↕ rlm / messages    ↕
+                     Recursive Subagents ────+
+                          ↕       ↕
+                           Daemon
+                              ↕
+                       Continual Harness
 
-Configure repository-specific argv arrays in task.test_commands, build_commands,
-lint_commands and typecheck_commands. Empty groups use available Python/Cargo/Go/npm
-entry-point detection. Missing tests fail preparation unless explicitly configured
-or require_tests is deliberately disabled. The default baseline requires a clean
-Git working tree. Dependencies are not installed automatically.
+L1: selected active context
+L2: persistent REPLs, retained values, recursive sessions/handles
+L3: disk-backed history, artifacts, messages, reusable state, session metadata
 
-## Repository intelligence and precise edits
-
-The persistent incremental index records hashes, languages, symbols and imports,
-excluding common generated/vendor directories. Tools include repo_map, repo_search,
-symbol_search, references_search, file_outline and dependency_context. Python uses
-AST parsing; other supported languages use lexical extraction. References are
-likely usages, not a compiler-grade call graph. Search uses ripgrep when available
-with a Python fallback.
-
-Editing tools provide strict unified patches, hash-checked line replacement,
-creation/deletion/moves, diffs and rollback. Patches validate before mutation;
-journals retain pre/post hashes, prior contents and patch artifacts. Interrupted
-edits recover or pause on conflicting external changes. Git checkpoints do not
-commit or reset the user's repository.
-Direct Python/process coding actions also receive before/after checkpoints and
-workspace-effect records, including interrupted effects observed during recovery.
-
-## Real execution and independent verification
-
-Before model actions, the coding adapter captures Git state, a file checkpoint,
-configured test/build results and optional benchmark measurements. Calling finish
-only requests completion. The verifier reruns commands and checks allowed/forbidden
-paths, required files, test deletion, optional test protection, baseline regressions,
-nonempty changes and benchmark thresholds. Failure returns evidence for another turn.
-
-run_tests, run_targeted_tests, run_build, run_lint and run_typecheck retain exit
-status, timing, full stdout/stderr and bounded parsed diagnostics. failure_localize
-connects evidence to source definitions, likely references and recent edits. Passing
-a weak configured verifier is not proof of arbitrary task correctness.
-
-Local execution is trusted-host execution, not a sandbox. Docker/Podman commands
-can use a private workspace mount, read-only container root, resource limits and
-network restrictions. Container-only configurations must omit Python permission:
-host REPL workers are not sandboxed by the command executor.
-
-## Persistent sessions and isolated coding children
-
-The detached daemon owns sessions independently of clients. `/exit` detaches; Ctrl-C
-in chat interrupts the current turn. SQLite preserves session IDs, recursive relationships, messages,
-action journals, goals, contexts, accounting and versioned state.
-
-Python variables persist across turns. Supported codecs and explicit reconstruction
-recipes recover state after restart; unsupported objects are reported. Full history
-survives compaction and is searchable through FTS5. Model-generated compaction
-retains structured facts and provenance, with a recorded extractive fallback.
-
-Coding children receive private Git copies of the parent's captured working state,
-including uncommitted inputs. Parents explicitly inspect/apply candidate patches;
-nothing merges automatically. Child usage, findings, verification, patch production,
-consumption and acceptance are recorded.
-
-Administrative/automation commands remain available (use chat for normal conversations):
-
-```sh
-uv run threadweave --data /absolute/path/to/agent-state list
-uv run threadweave --data /absolute/path/to/agent-state tree SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state status SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state history SESSION_ID --limit 20
-uv run threadweave --data /absolute/path/to/agent-state usage SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state pause SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state diff SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state verify SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state input SESSION_ID "Investigate the remaining failure."
-uv run threadweave --data /absolute/path/to/agent-state resume SESSION_ID
-uv run threadweave --data /absolute/path/to/agent-state attach SESSION_ID
+Long-horizon controls: autonomous mode, persistent goals, heartbeats, budgets
 ```
 
-stop cancels a tree; fork creates a separate continuation with explicit ancestry
-and an isolated coding workspace. Paused sessions retain messages. Restart recovers
-runnable sessions; reboot requires restarting the daemon or a service manager.
+rlm(instruction, name=None) returns a stable child handle after admission without
+waiting for a child answer. Children have independent contexts, REPLs and histories;
+they can create descendants. Related sessions communicate through durable queues.
+A failed child does not destroy the root.
 
-## Experiments, performance and refinement
+The Continual Harness retains append-only history and versioned memories,
+executable skills, prompt notes and reusable subagent specifications. refine queues
+typed, evidence-backed edits applied at turn boundaries. Read, explicit selection,
+deletion, rollback and optional global scope are supported. Foundational policy and
+model weights are never modified.
 
-Experiments are durable entities with hypotheses, source checkpoints, changes,
-correctness commands, measured results, patch artifacts and conclusions.
-experiment_create/run/result/compare/list expose them to the model;
-threadweave experiments exposes them to a human.
+Compaction only changes L1. History, REPL values and children remain intact.
+Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,
+accounting and supported Python checkpoint values. Non-serializable objects require
+explicit reconstruction recipes; missing/uncertain state is reported, not invented.
+[Component implementation and connection tests](docs/architecture.md).
 
-Benchmarks execute correctness gates, warmups and repeated actual commands, storing
-raw values, median, nearest-rank p95 and baseline comparisons. Direction, required
-improvement and noise tolerance are explicit. [configs/kernel.json](configs/kernel.json)
-expects real make build/correctness/benchmark targets; adapt commands and the metric
-regex to your project. Optional ncu, nsys or configured profiler commands retain
-reports. Ordinary coding requires no GPU.
+## Environment capabilities
 
-Optional automatic refinement runs at configured intervals, verifier failures,
-experiment conclusions and completion. Proposals need evidence IDs and intended
-effects. Executable skills validate schemas, syntax and declared permissions, track
-outcomes and quarantine repeatedly failing versions. Rollback appends a version.
-Model weights and foundational policy are unchanged. Validation does not prove
-generated code is safe.
+Files, processes, repository search/indexing, validated patches, Git checkpoints,
+tests/builds, benchmarks/profilers and durable experiments are Environment tools.
+The model chooses when to use them. Missing prerequisites return errors; a tool's
+existence does not imply a successful run.
 
-## Evaluate supplied workloads
-
-No benchmark dataset or score is bundled. Supply real repository issue,
-long-context or kernel instances described in [evaluation docs](docs/evaluation.md):
+For a task explicitly needing coding baseline and independent completion gates:
 
 ```sh
-uv run threadweave --data /absolute/path/to/eval-state eval /path/to/tasks.jsonl \
-  --config configs/coding.json --repetitions 3 --seed 42 --output /path/to/results.jsonl
-uv run threadweave analyze /path/to/results.jsonl
+uv run threadweave run "Fix the failing tests without weakening them." \
+  --workspace /path/to/repository --config configs/coding.json --attach
 ```
 
-Each isolated run records its resolved config, verifier outcome, patch and resource/
-trajectory metrics in JSONL and SQLite. Feature flags support ablations. Seeds are
-run labels, not claimed deterministic remote-model seeds.
+This optional environment captures baseline evidence and verifies finish against
+configured commands and repository constraints. Interactive greetings/inspection
+do not run its baseline. Writable coding children use private repository copies;
+parent acceptance is explicit. Generic children share the Environment: coordinate
+writes or supply an isolated environment when needed. Nothing is automatically
+committed or stashed. configs/kernel.json selects optional compile/correctness/
+performance commands through the same architecture.
 
-## Development and boundaries
+## Long-horizon sessions
+
+run --mode autonomous continues until completion, a configured end-condition or
+limits. --mode goal persists the objective across continuations. --mode heartbeat
+executes scheduled turns. schedule_turn supports intervals and UTC cron.
+Turn/token/time/tool/Python/depth/concurrency limits and accounting include
+descendants; detach/resume does not reset budgets.
+
+New chats store state in the user's XDG data directory (normally
+~/.local/share/threadweave), reuse an existing workspace .threadweave/history.sqlite3,
+or use --data. Automation retains list, status, tree, history, usage, states, input,
+attach, pause, resume, stop, fork and schedule. Explicitly restart an old daemon
+after upgrading: live processes do not reload source changes.
+
+## Tests and boundaries
 
 ```sh
 uv run pytest -q
 uv run ruff check src tests
 uv run ruff format --check src tests
 uv build
+
+# Real subscription, terminal, root/children, compaction and hard restart:
+env -u OPENAI_API_KEY THREADWEAVE_LIVE_ARCHITECTURE=1 \
+  THREADWEAVE_ARCHITECTURE_OUTPUT=/absolute/path/to/acceptance-results \
+  uv run pytest -s tests/test_architecture_live.py
 ```
 
-Providers used for deterministic tests live only under tests/. Tests execute real
-temporary repositories, test commands, patches, measurements and daemon death/
-restart. HTTP transport tests use in-memory responses. No paid-model quality,
-external benchmark score, or GPU performance is claimed by these tests.
+Deterministic providers exist only in tests. The opt-in test uses the real provider
+and stores raw terminal output, event trajectories and a result summary. Use a new
+output directory for each acceptance run.
 
-Boundaries: single-host daemon; synchronous local indexing/Git metadata; lexical
-non-Python navigation; full-copy candidates; text unified patches; no isolation for
-host Python/processes; no exactly-once external effects; no statistical significance
-claim from benchmark tolerance. Exact artifacts may contain repository secrets.
-
-See [architecture](docs/architecture.md), [operations/security](docs/operations.md),
-[extensions](docs/extensions.md), and [evaluation](docs/evaluation.md).
+Local Python/processes execute trusted code with the host user's authority: not a
+sandbox. Container command execution does not sandbox host REPLs. Artifacts may
+contain sensitive workspace content and are private by default. This is a
+single-host daemon; arbitrary-object recovery and exactly-once external effects
+are not guaranteed. [Operations/security](docs/operations.md),
+[extensions](docs/extensions.md), [Environment evaluation](docs/evaluation.md).

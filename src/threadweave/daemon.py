@@ -118,7 +118,7 @@ class Daemon:
                 "pid": os.getpid(),
                 "data": str(self.directory),
                 "schema_version": 2,
-                "capabilities": ["interactive_chat"],
+                "capabilities": ["interactive_chat", "information_hierarchy", "recursive_sessions"],
             }
         if method == "create":
             config = RunConfig.model_validate(args.pop("config", {}))
@@ -143,6 +143,8 @@ class Daemon:
             }
         if method == "config":
             return store.config(args["session_id"]).model_dump(mode="json")
+        if method == "information":
+            return runtime.information(args["session_id"])
         if method in {"history", "chat_events"}:
             sid = args.pop("session_id")
             rows = store.events(sid, **args)
@@ -188,9 +190,9 @@ class Daemon:
                             "scope": "unprepared_session",
                         },
                     )
-            if session.mode != "interactive":
-                store.update(sid, mode="interactive")
-                store.event(sid, "interactive_attached", {"previous_mode": session.mode})
+            # Attaching is observation/control, not a change to the daemon-owned
+            # execution mode. A persistent goal or heartbeat keeps its semantics.
+            store.event(sid, "interactive_attached", {"mode": session.mode})
             return bounded_session(store.session(sid))
         if method == "chat_detach":
             store.event(args["session_id"], "client_detached", {"client": "chat"})

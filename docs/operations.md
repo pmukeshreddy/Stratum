@@ -2,14 +2,16 @@
 
 ## Configuration and budgets
 
-configs/coding.json uses the existing ChatGPT/Codex subscription. An omitted model
+configs/session.json uses the existing ChatGPT/Codex subscription. An omitted model
 uses Codex's configured/default model, resolved from the live catalog. Run auth status
 and auth install-client before first use. See [subscription details](subscription.md).
 The optional chat provider accepts explicit API model/base URL/credential-variable
 configuration. Unknown providers, unavailable models and missing authentication fail
 without a fake-provider or API-billing fallback.
 
-Task configuration includes repository/base_commit; allowed_paths/forbidden_paths;
+The default task.adapter is workspace, with no verifier or coding preparation.
+Explicit configs/coding.json opts into repository baseline/completion policy.
+That task configuration includes repository/base_commit; allowed_paths/forbidden_paths;
 argv test/build/lint/typecheck commands; capture_baseline/require_clean_baseline;
 require_tests/prohibit_test_deletion/protect_tests; required_files/require_change;
 and optional benchmark/profiler configuration. CMake/Make projects should provide
@@ -17,7 +19,7 @@ explicit commands because target names and build directories vary.
 
 models maps aliases to full provider configurations. routing supports fixed or
 role_based policies, a default alias, and mappings such as agent, reviewer,
-compaction and refinement. agent_spawn can specify a role. Every decision/reason is
+compaction and refinement. rlm (or agent_spawn) can specify a role. Every decision/reason is
 recorded. Cost budgets require prices for every routed API model; subscription
 usage has null monetary cost and cannot use dollar budgets.
 
@@ -34,11 +36,13 @@ execution times can overlap. An interrupted turn's recovery estimate remains con
 
 `threadweave` and `threadweave chat` open a persistent interactive root, initially
 idle until the first message. `--workspace` defaults to cwd; `--config` overrides
-coding-config discovery. `--continue` selects the most recently updated root for
+configs/session.json discovery. `--continue` selects the most recently updated root for
 that workspace; `--resume ID` opens a specific root and its original workspace and
 config. No IDs are needed for subsequent messages. A plain model reply yields to
-input; successful independent coding verification also yields without destroying
-the session. Tool-only responses continue the existing runtime loop.
+input; accepted completion also yields without destroying
+the session. Only an actual verifier pass is labelled verified. Tool-only responses
+continue the existing runtime loop. Attaching to an autonomous/goal/heartbeat root
+does not change its existing execution mode.
 
 Chat uses user data storage outside the repository by default (XDG_DATA_HOME or
 ~/.local/share/threadweave); existing workspace-local .threadweave stores are reused.
@@ -54,7 +58,7 @@ At an idle prompt Ctrl-C clears input. /exit and Ctrl-D on empty input detach.
 Typing while busy queues a durable intervention for the next safe turn boundary.
 Partial external actions are not assumed rolled back after cancellation.
 
-Slash controls: /help, /status, /usage, /tree, /diff, /history, /experiments,
+Slash controls: /help, /status, /state, /states, /usage, /tree, /diff, /history, /experiments,
 /compact, /pause, /resume, /new, /exit. Diff and manual compaction require the
 session to be idle/paused. /new retains prior sessions and does not stop their work.
 --json gives debug events; --verbose adds low-level event/artifact details.

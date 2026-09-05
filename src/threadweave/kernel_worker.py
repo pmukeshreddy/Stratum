@@ -99,6 +99,7 @@ class Worker:
             "workspace": workspace,
             "remember_recipe": self.remember_recipe,
             "forget": self.forget,
+            "rlm": self.rlm,
         }
         self.protected = set(self.values)
         self.receipt = None
@@ -122,6 +123,10 @@ class Worker:
             raise ValueError("Recipe needs a non-reserved Python variable name")
         compile(code, "<recovery-recipe>", "exec")
         self.recipes[name] = code
+
+    def rlm(self, instruction: str = "", name: str | None = None, **options):
+        """Create/schedule a persistent child, returning JSON-safe handle metadata, not an answer."""
+        return self.values["tools"].call("rlm", instruction=instruction, name=name, **options)
 
     def forget(self, *names):
         for name in names:

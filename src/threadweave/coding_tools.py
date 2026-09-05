@@ -132,11 +132,8 @@ def register(registry):
         permissions=("workspace.read",),
         *,
         feature=None,
-        coding=True,
     ):
-        registry.register(
-            Tool(name, description, args, handler, permissions, coding_only=coding, feature=feature)
-        )
+        registry.register(Tool(name, description, args, handler, permissions, feature=feature))
 
     async def repo_map(c, a):
         return c.runtime.index(c.session_id).repo_map()
@@ -280,7 +277,12 @@ def register(registry):
         config = c.runtime.store.config(c.session_id).task.benchmark
         if not config:
             raise ValueError("Configure task.benchmark to run measured benchmarks")
-        return await run_benchmark(c, config, reference=baseline(c)["benchmark"])
+        reference = (
+            baseline(c)["benchmark"]
+            if c.runtime.store.config(c.session_id).task.adapter == "coding"
+            else None
+        )
+        return await run_benchmark(c, config, reference=reference)
 
     async def experiment_create(c, a):
         return Experiments(c).create(**a.model_dump())
@@ -467,7 +469,6 @@ def register(registry):
         history,
         (),
         feature="history_retrieval",
-        coding=False,
     )
     add(
         "artifact_search",
@@ -476,7 +477,6 @@ def register(registry):
         artifacts,
         (),
         feature="history_retrieval",
-        coding=False,
     )
     for name, args, handler in [
         ("experiment_create", ExperimentCreateArgs, experiment_create),
@@ -513,5 +513,4 @@ def register(registry):
         QueryArgs,
         skill_search,
         ("state",),
-        coding=False,
     )

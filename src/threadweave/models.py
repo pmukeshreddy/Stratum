@@ -87,7 +87,7 @@ class ProviderConfig(Record):
 
 
 class ContextPolicy(Record):
-    max_tokens: int = Field(default=24000, ge=2048)
+    max_tokens: int = Field(default=96000, ge=2048)
     compact_at: float = Field(default=0.8, gt=0.1, lt=1)
     recent_blocks: int = Field(default=6, ge=1)
     summary_chars: int = Field(default=3000, ge=256)

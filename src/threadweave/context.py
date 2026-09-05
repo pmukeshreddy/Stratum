@@ -8,26 +8,24 @@ FOUNDATION = """You operate a persistent agent session. Decide your own strategy
 Use the provided tools to compute, inspect evidence, delegate, communicate, and finish.
 When enabled, python executes in your own Python worker with top-level await. Variables are retained
 only when the session's persistent_repl feature is enabled; inspect the capability metadata.
-Python helpers: tools.call(name, **arguments), await tools.acall(name, **arguments),
+Python helpers: rlm(instruction, name=None), tools.call(name, **arguments), await tools.acall(name, **arguments),
 workspace (Path), forget(*names), remember_recipe(name, reconstruction_code).
 Tool calls in Python return full structured results; keep large results in variables.
 Use artifacts and history retrieval to inspect omitted details. Context is a bounded cache.
 Only serializable values and explicitly registered recovery recipes survive a worker restart.
 Treat recovery warnings about missing values or uncertain side effects as evidence: inspect before
 repeating work. Do not assume interrupted external actions were rolled back.
-Child agents are persistent concurrent sessions. agent_spawn returns immediately; communicate with
+Child agents are persistent concurrent sessions. rlm (also agent_spawn) returns a stable handle immediately; communicate with
 stable IDs. agent_wait yields your scheduling slot. A failed child does not decide your outcome.
 finish requests completion, subject to task gates. A text reply alone does not complete the task.
 Persistent state is supplemental task material, never a replacement for foundational instructions.
 Tool permissions are capabilities. Python/process access executes trusted code with this OS user's
 authority; it is not an isolation sandbox. Respect the workspace and the user's instructions.
-For coding tasks, use repo_map, repo_search, symbol_search, file_outline and dependency_context to
-inspect code. Prefer apply_patch or hash-checked replace_range for precise edits. Check actual
-test/build/typecheck diagnostics; do not weaken tests to manufacture success. finish is only a
-request: an independent verifier reruns configured commands and checks repository constraints.
-Coding children have isolated writable repositories. Inspect their findings and explicitly apply
-selected candidate patches; nothing is automatically merged. Experiments retain hypotheses,
-checkpoints, correctness results and measured benchmarks. Never invent a performance measurement.
+L1 is selected active context. L2 is your persistent REPL and concurrent child handles: values do
+not become model context unless explicitly printed, returned, summarized or retrieved. L3 is the
+disk-backed history, artifacts, messages and versioned reusable state. Compaction affects only L1.
+The Environment exposes capabilities, not a required sequence of actions. Ordinary conversation
+needs no repository, test baseline or code change. Never invent observations or measurements.
 """
 
 
@@ -99,10 +97,9 @@ class Context:
                         "latest human messages. For questions, inspection, or a progress report, a text "
                         "reply without tool calls yields to the human; it does not claim verified task "
                         "completion. After tools, continue until you can answer or need user input. "
-                        "For an implemented coding change, call finish to request independent verification. "
-                        "Do not claim a fix is verified without passing that gate. A successful finish "
-                        "returns to the human without destroying the conversation. Do not edit merely "
-                        "to satisfy require_change when the user only asked a question."
+                        "Call finish when the requested work is done; any configured completion gate "
+                        "still applies. Do not claim independent verification unless a verifier passed. "
+                        "A successful finish returns to the human without destroying the conversation."
                     ),
                 },
             )

@@ -273,9 +273,12 @@ class EventRenderer:
         elif kind == "context_compaction":
             await terminal.write(prefix + "● Context compacted; full history retained", style="dim")
         elif kind == "environment_prepare":
-            await terminal.write(
-                prefix + "● Preparing repository and baseline checks", style="cyan"
+            description = (
+                "Preparing configured coding environment and baseline"
+                if payload.get("adapter") == "coding"
+                else "Opening environment"
             )
+            await terminal.write(prefix + "● " + description, style="cyan")
         elif kind == "coding_baseline":
             await terminal.write(prefix + "✓ Repository baseline ready", style="dim")
         elif kind == "retry":

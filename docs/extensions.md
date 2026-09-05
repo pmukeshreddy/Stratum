@@ -56,8 +56,8 @@ python_callable=false for tools that would reenter the same worker.
 Use context.path for files, Editor for edits, GitWorkspace for checkpoints and the
 configured Executor/run_command for processes. Respect cancellation and use
 context.action_id as an external idempotency key where available. The harness cannot
-undo arbitrary external effects. Tool metadata controls permissions, features and
-coding-only exposure.
+undo arbitrary external effects. Tool metadata controls permissions and feature
+availability; a tool does not require selecting a coding task adapter.
 
 ## Task/environment
 
@@ -66,9 +66,10 @@ async verify(context, task_config) -> Verification | None. Preparation and verif
 must be idempotent/recoverable. Return passed=false for task failure; raise for
 infrastructure/environment failure.
 
-CodingTask supplies repository baseline/verification. WorkspaceTask remains for
-embedded non-coding environments; it is not the CLI product workflow. Add new
-domain capabilities without a separate scheduler or mandatory planner graph.
+WorkspaceTask is the default Environment policy for both CLI and embedded use.
+CodingTask optionally supplies repository baseline/verification. Environment owns
+that policy, not the Root Session. Add capabilities without a separate scheduler
+or mandatory planner graph. Ordinary interaction must not require a coding task.
 
 External Instance loaders cover repository issues, context bundles and kernel
 workspaces. A new dataset loader should translate supplied instances into those

@@ -1,0 +1,13 @@
+{
+  "provider": {
+    "name": "codex_subscription",
+    "streaming": true,
+    "max_output_tokens": 4096,
+    "timeout_seconds": 180
+  },
+  "task": {"adapter": "workspace", "verifier": "none"},
+  "permissions": ["workspace.read", "workspace.write", "python", "process", "agents", "state"],
+  "execution": {"backend": "local", "environment_allowlist": ["PATH", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"]},
+  "context": {"max_tokens": 96000, "summary_chars": 6000, "result_chars": 2400},
+  "limits": {"max_turns": 100, "token_budget": 3000000, "wall_seconds": 7200, "concurrency": 4, "max_subagents": 10, "max_depth": 3, "tool_timeout_seconds": 600}
+}
