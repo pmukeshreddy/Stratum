@@ -224,6 +224,7 @@ async def test_killed_daemon_does_not_replay_uncertain_tool_side_effect(tmp_path
             "name": "recovery_scenario",
             "max_output_tokens": 128,
             "parameters": {"scenario": scenario},
+            "model": "deterministic",
         },
         extensions=["tests.scenario_plugin:install"],
         permissions=["workspace.read", "workspace.write", "python", "process"],

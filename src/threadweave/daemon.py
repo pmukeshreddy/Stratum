@@ -31,7 +31,7 @@ async def request(directory, method, **arguments):
     try:
         writer.write((json.dumps({"method": method, "arguments": arguments}) + "\n").encode())
         await writer.drain()
-        async with asyncio.timeout(60):
+        async with asyncio.timeout(86400 if method == "verify" else 60):
             line = await reader.readline()
         if not line:
             raise ConnectionError("Daemon disconnected before responding")
@@ -74,7 +74,7 @@ class Daemon:
     async def dispatch(self, method, args):
         runtime, store = self.runtime, self.runtime.store
         if method == "ping":
-            return {"pid": os.getpid(), "data": str(self.directory), "schema_version": 1}
+            return {"pid": os.getpid(), "data": str(self.directory), "schema_version": 2}
         if method == "create":
             config = RunConfig.model_validate(args.pop("config", {}))
             return bounded_session(runtime.create(config=config, **args))
@@ -143,6 +143,33 @@ class Daemon:
             return {"disabled": args["schedule_id"]}
         if method == "states":
             return store.states(args["session_id"], include_deleted=True)
+        if method in {"diff", "experiments", "verify"}:
+            from .experiments import Experiments
+            from .gitops import GitWorkspace
+            from .models import new_id
+            from .tools import ToolContext
+
+            sid = args["session_id"]
+            if sid in runtime.tasks:
+                raise ValueError(
+                    "Pause the session before inspecting a stable diff or running manual verification"
+                )
+            event = store.event(sid, "human_inspection", {"operation": method})
+            context = ToolContext(runtime, sid, new_id(), event)
+            if method == "diff":
+                patch = GitWorkspace(context).diff()
+                return {
+                    "patch": patch[:16000],
+                    "artifact_id": runtime.artifacts.put_bytes(sid, patch.encode(), "text/x-diff"),
+                }
+            if method == "experiments":
+                return Experiments(context).list()
+            await runtime._prepare(sid)
+            verification, error = await runtime._verify(sid, event)
+            return {
+                "verification": verification.model_dump() if verification else None,
+                "infrastructure_error": error,
+            }
         if method == "refine":
             return {
                 "refinement_id": store.queue_refinement(

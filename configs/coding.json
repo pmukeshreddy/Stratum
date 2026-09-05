@@ -1,0 +1,28 @@
+{
+  "provider": {
+    "name": "chat",
+    "model": "${THREADWEAVE_MODEL}",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "streaming": true,
+    "max_output_tokens": 4096,
+    "timeout_seconds": 180
+  },
+  "task": {
+    "adapter": "coding",
+    "require_clean_baseline": true,
+    "capture_baseline": true,
+    "require_tests": true,
+    "prohibit_test_deletion": true,
+    "require_change": true,
+    "test_commands": [],
+    "build_commands": [],
+    "lint_commands": [],
+    "typecheck_commands": []
+  },
+  "permissions": ["workspace.read", "workspace.write", "python", "process", "agents", "state"],
+  "execution": {"backend": "local", "environment_allowlist": ["PATH", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"]},
+  "context": {"max_tokens": 96000, "summary_chars": 6000, "result_chars": 2400},
+  "refinement": {"automatic": true, "every_turns": 10, "on_completion": true},
+  "limits": {"max_turns": 100, "token_budget": 3000000, "wall_seconds": 7200, "concurrency": 4, "max_subagents": 10, "max_depth": 3, "tool_timeout_seconds": 600}
+}

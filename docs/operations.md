@@ -1,149 +1,120 @@
-# Configuration and operations
+# Configuration, control and security
 
-## Reproducible runs
+## Configuration and budgets
 
-`RunConfig` is a strict, versioned Pydantic model. Unknown fields, nonpositive
-limits, impossible context reservations, and incomplete cost-budget configuration
-are rejected. Configurations are serialized canonically, hashed, and stored once;
-every session references its exact configuration. Model credentials are referenced
-by environment-variable name and are not copied into the configuration.
+configs/coding.json requires an explicit provider.model or THREADWEAVE_MODEL.
+Provider configuration supports a compatible base URL, credential-variable name,
+parameters, streaming, timeout, output limit and optional prices. Missing models,
+unknown providers and missing credentials fail clearly.
 
-Configuration groups:
+Task configuration includes repository/base_commit; allowed_paths/forbidden_paths;
+argv test/build/lint/typecheck commands; capture_baseline/require_clean_baseline;
+require_tests/prohibit_test_deletion/protect_tests; required_files/require_change;
+and optional benchmark/profiler configuration. CMake/Make projects should provide
+explicit commands because target names and build directories vary.
 
-| Group | Main fields |
-| --- | --- |
-| `provider` | name, model, base_url, api_key_env, parameters, streaming, timeout_seconds, max_output_tokens, optional input/output prices |
-| `task` | adapter, specification, verifier, verifier_options, verify_each_turn, require_verifier, wait_for_children, success_metrics |
-| `context` | max_tokens, compact_at, recent_blocks, summary_chars, result_chars, supplemental_chars |
-| `refinement` | enabled, allow_global_writes, selected_entries |
-| `retry` | attempts, initial_delay, max_delay |
-| `limits` | max_turns, token_budget, wall_seconds, cost_budget, max_tool_calls, max_python_executions, max_model_calls, max_subagents, max_depth, concurrency, tool_timeout_seconds, python_timeout_seconds |
-| top level | schema_version, permissions, tool_allowlist, allow_sibling_messages, extensions |
+models maps aliases to full provider configurations. routing supports fixed or
+role_based policies, a default alias, and mappings such as agent, reviewer,
+compaction and refinement. agent_spawn can specify a role. Every decision/reason is
+recorded. Cost budgets require prices for every routed model.
 
-Omitted fields use explicit defaults in `models.py`. Run
-`threadweave config SESSION_ID` to export a fully resolved configuration. Pin your
-model ID, task revision, extension source version, and dependencies (`uv.lock`) for
-reproducibility; the runtime cannot make a remote stochastic model deterministic.
+limits apply cumulatively across the recursive tree and resumes. Conservative
+UTF-8 byte bounds reserve model input/output capacity; actual provider usage replaces
+reservations. Unknown/interrupted calls are charged conservatively. Root elapsed
+time includes waiting/downtime; summed session time can overlap.
 
-Tree budgets are cumulative across resumes. A new fork creates a new root budget
-and explicitly records ancestry, so analyses can include branch costs separately.
-The daemon's `--concurrency` caps simultaneous turns across all roots; each run's
-`limits.concurrency` adds a per-root cap. Both count turns, not sleeping agents.
+## Control
 
-The default capabilities are `workspace.read`, `workspace.write`, `python`, `agents`,
-and `state`. `process` is opt-in. A `tool_allowlist` further narrows the registry.
-Tool metadata is checked for both native model calls and Python callbacks. A
-subagent inherits permissions and cannot request broader ones through `agent_spawn`.
+Commands: run, attach, list, status, tree, history, usage, diff, experiments, verify,
+input, pause, resume, stop, fork, doctor. Additional controls: config, states, refine,
+compact, schedule, schedules, unschedule, artifact and daemon start/status/stop.
 
-## Local control protocol
+Use the same global --data directory for every command, preferably outside the
+repository. Pause before manual diff/verification for a stable workspace.
+Ctrl-C during attach detaches; it does not cancel. Terminal sessions require resume.
+Resource-limited sessions require a new fork for a fresh budget; original spend
+remains recorded.
 
-The CLI communicates over a mode-0600 Unix socket. Each connection sends one JSON
-line and receives one JSON line. Requests are bounded to 8 MiB; history/status
-previews are bounded. The local same-user socket is the authentication boundary.
-There is no unauthenticated network listener.
+Schedules accept intervals or five-field UTC cron, coalescing missed ticks.
+Reboot requires daemon startup, manually or through a service manager.
 
-```json
-{"method":"status","arguments":{"session_id":"STABLE_ID"}}
-```
+refine SESSION_ID edit.json queues an evidence-backed StateEdit. Automatic refinement
+can also be explicitly requested with refine SESSION_ID or input SESSION_ID /refine.
+The request runs at the next turn boundary; paused sessions still need resume.
+Periodic refinement
+is separately controlled by refinement.automatic and interval/completion settings.
+Only explicitly selected durable entries enter context.
 
-Responses are either `{"result": ...}` or `{"error": "type: message"}`. Available
-methods include `ping`, `create`, `list`, `tree`, `status`, `config`, `history`,
-`input`, `pause`, `resume`, `stop`, `fork`, `schedule`, `schedules`, `unschedule`,
-`states`, `refine`, `compact`, `artifact`, and `shutdown`.
+## Security boundaries
 
-The Python `threadweave.daemon.request` client can be used by another UI. A richer
-frontend can poll durable event sequence cursors without assuming an uninterrupted
-socket connection. History's initial query returns a bounded tail; subsequent
-positive `after` sequence cursors page forward. `history_read(event_id=...)` and
-the artifact tools provide complete referenced details to agents. SQL remains an
-inspectable source for complete trajectory exports.
+Local Python and commands have the daemon user's OS authority. This is trusted-host
+execution, NOT a sandbox. Tool checks cannot contain arbitrary Python, imports or
+host subprocesses. Use a dedicated OS account, container or VM for untrusted tasks.
 
-For direct embedding, construct `Runtime`, register integrations, create a session,
-then await `start()` and `wait(session_id)`. Always await `shutdown()` in `finally`.
-Use `Runtime` with one event loop and one owner per data directory. Use the daemon
-for detachment: shutting down an embedded Python interpreter also shuts down its
-runtime ownership.
+File tools resolve paths and reject workspace escapes and direct .git/private-state
+access. Editors reject symlink traversal. Command allowlists match exact argv[0].
+Permitting an interpreter permits its programs; this is not a shell-language sandbox.
 
-## State-edit example
+Child environments contain only allowlisted variables and permitted overrides.
+Credential-like variables are excluded; provider credentials stay in the daemon.
+Event payloads redact known credential values and sensitive fields, but cannot
+discover every secret in arbitrary files. Exact artifacts/checkpoints/patches may
+contain secrets and must remain private.
+
+For container commands configure, adapting the image to an installed toolchain:
 
 ```json
 {
-  "kind": "memory",
-  "scope": "session",
-  "title": "Measured constraint",
-  "content": {"text": "The target environment requires Python 3.12."},
-  "source_events": ["REAL_EVENT_ID_FROM_THIS_TREE"],
-  "intended_effect": "Use the measured interpreter version in future commands.",
-  "select": true
+  "execution": {
+    "backend": "container", "engine": "docker",
+    "image": "your-prebuilt-toolchain-image:immutable-tag",
+    "network": false, "read_only": false, "memory": "4g", "cpus": 2
+  },
+  "permissions": ["workspace.read", "workspace.write", "process", "agents", "state"]
 }
 ```
 
-For update, include `entry_id` and optionally `expected_version`. For delete, set
-`operation="delete"`. For rollback, set `operation="rollback"` and
-`rollback_version=N`; rollback creates a new current version with the previous
-content. The source-event and intended-effect requirements also apply to deletion
-and rollback. The CLI queues edits; they are applied at the next execution boundary.
-Resume an idle/paused session to make pending edits active.
+Docker/Podman must be installed and available. The container gets a read-only root,
+temporary storage, dropped capabilities, a PID limit and only its task workspace
+bind mount. network=false uses the engine's no-network mode. Writable commands can
+still modify the mounted repository; final verification checks configured paths.
+Local network restrictions are reported as unenforced, and local read-only command
+execution is rejected.
 
-Typed content fields are `text` for memories/prompt notes, `code` for skills, and
-`instruction` for subagent specifications. Selection IDs are available from
-`state_list`/`states`. `state_select` explicitly chooses the L1 supplement.
+Host Python workers are unavailable in container-only configurations. GPU runtime/
+device passthrough is not implemented; use a configured trusted GPU host or an
+externally isolated environment. Container execution is optional for ordinary coding.
 
-## On-disk layout and backup
+Cancellation kills/reaps process groups. Supervisors also stop groups if the daemon
+disappears. Deliberately detached host processes can escape that boundary. Ordinary
+container cancellation removes the named container. Durable container leases are
+cleaned during daemon recovery after hard death. If the engine is unavailable,
+recovery pauses the affected session and records the cleanup failure; inspect the
+engine before resuming. Containers may keep running while the daemon is down.
+This is not a distributed container lease service.
+
+## Storage and backups
 
 ```text
-.threadweave/
-  history.sqlite3          sessions, events, messages, versions, configs, usage, goals
-  history.sqlite3-wal      SQLite WAL while open
-  history.sqlite3-shm      SQLite shared-memory index while open
-  artifacts/<id>          immutable result values and logs
-  kernels/<kernel_id>/
-    checkpoint.json       supported values, reconstruction recipes, last receipt
-    worker.lock           prevents concurrent writers to one checkpoint
-    <action_id>.stdout    raw execution output
-    <action_id>.stderr    raw execution errors
-    recovery.log          recipe output
-    worker.log            worker diagnostics
-  daemon.log              structured runtime events and diagnostic failures
-  daemon.json             last daemon PID and socket reference (informational)
-  daemon.lock             daemon ownership
-  runtime.lock            embedded/runtime ownership
+DATA/
+  history.sqlite3    durable sessions, history, queues, state versions, indexes,
+                     checkpoints, experiments, routing, verification and eval rows
+  artifacts/         exact private values, patches, files, logs and measurements
+  kernels/           per-session snapshots, receipts and logs
+  workspaces/        isolated candidates and verification copies
+  evaluations/       independent workloads, state and final patches
+  daemon.log         structured event IDs/types and startup diagnostics
+  daemon.lock / runtime.lock
 ```
 
-For a consistent simple backup, stop the daemon and copy the entire data directory
-plus the associated workspace. For online database backups, use SQLite's backup
-API and separately coordinate artifact/workspace snapshots. Copying only the main
-SQLite file while WAL writes are active is not a valid full backup. Restoring to a
-different machine requires updating/restoring the actual workspace location and
-installing the configured extension modules; paths are intentionally stable.
+Stop the daemon and back up the whole data directory plus associated workspaces.
+Online backups need SQLite backup APIs coordinated with file snapshots; copying
+only the main database during WAL activity is insufficient.
 
-Events are append-only and state versions immutable under database triggers.
-Artifacts include size and SHA-256 metadata. Full artifact loads verify checksums;
-bounded range reads do not rehash the entire file. Large logs go to disk, so plan
-disk capacity for long runs. Automatic retention pruning, encryption, remote
-replication, and disk/memory quotas are not implemented. Keep the data directory
-private and avoid storing secrets in model-visible task material.
+Storage is not encrypted and has no pruning/quota service. Monitor disk use for
+large logs, snapshots and candidate copies. Checkpoint files above 64 MiB fail
+explicitly. The source reference PDF is not installed with the package.
 
-## Debugging and operational limits
-
-Inspect `status`, `tree`, `usage`, and bounded `history` first. Events link model
-invocations, tool calls, Python runs, messages, retries, verifiers, refinement,
-compaction, and completion using event IDs and causal references. Model request
-artifacts capture the exact L1 request and tool schemas. JSON log lines contain
-session/root IDs, event IDs, timestamps, event type, and causal references; detailed
-payloads live in SQLite to keep logs bounded.
-
-Failure categories are `model`, `provider`, `tool`, `verifier`, `environment`, and
-`runtime`. Transient provider failures and verifier infrastructure failures follow
-the configured retry policy. Tool/Python failures are returned as evidence so the
-model can choose its next action. Infrastructure failures are not task verifier
-failures. A context-capacity error usually means tool schemas plus instructions
-cannot fit the configured conservative bound.
-
-This is a local, single-host runtime. It does not reconnect to an old Python process
-after application death; it recreates the worker from supported values and recipes.
-It does not automatically serialize arbitrary objects, roll back external side
-effects, or replay uncertain actions. Forks share workspaces, so concurrent writers
-must coordinate through messages or use explicit isolated workspaces at admission.
-Custom tools/adapters are responsible for their own external idempotency and resource
-cleanup. Deploy OS isolation and service supervision as required by your environment.
+doctor reports provider/model and credential presence (not values), Git/ripgrep,
+requested container health, available compilers and optional CUDA/profilers,
+data-directory writability and SQLite quick_check. It does not make a paid model call.

@@ -1,165 +1,166 @@
 # Threadweave
 
-A working Python harness for persistent, recursive agent sessions. A local daemon
-owns the execution loop; each session has an independent Python worker, durable
-history, message queue, context cache, and lifecycle. Models choose actions and
-delegation. The runtime supplies persistence, concurrency, verification, and limits.
+A persistent coding-agent harness for real Git repositories. A model chooses how
+to search, edit, execute commands, delegate, and experiment. A separate verifier
+checks the resulting repository against configured tests and constraints before
+accepting completion.
 
-Requires Python 3.11+ on macOS or Linux. The offline demonstration and tests need
-no model account, credentials, network access, or paid API calls.
+Python 3.11+ on macOS/Linux. Local execution requires trusted code and tool access.
+No provider or model is selected silently.
 
-## Run the complete offline example
+## Configure a real model and run
+
+Install the harness and the target repository's dependencies first:
 
 ```sh
 uv sync --extra dev
-mkdir -p demo-workspace
-uv run threadweave demo --workspace demo-workspace
+export OPENAI_API_KEY='your-provider-key'
+export THREADWEAVE_MODEL='an-explicit-model-id-available-at-your-endpoint'
+
+uv run threadweave --data /absolute/path/to/agent-state doctor --config configs/coding.json
+uv run threadweave --data /absolute/path/to/agent-state run \
+  "Fix the failing parser tests without weakening the tests." \
+  --workspace /absolute/path/to/repository \
+  --config configs/coding.json --attach
 ```
 
-This starts a detached daemon, creates a root session, computes in a persistent
-Python worker, spawns a concurrent child with its own worker, exchanges a message,
-writes `demo-workspace/answer.txt`, and completes through a file verifier. The
-answer is `499500`. The demonstration provider is a deterministic test program;
-real model providers choose their own sequence of actions.
+Set an actual model ID, not the illustrative text above.
+[configs/coding.json](configs/coding.json) resolves THREADWEAVE_MODEL explicitly
+and invokes the streaming chat provider. Alternatively put the ID directly in
+provider.model. Compatible endpoints can configure provider.base_url and
+provider.api_key_env; an empty credential-variable name means no authentication.
+Credentials must exist before daemon startup. Restart the daemon after changing
+its environment.
 
-Session data defaults to `.threadweave/` in your current directory. Choose another
-location with `threadweave --data /absolute/path ...`; use the same location when
-resuming. Stopping an attached CLI with Ctrl-C **detaches without cancelling**.
+Configure repository-specific argv arrays in task.test_commands, build_commands,
+lint_commands and typecheck_commands. Empty groups use available Python/Cargo/Go/npm
+entry-point detection. Missing tests fail preparation unless explicitly configured
+or require_tests is deliberately disabled. The default baseline requires a clean
+Git working tree. Dependencies are not installed automatically.
+
+## Repository intelligence and precise edits
+
+The persistent incremental index records hashes, languages, symbols and imports,
+excluding common generated/vendor directories. Tools include repo_map, repo_search,
+symbol_search, references_search, file_outline and dependency_context. Python uses
+AST parsing; other supported languages use lexical extraction. References are
+likely usages, not a compiler-grade call graph. Search uses ripgrep when available
+with a Python fallback.
+
+Editing tools provide strict unified patches, hash-checked line replacement,
+creation/deletion/moves, diffs and rollback. Patches validate before mutation;
+journals retain pre/post hashes, prior contents and patch artifacts. Interrupted
+edits recover or pause on conflicting external changes. Git checkpoints do not
+commit or reset the user's repository.
+Direct Python/process coding actions also receive before/after checkpoints and
+workspace-effect records, including interrupted effects observed during recovery.
+
+## Real execution and independent verification
+
+Before model actions, the coding adapter captures Git state, a file checkpoint,
+configured test/build results and optional benchmark measurements. Calling finish
+only requests completion. The verifier reruns commands and checks allowed/forbidden
+paths, required files, test deletion, optional test protection, baseline regressions,
+nonempty changes and benchmark thresholds. Failure returns evidence for another turn.
+
+run_tests, run_targeted_tests, run_build, run_lint and run_typecheck retain exit
+status, timing, full stdout/stderr and bounded parsed diagnostics. failure_localize
+connects evidence to source definitions, likely references and recent edits. Passing
+a weak configured verifier is not proof of arbitrary task correctness.
+
+Local execution is trusted-host execution, not a sandbox. Docker/Podman commands
+can use a private workspace mount, read-only container root, resource limits and
+network restrictions. Container-only configurations must omit Python permission:
+host REPL workers are not sandboxed by the command executor.
+
+## Persistent sessions and isolated coding children
+
+The detached daemon owns sessions independently of clients. Ctrl-C detaches without
+cancelling work. SQLite preserves session IDs, recursive relationships, messages,
+action journals, goals, contexts, accounting and versioned state.
+
+Python variables persist across turns. Supported codecs and explicit reconstruction
+recipes recover state after restart; unsupported objects are reported. Full history
+survives compaction and is searchable through FTS5. Model-generated compaction
+retains structured facts and provenance, with a recorded extractive fallback.
+
+Coding children receive private Git copies of the parent's captured working state,
+including uncommitted inputs. Parents explicitly inspect/apply candidate patches;
+nothing merges automatically. Child usage, findings, verification, patch production,
+consumption and acceptance are recorded.
 
 ```sh
-uv run threadweave list
-uv run threadweave tree SESSION_ID
-uv run threadweave status SESSION_ID
-uv run threadweave history SESSION_ID --limit 20
-uv run threadweave usage SESSION_ID
-uv run threadweave input SESSION_ID "Check the result against the original objective."
-uv run threadweave resume SESSION_ID
-uv run threadweave attach SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state list
+uv run threadweave --data /absolute/path/to/agent-state tree SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state status SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state history SESSION_ID --limit 20
+uv run threadweave --data /absolute/path/to/agent-state usage SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state pause SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state diff SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state verify SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state input SESSION_ID "Investigate the remaining failure."
+uv run threadweave --data /absolute/path/to/agent-state resume SESSION_ID
+uv run threadweave --data /absolute/path/to/agent-state attach SESSION_ID
 ```
 
-Use `pause SESSION_ID` to unload a session while retaining queued input;
-`resume SESSION_ID` continues it under the same identity and remaining budgets.
-Use `stop SESSION_ID` to cancel it and its active descendants. `stop --only`
-cancels that session while allowing descendants to continue within the root's
-remaining budget. Completion, cancellation, and failure do not delete history.
+stop cancels a tree; fork creates a separate continuation with explicit ancestry
+and an isolated coding workspace. Paused sessions retain messages. Restart recovers
+runnable sessions; reboot requires restarting the daemon or a service manager.
+
+## Experiments, performance and refinement
+
+Experiments are durable entities with hypotheses, source checkpoints, changes,
+correctness commands, measured results, patch artifacts and conclusions.
+experiment_create/run/result/compare/list expose them to the model;
+threadweave experiments exposes them to a human.
+
+Benchmarks execute correctness gates, warmups and repeated actual commands, storing
+raw values, median, nearest-rank p95 and baseline comparisons. Direction, required
+improvement and noise tolerance are explicit. [configs/kernel.json](configs/kernel.json)
+expects real make build/correctness/benchmark targets; adapt commands and the metric
+regex to your project. Optional ncu, nsys or configured profiler commands retain
+reports. Ordinary coding requires no GPU.
+
+Optional automatic refinement runs at configured intervals, verifier failures,
+experiment conclusions and completion. Proposals need evidence IDs and intended
+effects. Executable skills validate schemas, syntax and declared permissions, track
+outcomes and quarantine repeatedly failing versions. Rollback appends a version.
+Model weights and foundational policy are unchanged. Validation does not prove
+generated code is safe.
+
+## Evaluate supplied workloads
+
+No benchmark dataset or score is bundled. Supply real repository issue,
+long-context or kernel instances described in [evaluation docs](docs/evaluation.md):
 
 ```sh
-uv run threadweave daemon stop
-uv run threadweave daemon start
-uv run threadweave attach SESSION_ID
+uv run threadweave --data /absolute/path/to/eval-state eval /path/to/tasks.jsonl \
+  --config configs/coding.json --repetitions 3 --seed 42 --output /path/to/results.jsonl
+uv run threadweave analyze /path/to/results.jsonl
 ```
 
-Restart recovers runnable sessions automatically. Paused sessions stay paused.
-The daemon itself must be restarted after an OS reboot; it can be run under your
-service manager with `python -m threadweave.daemon --data /absolute/path`.
+Each isolated run records its resolved config, verifier outcome, patch and resource/
+trajectory metrics in JSONL and SQLite. Feature flags support ablations. Seeds are
+run labels, not claimed deterministic remote-model seeds.
 
-## Use a model provider
-
-Copy [examples/chat.json](examples/chat.json), set `provider.model` to a model ID
-available at your endpoint, and adjust the budgets. Supply credentials in the
-environment **before starting the daemon**:
-
-```sh
-export OPENAI_API_KEY='your-key'
-uv run threadweave daemon start
-uv run threadweave run "Inspect this repository and implement the requested change" \
-  --workspace /absolute/path/to/repository --config examples/chat.json --attach
-```
-
-The `chat` provider implements streamed and non-streamed chat completions with
-tool calls, usage, timeouts, and cancellation. Set `base_url` for a compatible
-local service; set `api_key_env` to `""` when the service requires no key. There is
-no default paid model ID. Provider parameters such as temperature are passed
-through; the harness owns the output-token maximum and protocol fields. Its wire
-format follows the [official API reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
-
-Changing credentials in a CLI does not change an already running daemon's
-environment. Stop and start the daemon after updating its credentials.
-
-## Python, tools, and retained information
-
-Every session can incrementally execute Python, including top-level `await`:
-
-```python
-rows = tools.call("artifact_load", artifact_id="ARTIFACT_ID")
-selected = [row for row in rows if row["score"] > 0.9]
-len(selected)  # Only this result's bounded representation enters model context.
-
-child = await tools.acall("agent_spawn", instruction="Check the calculation", name="checker")
-tools.call("agent_message", recipient_id=child["session_id"], body="Please inspect the edge cases.")
-forget("rows")
-```
-
-Values persist across turns and can be inspected later. JSON-compatible values,
-collections, bytes, paths, and imported modules have explicit checkpoint codecs.
-Functions, clients, iterators, GPU objects, and other live handles need a saved
-artifact plus an explicit reconstruction recipe when feasible:
-
-```python
-from pathlib import Path
-report = Path("report.json")
-client = SomeClient.from_config(report)
-remember_recipe("client", "client = SomeClient.from_config(report)")
-```
-
-The recipe must recreate its dependencies too if they are not checkpointed.
-Recipes are opt-in executable code. Ordinary action history is never replayed on
-recovery. Missing values and failed recipes are reported, not silently restored.
-
-Python and process permissions run trusted code with the daemon user's OS
-authority. This is **not an OS sandbox**. For untrusted tasks, run the daemon in
-an appropriately isolated container or account. Built-in file tools enforce
-workspace boundaries, and tool capabilities/allowlists apply to Python bridge
-calls as well as direct model actions.
-
-## Goals, schedules, refinement, and branching
-
-```sh
-uv run threadweave run "Maintain this objective" --mode goal --config examples/chat.json
-uv run threadweave schedule SESSION_ID --interval 300
-uv run threadweave schedule SESSION_ID --cron '0 */6 * * *'
-uv run threadweave schedules SESSION_ID
-uv run threadweave unschedule SCHEDULE_ID
-
-uv run threadweave states SESSION_ID
-uv run threadweave refine SESSION_ID path/to/state-edit.json
-uv run threadweave pause SESSION_ID
-uv run threadweave fork SESSION_ID --name experiment
-```
-
-Schedules use UTC and coalesce overdue ticks. A `heartbeat` session runs one turn
-per activation; autonomous and goal sessions continue until an explicit finish,
-successful verifier, wait action, or limit. Messages wake active, unpaused agents.
-Terminal sessions require explicit resume. A resource-limited run must be forked
-to start a new accounting budget; the original spend stays recorded.
-
-Refinement produces typed, versioned memories, prompt notes, executable skills,
-and subagent specifications. Edits require source event IDs and an intended
-effect, apply at a turn boundary, and support deletion and rollback as new
-versions. Global writes are disabled by default. Supplemental entries enter
-context only when explicitly selected. Foundational instructions are separate.
-
-A fork has a new session/root identity, explicit ancestry, copied context and
-recoverable Python state, and fresh accounting. It does not clone descendants or
-the workspace. Pause a running source first. Forking a partial turn preserves its
-source journal and warns the new continuation to inspect uncertain effects.
-
-## Verify and extend
+## Development and boundaries
 
 ```sh
 uv run pytest -q
-uv run ruff check src tests examples
-uv run ruff format --check src tests examples
+uv run ruff check src tests
+uv run ruff format --check src tests
 uv build
 ```
 
-The tests cover lifecycle, events, compaction, kernels, versioning/rollback,
-messages, recursive concurrency, resource limits, provider streaming/retries,
-permissions, schedules, branching, and daemon process death/restart. API tests
-use an in-memory HTTP transport. The integration suite kills a real daemon and
-recovers the same session tree, and kills it during tools to check uncertain
-effects are not duplicated.
+Providers used for deterministic tests live only under tests/. Tests execute real
+temporary repositories, test commands, patches, measurements and daemon death/
+restart. HTTP transport tests use in-memory responses. No paid-model quality,
+external benchmark score, or GPU performance is claimed by these tests.
 
-See [architecture and recovery](docs/architecture.md),
-[providers, tools, and task adapters](docs/extensions.md), and
-[configuration and operations](docs/operations.md).
+Boundaries: single-host daemon; synchronous local indexing/Git metadata; lexical
+non-Python navigation; full-copy candidates; text unified patches; no isolation for
+host Python/processes; no exactly-once external effects; no statistical significance
+claim from benchmark tolerance. Exact artifacts may contain repository secrets.
+
+See [architecture](docs/architecture.md), [operations/security](docs/operations.md),
+[extensions](docs/extensions.md), and [evaluation](docs/evaluation.md).

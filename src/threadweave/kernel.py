@@ -10,13 +10,43 @@ from pathlib import Path
 from .models import HarnessError
 
 
+def fork_checkpoint(source, destination, old_workspace, new_workspace):
+    """Rebind explicit Path codecs; do not replay source-bound reconstruction recipes."""
+    from .artifacts import atomic_write
+
+    checkpoint = json.loads(source.read_text())
+    old, new = Path(old_workspace).resolve(), Path(new_workspace).resolve()
+
+    def rebind(value):
+        if isinstance(value, list):
+            if len(value) == 2 and value[0] == "path" and isinstance(value[1], str):
+                path = Path(value[1])
+                if path.is_absolute() and path.is_relative_to(old):
+                    return ["path", str(new / path.relative_to(old))]
+            return [rebind(item) for item in value]
+        if isinstance(value, dict):
+            return {key: rebind(item) for key, item in value.items()}
+        return value
+
+    checkpoint["values"] = rebind(checkpoint["values"])
+    missing = checkpoint.setdefault("missing", {})
+    for name in checkpoint.get("recipes", {}):
+        missing[name] = (
+            "Reconstruction recipe not inherited into an isolated fork; review workspace bindings before registering it again"
+        )
+    checkpoint["recipes"] = {}
+    checkpoint["receipt"] = None
+    atomic_write(destination, json.dumps(checkpoint).encode())
+
+
 class Kernel:
-    def __init__(self, directory: Path, workspace: Path, bridge):
+    def __init__(self, directory: Path, workspace: Path, bridge, *, env=None):
         self.directory, self.workspace, self.bridge = directory, workspace, bridge
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
         self.recovery = {}
         self._stderr = None
+        self.env = env
 
     async def start(self):
         if self.process and self.process.returncode is None:
@@ -35,6 +65,7 @@ class Kernel:
             stderr=self._stderr,
             start_new_session=True,
             limit=8 * 1024 * 1024,
+            env=self.env,
         )
         try:
             async with asyncio.timeout(20):

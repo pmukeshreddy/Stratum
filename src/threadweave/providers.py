@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -181,93 +180,5 @@ class ChatProvider:
         }
 
 
-class ScriptedProvider:
-    """Deterministic test provider. The persisted turn index selects each response."""
-
-    def __init__(self, scripts: dict[str, list], *, delay=0):
-        self.scripts, self.delay = scripts, delay
-        self.requests: list[ModelRequest] = []
-        self.active = 0
-        self.peak_active = 0
-
-    async def invoke(self, request, emit):
-        self.requests.append(request)
-        self.active += 1
-        self.peak_active = max(self.peak_active, self.active)
-        try:
-            await asyncio.sleep(self.delay)
-            sequence = self.scripts.get(request.name, self.scripts.get("*", []))
-            item = (
-                sequence[request.turn]
-                if request.turn < len(sequence)
-                else ModelResponse(
-                    actions=[Action(name="finish", arguments={"result": "Script complete"})]
-                )
-            )
-            if isinstance(item, Exception):
-                raise item
-            if callable(item):
-                item = item(request)
-                if hasattr(item, "__await__"):
-                    item = await item
-            return item if isinstance(item, ModelResponse) else ModelResponse.model_validate(item)
-        finally:
-            self.active -= 1
-
-
-class DemoProvider:
-    """An offline executable example, not a model and not runtime planning logic."""
-
-    async def invoke(self, request, emit):
-        await asyncio.sleep(0.03)
-        if request.parent_id:
-            steps = [
-                Action(
-                    name="python", arguments={"code": "values = list(range(1000))\nsum(values)"}
-                ),
-                Action(
-                    name="agent_message",
-                    arguments={
-                        "recipient_id": request.parent_id,
-                        "body": "I computed sum(range(1000)) = 499500 in my persistent worker.",
-                    },
-                ),
-                Action(name="finish", arguments={"result": "Independent computation verified."}),
-            ]
-            action = steps[min(request.turn, len(steps) - 1)]
-        else:
-            steps = [
-                Action(
-                    name="python", arguments={"code": "values = list(range(1000))\nlen(values)"}
-                ),
-                Action(
-                    name="agent_spawn",
-                    arguments={
-                        "instruction": "Independently check sum(range(1000)).",
-                        "name": "checker",
-                    },
-                ),
-                Action(name="python", arguments={"code": "answer = sum(values)\nprint(answer)"}),
-                Action(name="agent_wait", arguments={"seconds": 0.3}),
-                Action(
-                    name="python",
-                    arguments={
-                        "code": "tools.call('workspace_write', path='answer.txt', content=str(answer))\nanswer"
-                    },
-                ),
-            ]
-            action = (
-                steps[request.turn]
-                if request.turn < len(steps)
-                else Action(
-                    name="finish",
-                    arguments={
-                        "result": "Computed 499500; saved answer.txt. Child has its own history."
-                    },
-                )
-            )
-        return ModelResponse(actions=[action], usage=Usage(input_tokens=200, output_tokens=60))
-
-
 def default_providers() -> dict[str, Provider]:
-    return {"demo": DemoProvider(), "chat": ChatProvider()}
+    return {"chat": ChatProvider()}

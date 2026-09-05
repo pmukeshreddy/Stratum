@@ -1,7 +1,7 @@
 from threadweave.models import Action, ModelResponse, Outcome
-from threadweave.providers import ScriptedProvider
 
 from .conftest import response
+from .fakes import ScriptedProvider
 
 
 async def test_two_python_workers_reach_a_barrier_concurrently(runtime, tmp_path, config):
@@ -52,8 +52,8 @@ async def test_two_python_workers_reach_a_barrier_concurrently(runtime, tmp_path
         assert not runtime.store.events(child.id, kind="python_error")
 
 
-async def test_example_adapter_uses_custom_verifier_name(runtime, tmp_path, config):
-    config.extensions = ["examples.extension:install"]
+async def test_extension_adapter_uses_custom_verifier_name(runtime, tmp_path, config):
+    config.extensions = ["tests.adapter_plugin:install"]
     config.task.adapter = "measurement"
     config.task.verifier = "measurement"
     config.task.verifier_options = {"maximum_error": 0.01}

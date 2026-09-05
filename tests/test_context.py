@@ -1,8 +1,10 @@
 import pytest
 
 from threadweave.context import FOUNDATION, Context
-from threadweave.models import RunConfig, StateEdit, Workspace
+from threadweave.models import StateEdit, Workspace
 from threadweave.storage import Store, encode
+
+from .fakes import TestConfig as RunConfig
 
 
 def test_compaction_preserves_full_history_and_complete_tool_pairs(tmp_path):

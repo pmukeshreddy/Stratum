@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -40,6 +41,13 @@ class Artifacts:
         return self.put_bytes(sid, encode(value).encode(), "application/json", source_event)
 
     def put_bytes(self, sid: str, data: bytes, media_type="text/plain", source_event=None) -> str:
+        checksum = hashlib.sha256(data).hexdigest()
+        existing = self.store.db.execute(
+            "SELECT id FROM artifacts WHERE session_id=? AND sha256=? AND media_type=? AND size=? LIMIT 1",
+            (sid, checksum, media_type, len(data)),
+        ).fetchone()
+        if existing:
+            return existing[0]
         aid = new_id()
         path = self.directory / aid
         atomic_write(path, data)
@@ -51,38 +59,62 @@ class Artifacts:
                 str(path.relative_to(self.store.directory)),
                 media_type,
                 len(data),
-                hashlib.sha256(data).hexdigest(),
+                checksum,
                 now(),
                 source_event,
             ),
         )
+        self.index(sid, aid, data[:16000])
         return aid
 
-    def put_stream(self, sid: str, stream, *, source_event=None) -> str:
+    def put_stream(self, sid: str, stream, *, source_event=None, media_type="text/plain") -> str:
         aid = new_id()
         path = self.directory / aid
         digest, size = hashlib.sha256(), 0
         with path.open("xb") as target:
+            os.chmod(path, 0o600)
             while chunk := stream.read(1024 * 1024):
                 target.write(chunk)
                 digest.update(chunk)
                 size += len(chunk)
             target.flush()
             os.fsync(target.fileno())
+        existing = self.store.db.execute(
+            "SELECT id FROM artifacts WHERE session_id=? AND sha256=? AND media_type=? AND size=? LIMIT 1",
+            (sid, digest.hexdigest(), media_type, size),
+        ).fetchone()
+        if existing:
+            path.unlink()  # Only this just-created duplicate blob; existing history is unchanged.
+            return existing[0]
         self.store.db.execute(
             "INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)",
             (
                 aid,
                 sid,
                 str(path.relative_to(self.store.directory)),
-                "text/plain",
+                media_type,
                 size,
                 digest.hexdigest(),
                 now(),
                 source_event,
             ),
         )
+        with path.open("rb") as stream:
+            self.index(sid, aid, stream.read(16000))
         return aid
+
+    def index(self, sid, aid, data):
+        if b"\0" not in data:
+            self.store.db.execute(
+                "INSERT INTO history_fts(id,session_id,root_id,kind,text) VALUES(?,?,?,?,?)",
+                (
+                    aid,
+                    sid,
+                    self.store.session(sid).root_id,
+                    "artifact",
+                    data.decode(errors="replace"),
+                ),
+            )
 
     def metadata(self, sid: str, aid: str) -> dict:
         row = self.store.db.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
@@ -113,7 +145,13 @@ class Artifacts:
         raw = (self.store.directory / meta["path"]).read_bytes()
         if hashlib.sha256(raw).hexdigest() != meta["sha256"]:
             raise ValueError("Artifact checksum mismatch")
-        return json.loads(raw) if meta["media_type"] == "application/json" else raw.decode()
+        if meta["media_type"] == "application/octet-stream":
+            return {"encoding": "base64", "data": base64.b64encode(raw).decode()}
+        return (
+            json.loads(raw)
+            if meta["media_type"] == "application/json"
+            else raw.decode(errors="replace")
+        )
 
     def expose(self, sid: str, value: Any, *, source_event=None) -> dict:
         aid = self.put(sid, value, source_event=source_event)

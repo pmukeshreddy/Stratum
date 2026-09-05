@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 
 import pytest
 import pytest_asyncio
 
 from threadweave.models import Action, ModelResponse, RunConfig, Usage
 from threadweave.runtime import Runtime
+
+pytest_plugins = ["tests.coding_fixtures"]
 
 
 def response(tool_name: str, /, **arguments):
@@ -36,7 +39,10 @@ def config():
 
 @pytest_asyncio.fixture
 async def runtime(tmp_path):
-    manager = Runtime(tmp_path / "data")
+    from .fakes import ScriptedProvider, TestConfig
+
+    manager = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
+    manager.create = partial(manager.create, config=TestConfig())
     try:
         yield manager
     finally:

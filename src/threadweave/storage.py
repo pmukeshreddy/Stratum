@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .migrations import VERSION, migrate
 from .models import (
     HarnessError,
     Lifecycle,
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS artifacts(
  path TEXT NOT NULL, media_type TEXT NOT NULL, size INTEGER NOT NULL,
  sha256 TEXT NOT NULL, created_at REAL NOT NULL, source_event TEXT
 );
+CREATE INDEX IF NOT EXISTS artifacts_content ON artifacts(session_id,sha256,media_type,size);
 CREATE TABLE IF NOT EXISTS compactions(
  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
  source_events TEXT NOT NULL, summary TEXT NOT NULL, created_at REAL NOT NULL
@@ -108,17 +110,20 @@ class Store:
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.db = sqlite3.connect(self.directory / "history.sqlite3", isolation_level=None)
+        (self.directory / "history.sqlite3").chmod(0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 1:
-            raise RuntimeError(f"Database schema {version} is newer than supported schema 1")
+        if version > VERSION:
+            raise RuntimeError(
+                f"Database schema {version} is newer than supported schema {VERSION}"
+            )
         self.db.executescript(SCHEMA)
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1, ?)", (now(),))
-        self.db.execute("PRAGMA user_version=1")
+        migrate(self.db, version, now())
         self._depth = 0
 
     @contextmanager
@@ -258,6 +263,12 @@ class Store:
         self, sid: str, kind: str, payload: dict[str, Any], *, parent=None, usage=None
     ) -> str:
         session = self.session(sid)
+        from .security import redact
+
+        config = self.config(sid)
+        payload = redact(
+            payload, [p.api_key_env for p in [config.provider, *config.models.values()]]
+        )
         eid, timestamp = new_id(), now()
         self.db.execute(
             "INSERT INTO events(id,session_id,root_id,timestamp,type,payload,"
@@ -514,6 +525,10 @@ class Store:
         if edit.operation == "delete" and current:
             title, content = current["title"], current["content"]
         if not deleted:
+            if kind == "skill":
+                from .refinement import validate_skill
+
+                content = validate_skill(content, config.permissions)
             required = {
                 "memory": "text",
                 "prompt_note": "text",

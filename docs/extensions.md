@@ -1,144 +1,83 @@
-# Providers, tools, and task environments
+# Extension contracts
 
-The core depends on three small contracts. The model controls workflow; extensions
-add execution capabilities or define what success means in an environment.
+Extensions are trusted installed Python modules configured as
+"extensions": ["your_package.integration:install"]. They load during admission and
+recovery. Pin their source/dependency versions for reproducibility.
 
-## Register an extension
+## Provider
 
-Install a Python module containing `install(runtime)`, then include its import
-reference in the run configuration:
+Implement async invoke(ModelRequest, emit) -> ModelResponse. Translate messages
+and tool schemas to the provider protocol; emit optional text fragments and return
+model-selected actions plus usage. Propagate cancellation. Register the instance in
+runtime.providers under an explicit provider name.
 
-```json
-{"extensions": ["my_package.integration:install"]}
-```
+Raise HarnessError with category provider for transport failures and model for
+malformed responses; never include credentials/headers in errors. The runtime owns
+timeouts, retries, reservations and accounting for normal and auxiliary calls.
+Unknown usage must be marked usage_reported=false with conservative bounds.
 
-The daemon loads the same references before admission and recovery. These are
-trusted host-side extensions, not arbitrary module paths selected by a model. Keep
-the module and dependency versions pinned alongside your evaluation configuration.
-The example [extension module](../examples/extension.py) can be loaded as
-`examples.extension:install` when running from the repository checkout.
+The built-in chat provider handles streamed tool fragments, usage, nonstreamed
+responses, environment credentials and compatible base URLs. Deterministic response
+providers exist only in tests.
 
-## Add a provider
-
-Implement an asynchronous `invoke(ModelRequest, emit) -> ModelResponse` method:
-
-```python
-from threadweave.models import Action, ModelResponse, Usage, HarnessError
-
-class MyProvider:
-    async def invoke(self, request, emit):
-        # Translate request.messages and request.tools into your provider's API.
-        # Use request.config.model, parameters, and max_output_tokens.
-        # Await your HTTP/SDK operation so cancellation propagates.
-        await emit("optional streamed text")
-        return ModelResponse(
-            text="I will inspect the workspace.",
-            actions=[Action(name="workspace_list", arguments={"path": "."})],
-            usage=Usage(input_tokens=100, output_tokens=20),
-            usage_reported=True,
-        )
-
-def install(runtime):
-    runtime.providers["my-provider"] = MyProvider()
-```
-
-Providers may return zero or several actions. Never treat a failed transport as a
-model's explicit finish. Raise `HarnessError("provider", code, message,
-retryable=True)` for transient API failures and category `model` for malformed
-model-generated actions. Propagate `asyncio.CancelledError`. The runtime owns retry
-policy, durable invocation records, call timeouts, and reservations.
-
-Set `usage_reported=False` if actual token counts were unavailable, and return
-conservative input/output bounds in `usage`. Do not increment the `model_calls`,
-`turns`, or other runtime-owned counters yourself. Cost can be supplied in `usage.cost`.
-For a hard preflight cost budget, configure input/output prices as well.
-
-`ChatProvider` demonstrates streamed tool-call fragments, final usage chunks,
-non-streamed responses, cancellation, authentication through environment variables,
-and structured errors. `ScriptedProvider` indexes deterministic responses by the
-persisted session name/turn and is intended for tests. Providers do not get implicit
-access to L2/L3; only the assembled request is sent to external APIs.
-
-## Add a tool
+## Tool
 
 ```python
-from pydantic import Field
 from threadweave.models import Record
 from threadweave.tools import Tool
 
-class CountArgs(Record):
+class InspectArgs(Record):
     path: str
-    limit: int = Field(default=1000, ge=1, le=100000)
 
-async def count_lines(context, args):
-    path = context.path(args.path)  # Enforces the workspace boundary, including symlinks.
-    with path.open() as stream:
-        count = sum(1 for _, _line in zip(range(args.limit), stream))
-    return {"lines": count, "limit": args.limit}
+async def inspect(context, args):
+    return {"bytes": context.path(args.path).stat().st_size}
 
 def install(runtime):
     runtime.tools.register(Tool(
-        "count_lines", "Count a bounded number of lines in a workspace file.",
-        CountArgs, count_lines, permissions=("workspace.read",),
+        "inspect_size", "Inspect a permitted file.",
+        InspectArgs, inspect, permissions=("workspace.read",),
     ))
 ```
 
-Arguments are validated by Pydantic and published as JSON Schema. Return
-JSON-compatible structured results. The runtime retains full results in artifacts
-and exposes bounded previews. Python calls receive full results through the bridge.
-Use `python_callable=False` if the tool cannot safely execute inside that bridge;
-tools that recursively invoke the same Python worker must be disabled there.
+Return JSON-compatible structured results. Full results become artifacts; model
+previews are bounded and Python bridge callers receive complete values. Set
+python_callable=false for tools that would reenter the same worker.
 
-For side effects, `context.action_id` is a stable idempotency key. The journal
-records the call before execution and its result afterward. The runtime does not
-automatically repeat side-effecting tools after an uncertain interruption. Raise
-structured `HarnessError("tool", ...)` failures for predictable tool errors. Respect
-cancellation, and put CPU-heavy/blocking work in a process or explicitly managed
-thread rather than blocking the event loop. A timed-out thread cannot be forcibly
-stopped; use subprocesses for work that needs hard cancellation.
+Use context.path for files, Editor for edits, GitWorkspace for checkpoints and the
+configured Executor/run_command for processes. Respect cancellation and use
+context.action_id as an external idempotency key where available. The harness cannot
+undo arbitrary external effects. Tool metadata controls permissions, features and
+coding-only exposure.
 
-## Add a benchmark or interactive environment
+## Task/environment
 
-Implement `prepare(context, task_config)` and
-`verify(context, task_config) -> Verification | None`:
+Implement async prepare(context, task_config) -> dict and
+async verify(context, task_config) -> Verification | None. Preparation and verification
+must be idempotent/recoverable. Return passed=false for task failure; raise for
+infrastructure/environment failure.
 
-```python
-from threadweave.models import Verification
+CodingTask supplies repository baseline/verification. WorkspaceTask remains for
+embedded non-coding environments; it is not the CLI product workflow. Add new
+domain capabilities without a separate scheduler or mandatory planner graph.
 
-class ExperimentTask:
-    async def prepare(self, context, task):
-        # Validate paths/services and return bounded descriptive environment data.
-        return {"experiment": task.specification, "metrics": task.success_metrics}
+External Instance loaders cover repository issues, context bundles and kernel
+workspaces. A new dataset loader should translate supplied instances into those
+contracts and reuse Runtime.
 
-    async def verify(self, context, task):
-        measurement = read_measurement(context.path("measurement.json"))
-        threshold = task.verifier_options["maximum_error"]
-        return Verification(
-            passed=measurement["error"] <= threshold,
-            details=measurement,
-            metrics={"error": measurement["error"]},
-        )
+## Executable skills
 
-def install(runtime):
-    runtime.adapters["experiment"] = ExperimentTask()
-```
+Skill content requires name, description and executable code, plus inputs and
+required_permissions (default empty-object inputs and python permission). Inputs
+support a validated subset of JSON Schema: explicit scalar/object/array types,
+properties/required/additionalProperties, items, enum, minimum/maximum and string
+minLength/maxLength. Unsupported schema keywords fail instead of being ignored.
 
-Then configure `task.adapter="experiment"` and a verifier name other than `"none"`,
-such as `"measurement"`. Custom verifier names are owned by the adapter. Attach
-dataset IDs, task specifications, benchmark revisions, success thresholds, and
-environment references in the serialized task configuration. Add tools for actions
-specific to the environment. Coding tasks, kernel optimization, research, and
-interactive environments all run through the same session loop.
+Code executes in the trusted worker with skill_inputs and normal output capture.
+Versions record provenance and validation status; skill_inspect includes outcome
+counts and quarantine state. Repeatedly failing versions require a validated
+update/rollback. Syntax and permission declarations do not prove safety or constrain
+arbitrary host Python.
 
-`prepare` and `verify` must be idempotent or read-only because interrupted preparation
-or verification can run again after recovery. Raise an exception for infrastructure
-failure; return `Verification(passed=False, ...)` for a real task failure. These
-have different event categories and retry behavior. `details` is retained in an
-artifact and bounded before being returned to L1. `metrics` stores quantitative
-measurements independent of the pass/fail gate.
-
-The built-in workspace adapter supports no verifier, file existence/content checks,
-and argv-based commands whose zero exit status passes. Command verifiers require
-the `process` capability. Child sessions inherit workspace/configuration but receive
-their own instruction and have the parent's completion verifier disabled. Register
-environment tools to let a child perform additional checks when appropriate.
+Memories/prompt notes require text; subagent specs require an instruction. Every
+StateEdit requires source event IDs and intended effect. Updates, deletion and
+rollback append versions at controlled boundaries. Foundational policy is separate.

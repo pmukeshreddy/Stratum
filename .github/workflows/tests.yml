@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --extra dev --locked
-      - run: uv run ruff check src tests examples
-      - run: uv run ruff format --check src tests examples
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
       - run: uv run pytest -q
       - run: uv build

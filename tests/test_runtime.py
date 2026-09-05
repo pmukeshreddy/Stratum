@@ -9,10 +9,10 @@ from threadweave.models import (
     ModelResponse,
     Outcome,
 )
-from threadweave.providers import ScriptedProvider
 from threadweave.runtime import BudgetBusy, LimitReached, Runtime
 
 from .conftest import eventually, response
+from .fakes import ScriptedProvider
 
 
 async def test_model_action_result_and_repl_roundtrip(runtime, tmp_path, config):
@@ -263,7 +263,11 @@ async def test_refinement_applied_at_next_turn_then_skill_executes(runtime, tmp_
             edit={
                 "kind": "skill",
                 "title": "Compute",
-                "content": {"code": "answer = x * 2\nanswer"},
+                "content": {
+                    "name": "compute",
+                    "description": "Reuse calculation",
+                    "code": "answer = x * 2\nanswer",
+                },
                 "source_events": [event],
                 "intended_effect": "Reuse calculation",
                 "select": True,

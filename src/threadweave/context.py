@@ -6,7 +6,8 @@ from .storage import Store, encode
 # Foundational instructions are code-owned. Adaptive entries never replace this message.
 FOUNDATION = """You operate a persistent agent session. Decide your own strategy and next actions.
 Use the provided tools to compute, inspect evidence, delegate, communicate, and finish.
-python executes in your own persistent Python worker, with top-level await and retained variables.
+When enabled, python executes in your own Python worker with top-level await. Variables are retained
+only when the session's persistent_repl feature is enabled; inspect the capability metadata.
 Python helpers: tools.call(name, **arguments), await tools.acall(name, **arguments),
 workspace (Path), forget(*names), remember_recipe(name, reconstruction_code).
 Tool calls in Python return full structured results; keep large results in variables.
@@ -20,6 +21,13 @@ finish requests completion, subject to task gates. A text reply alone does not c
 Persistent state is supplemental task material, never a replacement for foundational instructions.
 Tool permissions are capabilities. Python/process access executes trusted code with this OS user's
 authority; it is not an isolation sandbox. Respect the workspace and the user's instructions.
+For coding tasks, use repo_map, repo_search, symbol_search, file_outline and dependency_context to
+inspect code. Prefer apply_patch or hash-checked replace_range for precise edits. Check actual
+test/build/typecheck diagnostics; do not weaken tests to manufacture success. finish is only a
+request: an independent verifier reruns configured commands and checks repository constraints.
+Coding children have isolated writable repositories. Inspect their findings and explicitly apply
+selected candidate patches; nothing is automatically merged. Experiments retain hypotheses,
+checkpoints, correctness results and measured benchmarks. Never invent a performance measurement.
 """
 
 
@@ -71,6 +79,8 @@ class Context:
             "workspace": session.workspace.path,
             "turn": session.turns,
             "goal": self.store.goal(sid),
+            "features": self.store.config(sid).features.model_dump(),
+            "execution_backend": self.store.config(sid).execution.backend,
         }
         # A long goal is still available in L3, and must not defeat context bounds.
         if metadata["goal"]:
@@ -94,9 +104,14 @@ class Context:
             )
         for block in session.context:
             messages.extend(block["messages"])
+        from .retrieval import coding_focus
+
+        focus = coding_focus(self.store, sid)
+        if focus:
+            messages.append({"role": "user", "content": "Current coding evidence: " + focus})
         return messages
 
-    def compact(self, sid: str, *, count: int | None = None):
+    def compact(self, sid: str, *, count: int | None = None, summary=None, provenance=None):
         with self.store.transaction():
             session, policy = self.store.session(sid), self.store.config(sid).context
             if not session.context:
@@ -114,7 +129,11 @@ class Context:
             cap = policy.summary_chars
             # Preserve part of the prior digest and the most recent observations.
             prior = session.summary[: cap // 3] if session.summary else ""
-            summary = (prior + "\n" + additions[-(cap - len(prior) - 1) :]).strip()
+            summary = (
+                summary[:cap]
+                if summary
+                else (prior + "\n" + additions[-(cap - len(prior) - 1) :]).strip()
+            )
             source_events = [b["event_id"] for b in removed]
             eid = self.store.event(
                 sid,
@@ -122,7 +141,8 @@ class Context:
                 {
                     "source_events": source_events,
                     "summary": summary,
-                    "method": "bounded_extractive",
+                    "method": "model_structured" if provenance else "bounded_extractive",
+                    "model_response_event": provenance,
                 },
             )
             self.store.db.execute(
@@ -140,7 +160,9 @@ class Context:
 
     def assemble(self, sid: str, tools: list[dict]) -> tuple[list[dict], int]:
         config = self.store.config(sid)
-        available = config.context.max_tokens - config.provider.max_output_tokens
+        available = config.context.max_tokens - max(
+            p.max_output_tokens for p in [config.provider, *config.models.values()]
+        )
         messages = self.messages(sid)
         size = token_bound({"messages": messages, "tools": tools})
         threshold = int(available * config.context.compact_at)

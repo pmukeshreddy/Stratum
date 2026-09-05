@@ -11,6 +11,7 @@ import fcntl
 import importlib
 import json
 import logging
+import os
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,8 +19,10 @@ from pathlib import Path
 from croniter import croniter
 
 from .artifacts import Artifacts
+from .coding import CodingTask
 from .context import Context
-from .kernel import Kernel
+from .execution import environment
+from .kernel import Kernel, fork_checkpoint
 from .models import (
     Action,
     HarnessError,
@@ -34,6 +37,8 @@ from .models import (
     now,
 )
 from .providers import default_providers
+from .refinement import MemoryServices
+from .routing import route
 from .storage import Store, encode
 from .tasks import WorkspaceTask
 from .tools import ToolContext, builtins
@@ -49,7 +54,7 @@ class BudgetBusy(Exception):
     """Another invocation temporarily owns a reservation that may be released."""
 
 
-class Runtime:
+class Runtime(MemoryServices):
     def __init__(
         self,
         directory: str | Path,
@@ -73,7 +78,11 @@ class Runtime:
         self.artifacts = Artifacts(self.store)
         self.context = Context(self.store)
         self.providers = providers if providers is not None else default_providers()
-        self.adapters = adapters if adapters is not None else {"workspace": WorkspaceTask()}
+        self.adapters = (
+            adapters
+            if adapters is not None
+            else {"workspace": WorkspaceTask(), "coding": CodingTask()}
+        )
         self.tools = tools if tools is not None else builtins()
         self.concurrency, self.idle_seconds = concurrency, idle_seconds
         self.kernels: dict[str, Kernel] = {}
@@ -92,9 +101,32 @@ class Runtime:
                 self._extensions.add(reference)
 
     def validate_config(self, config):
+        RunConfig.model_validate(config.model_dump())
         self.load_extensions(config)
-        if config.provider.name not in self.providers:
-            raise ValueError(f"Unknown provider: {config.provider.name}")
+        providers = list(config.models.values()) + (
+            [config.provider] if not config.routing.default else []
+        )
+        for provider in providers:
+            if provider.name not in self.providers:
+                raise ValueError(f"Unknown provider: {provider.name}; configure a real provider")
+            if not provider.model.strip() or provider.model.startswith("REPLACE_"):
+                raise ValueError(
+                    "Explicit provider.model is required; pass --config with a real model ID"
+                )
+            if (
+                provider.name == "chat"
+                and provider.api_key_env
+                and not os.environ.get(provider.api_key_env)
+            ):
+                raise ValueError(
+                    f"Set {provider.api_key_env} before starting the daemon (or use api_key_env='' for an unauthenticated local endpoint)"
+                )
+            if config.limits.cost_budget and (
+                provider.input_cost_per_million is None or provider.output_cost_per_million is None
+            ):
+                raise ValueError(
+                    "Every routed model needs input/output prices when using cost budgets"
+                )
         if config.task.adapter not in self.adapters:
             raise ValueError(f"Unknown task adapter: {config.task.adapter}")
 
@@ -108,6 +140,11 @@ class Runtime:
         mode="autonomous",
     ):
         config = config or RunConfig()
+        config = config.model_copy(deep=True)
+        if config.task.adapter == "coding":
+            config.task.verifier = "coding"
+            config.task.require_verifier = True
+            config.task.verify_each_turn = False
         self.validate_config(config)
         path = Path(workspace).resolve()
         if not path.is_dir():
@@ -130,12 +167,14 @@ class Runtime:
         self._wake.set()
         return session
 
-    def spawn(self, parent_id: str, instruction: str, *, name=None):
+    def spawn(self, parent_id: str, instruction: str, *, name=None, role="agent"):
         parent = self.store.session(parent_id)
         if parent.outcome != Outcome.ACTIVE:
             raise ValueError("Cannot spawn from a terminated session")
         self._check_limits(parent_id)
         root_config = self.store.config(parent.root_id)
+        if not root_config.features.subagents:
+            raise PermissionError("Subagents disabled by feature configuration")
         usage = self.store.usage(parent.root_id, tree=True)
         if usage.subagent_count >= root_config.limits.max_subagents:
             raise HarnessError("tool", "subagent_limit", "Root subagent limit reached")
@@ -146,10 +185,30 @@ class Runtime:
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
+        workspace = parent.workspace
+        checkpoint = None
+        if config.task.adapter == "coding":
+            from .gitops import GitWorkspace
+
+            event = self.store.event(parent_id, "candidate_preparing", {"instruction": instruction})
+            git = GitWorkspace(ToolContext(self, parent_id, new_id(), event))
+            checkpoint = git.snapshot("candidate-source")
+            isolated = git.isolate(checkpoint)
+            workspace = Workspace(
+                path=str(isolated),
+                metadata={
+                    "source_session": parent_id,
+                    "source_checkpoint": checkpoint,
+                    "isolation": "private_git_copy",
+                },
+            )
+            config.task.repository = str(isolated)
+            config.task.base_commit = None
+            config.task.require_change = False
         # Completion gates belong to each task. Children receive their own instructions;
         # they must not complete the root by observing its verifier artifact.
-        config.task.verifier = "none"
-        config.task.require_verifier = False
+        config.task.verifier = "coding" if checkpoint else "none"
+        config.task.require_verifier = bool(checkpoint)
         config.task.verifier_options = {}
         config.refinement.selected_entries = [
             eid
@@ -158,14 +217,32 @@ class Runtime:
         ]
         session = self.store.create(
             instruction,
-            parent.workspace,
+            workspace,
             config,
             parent_id=parent_id,
             name=name or f"child-{usage.subagent_count + 1}",
             mode="goal",
         )
+        if checkpoint:
+            self.store.db.execute(
+                "INSERT INTO candidates VALUES(?,?,?,?)",
+                (
+                    session.id,
+                    parent_id,
+                    checkpoint,
+                    encode(
+                        {
+                            "instruction": instruction,
+                            "start_time": session.created_at,
+                            "consumed": False,
+                            "accepted": False,
+                        }
+                    ),
+                ),
+            )
+        self.store.update(session.id, role=role)
         self._wake.set()
-        return session
+        return self.store.session(session.id)
 
     def related(self, sid: str):
         session = self.store.session(sid)
@@ -208,6 +285,10 @@ class Runtime:
             self.store.ensure_related(sender_id, recipient_id)
         with self.store.transaction():
             mid = self.store.send(sender_id, recipient_id, body)
+            if sender_id is None and body.strip() == "/refine":
+                self.store.event(
+                    recipient_id, "refinement_trigger", {"reason": "human", "message_id": mid}
+                )
             recipient = self.store.session(recipient_id)
             # Terminal sessions retain messages, but are resumed only by explicit human control.
             if recipient.outcome == Outcome.ACTIVE and not recipient.paused:
@@ -332,7 +413,7 @@ class Runtime:
         root = self.store.session(root_id)
         return max(0, now() - root.started_at) if root.started_at else 0
 
-    def _check_limits(self, sid: str, *, resource: str | None = None, input_bound=0):
+    def _check_limits(self, sid: str, *, resource: str | None = None, input_bound=0, provider=None):
         session = self.store.session(sid)
         root = self.store.session(session.root_id)
         config, usage = self.store.config(root.id), self.store.usage(root.id, tree=True)
@@ -357,7 +438,7 @@ class Runtime:
             if resource == key and getattr(usage, key) >= maximum:
                 raise LimitReached(f"Root {key} limit exhausted")
         if resource == "model_calls":
-            provider = self.store.config(sid).provider
+            provider = provider or self.store.config(sid).provider
             if tokens + input_bound + provider.max_output_tokens > limits.token_budget:
                 if (
                     reserved_tokens
@@ -386,6 +467,14 @@ class Runtime:
         self._scheduler_task = asyncio.create_task(self._scheduler(), name="session-scheduler")
 
     async def recover(self):
+        from .editing import recover_edits
+        from .execution import recover_containers
+        from .gitops import recover_workspace_effects
+
+        recover_edits(self)
+        await recover_containers(self)
+        await recover_workspace_effects(self)
+        self.store.db.execute("UPDATE experiments SET status='interrupted' WHERE status='running'")
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
         for row in self.store.db.execute("SELECT * FROM reservations").fetchall():
@@ -566,9 +655,15 @@ class Runtime:
                 self.store.apply_refinements(sid)
                 self.receive(sid)
                 await self._prepare(sid)
+                await self.auto_refine(sid)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 response, response_event = await self._invoke(sid)
+                if not response.actions and config.task.adapter == "coding":
+                    from .guardrails import observe
+
+                    if observe(self, sid, "model_no_actions", {}):
+                        raise LimitReached("Configured no-action loop limit reached")
                 pending = self.store.session(sid).pending_turn
                 assert pending and pending["event_id"] == response_event
             else:
@@ -630,6 +725,8 @@ class Runtime:
             verifier_ok = verification is not None and verification.passed
             if verification_error and config.task.require_verifier:
                 explicit_ok = False
+            if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
+                await self.auto_refine(sid, trigger="completion")
             with self.store.transaction():
                 children_active = self._active_descendants(sid)
                 if (
@@ -697,6 +794,36 @@ class Runtime:
             if self.store.session(sid).outcome != Outcome.ACTIVE or self._closing:
                 await self._close_kernel(sid)
                 self.store.transition(sid, Lifecycle.INACTIVE)
+                self._candidate_accounting(sid)
+
+    def _candidate_accounting(self, sid):
+        row = self.store.db.execute(
+            "SELECT body FROM candidates WHERE child_id=?", (sid,)
+        ).fetchone()
+        if not row:
+            return
+        session = self.store.session(sid)
+        body = json.loads(row[0])
+        body.update(
+            end_time=session.updated_at if session.outcome != Outcome.ACTIVE else None,
+            usage=self.store.usage(sid).model_dump(),
+            outcome=session.outcome,
+            tools_used=sorted(
+                {e["payload"]["name"] for e in self.store.events(sid, kind="tool_call", limit=500)}
+            ),
+            verifier=[
+                e["payload"] for e in self.store.events(sid, kind="verifier_result", limit=1)
+            ],
+        )
+        try:
+            from .gitops import GitWorkspace
+
+            patch = GitWorkspace(ToolContext(self, sid, new_id(), "candidate-accounting")).diff()
+            body["patch_artifact"] = self.artifacts.put_bytes(sid, patch.encode(), "text/x-diff")
+            body["patch_produced"] = bool(patch)
+        except (ValueError, OSError) as exc:
+            body["patch_error"] = str(exc)
+        self.store.db.execute("UPDATE candidates SET body=? WHERE child_id=?", (encode(body), sid))
 
     async def _prepare(self, sid):
         if self.store.events(sid, kind="environment_prepared", limit=1):
@@ -718,6 +845,7 @@ class Runtime:
 
     async def _invoke(self, sid):
         config = self.store.config(sid)
+        await self.semantic_compact(sid)
         schemas = self.tools.schemas(config)
         messages, size = self.context.assemble(sid, schemas)
         session = self.store.session(sid)
@@ -729,14 +857,22 @@ class Runtime:
             turn=session.turns,
             messages=messages,
             tools=schemas,
-            config=config.provider,
+            config=route(self.store, sid, session.role, context_size=size),
             input_token_bound=size,
         )
+        return await self._model_call(sid, request)
+
+    async def _model_call(self, sid, request, *, persist_turn=True):
+        config = self.store.config(sid)
+        session = self.store.session(sid)
+        size, provider = request.input_token_bound, request.config
         for attempt in range(config.retry.attempts):
             while True:
                 try:
                     with self.store.transaction():
-                        self._check_limits(sid, resource="model_calls", input_bound=size)
+                        self._check_limits(
+                            sid, resource="model_calls", input_bound=size, provider=provider
+                        )
                         request_artifact = self.artifacts.put(sid, request.model_dump(mode="json"))
                         eid = self.store.event(
                             sid,
@@ -745,18 +881,17 @@ class Runtime:
                                 "attempt": attempt + 1,
                                 "request_artifact": request_artifact,
                                 "turn": session.turns,
-                                "provider": config.provider.name,
-                                "model": config.provider.model,
+                                "provider": provider.name,
+                                "model": provider.model,
                             },
                         )
                         cost = (
-                            size * (config.provider.input_cost_per_million or 0)
-                            + config.provider.max_output_tokens
-                            * (config.provider.output_cost_per_million or 0)
+                            size * (provider.input_cost_per_million or 0)
+                            + provider.max_output_tokens * (provider.output_cost_per_million or 0)
                         ) / 1_000_000
                         self.store.db.execute(
                             "INSERT INTO reservations VALUES(?,?,?,?,?)",
-                            (eid, sid, size, config.provider.max_output_tokens, cost),
+                            (eid, sid, size, provider.max_output_tokens, cost),
                         )
                         self.store.charge(sid, Usage(model_calls=1), parent=eid)
                     break
@@ -773,7 +908,7 @@ class Runtime:
             try:
                 async with asyncio.timeout(
                     min(
-                        config.provider.timeout_seconds,
+                        provider.timeout_seconds,
                         max(
                             0.01,
                             self.store.config(session.root_id).limits.wall_seconds
@@ -781,7 +916,7 @@ class Runtime:
                         ),
                     )
                 ):
-                    response = await self.providers[config.provider.name].invoke(request, emit)
+                    response = await self.providers[provider.name].invoke(request, emit)
                 if buffer:
                     self.store.event(sid, "model_stream", {"text": "".join(buffer)}, parent=eid)
                 if not response.usage_reported:
@@ -792,17 +927,18 @@ class Runtime:
                     response_event = self.store.event(
                         sid, "model_response", response.model_dump(mode="json"), parent=eid
                     )
-                    self.store.update(
-                        sid,
-                        pending_turn={
-                            "response": response.model_dump(mode="json"),
-                            "event_id": response_event,
-                            "action_ids": [new_id() for _ in response.actions],
-                            "index": 0,
-                            "results": [],
-                            "completion": None,
-                        },
-                    )
+                    if persist_turn:
+                        self.store.update(
+                            sid,
+                            pending_turn={
+                                "response": response.model_dump(mode="json"),
+                                "event_id": response_event,
+                                "action_ids": [new_id() for _ in response.actions],
+                                "index": 0,
+                                "results": [],
+                                "completion": None,
+                            },
+                        )
                 return response, response_event
             except asyncio.CancelledError:
                 # Graceful cancellation settles now; hard process death is handled in recover().
@@ -811,7 +947,7 @@ class Runtime:
                         sid,
                         Usage(
                             input_tokens=size,
-                            output_tokens=config.provider.max_output_tokens,
+                            output_tokens=provider.max_output_tokens,
                             cost=cost,
                             estimated_calls=1,
                         ),
@@ -837,7 +973,7 @@ class Runtime:
                         sid,
                         Usage(
                             input_tokens=size,
-                            output_tokens=config.provider.max_output_tokens,
+                            output_tokens=provider.max_output_tokens,
                             cost=cost,
                             estimated_calls=1,
                         ),
@@ -865,6 +1001,8 @@ class Runtime:
         raise AssertionError("Unreachable retry loop")
 
     async def _execute_action(self, sid, action_id, action: Action, parent, *, from_python=False):
+        if self.store.session(sid).paused:
+            raise asyncio.CancelledError("Session paused before action")
         old = self.store.db.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
         if old and old["status"] == "done":
             return json.loads(old["result"])
@@ -883,6 +1021,12 @@ class Runtime:
                 parent,
             )
         self._check_limits(sid, resource="tool_calls")
+        from .guardrails import observe
+
+        if observe(self, sid, action.name, action.arguments):
+            raise LimitReached(
+                "Configured repeated-action limit reached without repository progress"
+            )
         with self.store.transaction():
             eid = self.store.event(
                 sid,
@@ -902,7 +1046,36 @@ class Runtime:
             self.store.charge(sid, Usage(tool_calls=1), parent=eid)
         config = self.store.config(sid)
         context = ToolContext(self, sid, action_id, eid, from_python)
+        external_checkpoint = None
         try:
+            if (
+                config.task.adapter == "coding"
+                and not from_python
+                and action.name
+                in {
+                    "python",
+                    "skill_run",
+                    "process_run",
+                    "run_tests",
+                    "run_targeted_tests",
+                    "run_build",
+                    "run_lint",
+                    "run_typecheck",
+                    "run_benchmark",
+                    "run_profile",
+                    "experiment_run",
+                }
+                and self.tools.allowed(action.name, config)
+            ):
+                from .gitops import GitWorkspace
+
+                external_checkpoint = GitWorkspace(context).snapshot("before-external-action")
+                self.store.event(
+                    sid,
+                    "workspace_observation_started",
+                    {"action_id": action_id, "checkpoint_id": external_checkpoint},
+                    parent=eid,
+                )
             timeout = (
                 config.limits.python_timeout_seconds + 25
                 if action.name in ("python", "skill_run")
@@ -938,6 +1111,18 @@ class Runtime:
             )
             raw = {"error": failure.model_dump()}
             self.store.event(sid, "failure", failure.model_dump(), parent=eid)
+        finally:
+            if external_checkpoint:
+                try:
+                    GitWorkspace(context).observe_effects(external_checkpoint, action_id)
+                except (ValueError, OSError) as exc:
+                    self.store.event(
+                        sid,
+                        "workspace_observation_failed",
+                        {"action_id": action_id, "reason": str(exc)},
+                        parent=eid,
+                    )
+                    self.store.update(sid, paused=True, runnable=False)
         result = self._action_result(sid, action_id, raw, eid)
         # Python receives full values for computation, while the action journal/context
         # always stores a bounded preview plus the durable artifact.
@@ -982,11 +1167,21 @@ class Runtime:
                 self.store.directory / "kernels" / session.kernel_id,
                 Path(session.workspace.path),
                 bridge,
+                env=environment(self.store.config(sid).execution),
             )
         return self.kernels[sid]
 
     async def execute_python(self, context, code):
         sid = context.session_id
+        if not self.store.config(sid).features.persistent_repl:
+            await self._close_kernel(sid)
+            checkpoint = (
+                self.store.directory
+                / "kernels"
+                / self.store.session(sid).kernel_id
+                / "checkpoint.json"
+            )
+            checkpoint.unlink(missing_ok=True)
         self._check_limits(sid, resource="python_executions")
         self._python_parent[sid] = context.source_event
         kernel = self._kernel(sid)
@@ -1061,6 +1256,8 @@ class Runtime:
                 self.store.add_context(
                     sid, result_event, [{"role": "user", "content": "Verifier: " + encode(exposed)}]
                 )
+                if verification and not verification.passed:
+                    self.retain_failure(sid, result_event, verification)
                 return verification, False
             except asyncio.CancelledError:
                 raise
@@ -1140,11 +1337,25 @@ class Runtime:
         if sid in self.tasks:
             raise ValueError("Pause the source session before forking it")
         last = self.store.events(sid, limit=1)
+        workspace, config = source.workspace, self.store.config(sid).model_copy(deep=True)
+        if config.task.adapter == "coding":
+            from .gitops import GitWorkspace
+
+            event = self.store.event(sid, "fork_workspace", {})
+            git = GitWorkspace(ToolContext(self, sid, new_id(), event))
+            checkpoint = git.snapshot("fork-source")
+            isolated = git.isolate(checkpoint)
+            workspace = Workspace(
+                path=str(isolated),
+                metadata={"isolation": "private_git_copy", "source_checkpoint": checkpoint},
+            )
+            config.task.repository = str(isolated)
+            config.task.base_commit = None
         with self.store.transaction():
             branch = self.store.create(
                 source.instruction,
-                source.workspace,
-                self.store.config(sid),
+                workspace,
+                config,
                 name=name or source.name + "-branch",
                 mode=source.mode,
                 branch_from=sid,
@@ -1206,7 +1417,15 @@ class Runtime:
                 target_dir.mkdir(parents=True, exist_ok=True)
                 checkpoint = source_dir / "checkpoint.json"
                 if checkpoint.exists():
-                    shutil.copy2(checkpoint, target_dir / "checkpoint.json")
+                    if config.task.adapter == "coding":
+                        fork_checkpoint(
+                            checkpoint,
+                            target_dir / "checkpoint.json",
+                            source.workspace.path,
+                            workspace.path,
+                        )
+                    else:
+                        shutil.copy2(checkpoint, target_dir / "checkpoint.json")
             self.store.event(
                 sid, "branch_created", {"branch_id": branch.id}, parent=source.branch_event
             )

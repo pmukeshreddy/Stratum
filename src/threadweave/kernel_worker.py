@@ -103,6 +103,8 @@ class Worker:
         self.protected = set(self.values)
         self.receipt = None
         os.chdir(workspace)
+        # -m initializes sys.path from the daemon's cwd, not this session's repository.
+        sys.path.insert(0, str(workspace))
 
     def emit(self, value):
         self.protocol.write(json.dumps(value, ensure_ascii=True, allow_nan=False) + "\n")
@@ -257,7 +259,19 @@ class Worker:
 
     def run(self):
         try:
-            restored = self.restore()
+            saved_out, saved_err = os.dup(1), os.dup(2)
+            try:
+                with (self.directory / "recovery.log").open("a") as output:
+                    os.dup2(output.fileno(), 1)
+                    os.dup2(output.fileno(), 2)
+                    restored = self.restore()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+            finally:
+                os.dup2(saved_out, 1)
+                os.dup2(saved_err, 2)
+                os.close(saved_out)
+                os.close(saved_err)
             self.emit({"type": "ready", "recovery": restored})
         except BaseException as exc:
             self.emit({"type": "fatal", "error": str(exc)})

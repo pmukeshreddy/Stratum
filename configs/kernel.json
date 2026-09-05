@@ -1,0 +1,25 @@
+{
+  "provider": {"name": "chat", "model": "${THREADWEAVE_MODEL}", "api_key_env": "OPENAI_API_KEY", "streaming": true, "max_output_tokens": 4096},
+  "task": {
+    "adapter": "coding",
+    "test_commands": [["make", "correctness"]],
+    "build_commands": [["make", "build"]],
+    "benchmark": {
+      "command": ["make", "benchmark"],
+      "correctness_commands": [["make", "correctness"]],
+      "metric_regex": "latency_ms=([0-9.eE+-]+)",
+      "warmups": 3,
+      "repetitions": 10,
+      "direction": "lower_is_better",
+      "required_improvement": 0.02,
+      "noise_tolerance": 0.005,
+      "timeout_seconds": 60
+    },
+    "prohibit_test_deletion": true
+  },
+  "permissions": ["workspace.read", "workspace.write", "python", "process", "agents", "state"],
+  "execution": {"backend": "local"},
+  "context": {"max_tokens": 96000, "summary_chars": 6000},
+  "refinement": {"automatic": true},
+  "limits": {"max_turns": 100, "token_budget": 3000000, "wall_seconds": 14400, "tool_timeout_seconds": 1800, "concurrency": 2}
+}

@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .configuration import doctor, load_config
 from .daemon import request
 
 
@@ -72,35 +73,47 @@ async def execute(args):
         else:
             show(await request(directory, "shutdown" if args.action == "stop" else "ping"))
         return 0
-    if command in ("run", "demo"):
+    if command == "doctor":
+        result = doctor(directory, load_config(args.config) if args.config else None)
+        show(result)
+        return 0 if result["ok"] else 1
+    if command == "eval":
+        from .evaluation import evaluate
+
+        show(
+            await evaluate(
+                args.tasks,
+                load_config(args.config),
+                directory,
+                repetitions=args.repetitions,
+                seed=args.seed,
+                output=args.output,
+            )
+        )
+        return 0
+    if command == "analyze":
+        from .evaluation import analyze
+
+        show(analyze(args.results))
+        return 0
+    if command == "run":
+        config = load_config(args.config, model_override=args.model)
+        config.task.adapter = "coding"
         await ensure_daemon(directory)
-        config = json.loads(args.config.read_text()) if command == "run" and args.config else {}
-        if command == "demo":
-            config = {
-                "task": {
-                    "verifier": "file",
-                    "verifier_options": {"path": "answer.txt", "equals": "499500"},
-                    "require_verifier": True,
-                    "verify_each_turn": False,
-                }
-            }
         session = await request(
             directory,
             "create",
-            instruction=args.instruction
-            if command == "run"
-            else "Compute sum(range(1000)), delegate an independent check, and save answer.txt.",
+            instruction=args.instruction,
             workspace=str(args.workspace.resolve()),
-            config=config,
-            name=args.name if command == "run" else "demo",
-            mode=args.mode if command == "run" else "goal",
+            config=config.model_dump(mode="json"),
+            name=args.name,
+            mode=args.mode,
         )
-        if command == "demo" or args.attach:
+        if args.attach:
             print(
                 f"Session {session['id']}; Ctrl-C detaches and leaves it running.", file=sys.stderr
             )
             return await attach(directory, session["id"])
-        # A bare stable ID makes scripting straightforward.
         print(session["id"])
         return 0
     if command == "attach":
@@ -117,6 +130,9 @@ async def execute(args):
         "pause",
         "resume",
         "compact",
+        "diff",
+        "experiments",
+        "verify",
     ):
         result = await request(
             directory, "status" if command == "usage" else command, session_id=args.session_id
@@ -154,6 +170,9 @@ async def execute(args):
     elif command == "unschedule":
         show(await request(directory, "unschedule", schedule_id=args.schedule_id))
     elif command == "refine":
+        if args.edit is None:
+            show(await request(directory, "input", session_id=args.session_id, body="/refine"))
+            return 0
         show(
             await request(
                 directory,
@@ -177,7 +196,7 @@ async def execute(args):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Persistent recursive agent sessions")
+    p = argparse.ArgumentParser(description="Persistent coding agents for real repositories")
     p.add_argument(
         "--data", type=Path, default=Path.cwd() / ".threadweave", help="Durable data directory"
     )
@@ -188,12 +207,12 @@ def parser():
     run = sub.add_parser("run", help="Create a task; prints its stable session ID")
     run.add_argument("instruction")
     run.add_argument("--workspace", type=Path, default=Path.cwd())
-    run.add_argument("--config", type=Path)
+    run.add_argument("--config", type=Path, required=True)
+    run.add_argument("--model")
     run.add_argument("--name", default="root")
     run.add_argument("--mode", choices=["autonomous", "goal", "heartbeat"], default="autonomous")
     run.add_argument("--attach", action="store_true")
-    demo = sub.add_parser("demo", help="Run the offline recursive computation demo")
-    demo.add_argument("--workspace", type=Path, default=Path.cwd())
+
     sub.add_parser("list", help="List root sessions")
     for name in (
         "status",
@@ -205,6 +224,9 @@ def parser():
         "pause",
         "resume",
         "compact",
+        "diff",
+        "experiments",
+        "verify",
     ):
         command = sub.add_parser(name)
         command.add_argument("session_id")
@@ -242,12 +264,27 @@ def parser():
     unschedule.add_argument("schedule_id")
     refine = sub.add_parser("refine", help="Queue an auditable StateEdit JSON document")
     refine.add_argument("session_id")
-    refine.add_argument("edit", type=Path)
+    refine.add_argument(
+        "edit",
+        type=Path,
+        nargs="?",
+        help="StateEdit JSON; omit to request a model refinement at the next turn boundary",
+    )
     artifact = sub.add_parser("artifact")
     artifact.add_argument("session_id")
     artifact.add_argument("artifact_id")
     artifact.add_argument("--offset", type=int, default=0)
     artifact.add_argument("--limit", type=int, default=16000)
+    diagnostics = sub.add_parser("doctor", help="Check provider, credentials, tools and storage")
+    diagnostics.add_argument("--config", type=Path)
+    evaluation = sub.add_parser("eval", help="Run externally supplied real coding tasks")
+    evaluation.add_argument("tasks", type=Path)
+    evaluation.add_argument("--config", type=Path, required=True)
+    evaluation.add_argument("--output", type=Path, required=True)
+    evaluation.add_argument("--repetitions", type=int, default=1)
+    evaluation.add_argument("--seed", type=int, default=0)
+    analysis = sub.add_parser("analyze", help="Aggregate measured evaluation results")
+    analysis.add_argument("results", type=Path)
     return p
 
 

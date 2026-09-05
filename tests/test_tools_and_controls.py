@@ -5,11 +5,11 @@ from datetime import UTC, datetime
 import pytest
 
 from threadweave.models import HarnessError, Outcome, StateEdit
-from threadweave.providers import ScriptedProvider
 from threadweave.runtime import LimitReached, Runtime
 from threadweave.tools import Empty, Tool, ToolContext
 
 from .conftest import eventually, response
+from .fakes import ScriptedProvider
 
 
 async def test_process_tool_retains_large_output_and_command_verifier(runtime, tmp_path, config):
@@ -166,7 +166,7 @@ async def test_limited_partial_turn_can_fork_without_replaying_source_actions(
 
 
 async def test_global_refinement_read_update_and_delete(runtime, tmp_path):
-    from threadweave.models import RunConfig
+    from .fakes import TestConfig as RunConfig
 
     config = RunConfig(refinement={"allow_global_writes": True})
     root = runtime.create("Global", tmp_path, config=config)

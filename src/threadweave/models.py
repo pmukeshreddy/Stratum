@@ -52,8 +52,8 @@ class HarnessError(Exception):
 
 
 class ProviderConfig(Record):
-    name: str = "demo"
-    model: str = "offline-demo"
+    name: str = "chat"
+    model: str = ""
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
     parameters: dict[str, Any] = Field(default_factory=dict)
@@ -83,6 +83,68 @@ class RefinementPolicy(Record):
     enabled: bool = True
     allow_global_writes: bool = False
     selected_entries: list[str] = Field(default_factory=list)
+    automatic: bool = False
+    every_turns: int = Field(default=10, ge=1)
+    on_completion: bool = True
+    verifier_failures: int = Field(default=3, ge=1)
+    max_proposals: int = Field(default=3, ge=1, le=10)
+    skill_failure_limit: int = Field(default=3, ge=1)
+
+
+class Features(Record):
+    persistent_repl: bool = True
+    subagents: bool = True
+    history_retrieval: bool = True
+    automatic_refinement: bool = True
+    experiments: bool = True
+    enhanced_code_index: bool = True
+    model_compaction: bool = True
+
+
+class ExecutionConfig(Record):
+    backend: Literal["local", "container"] = "local"
+    engine: Literal["docker", "podman"] = "docker"
+    image: str | None = None
+    network: bool = False
+    read_only: bool = False
+    environment_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "VIRTUAL_ENV",
+            "CUDA_VISIBLE_DEVICES",
+        ]
+    )
+    environment: dict[str, str] = Field(default_factory=dict)
+    command_allowlist: list[str] | None = None
+    output_chars: int = Field(default=4000, ge=256, le=16000)
+    memory: str = "2g"
+    cpus: float = Field(default=2, gt=0)
+
+
+class BenchmarkConfig(Record):
+    command: list[str] = Field(min_length=1)
+    correctness_commands: list[list[str]] = Field(default_factory=list)
+    repetitions: int = Field(default=10, ge=1, le=1000)
+    warmups: int = Field(default=3, ge=0, le=100)
+    metric_regex: str
+    direction: Literal["lower_is_better", "higher_is_better"] = "lower_is_better"
+    required_improvement: float = Field(default=0, ge=0)
+    noise_tolerance: float = Field(default=0.01, ge=0)
+    timeout_seconds: float = Field(default=60, gt=0)
+
+
+class RoutingConfig(Record):
+    policy: Literal["fixed", "role_based"] = "fixed"
+    default: str | None = None
+    roles: dict[str, str] = Field(default_factory=dict)
+
+
+class LoopPolicy(Record):
+    warn_repetitions: int = Field(default=3, ge=2)
+    stop_repetitions: int = Field(default=12, ge=3)
 
 
 class ResourceLimits(Record):
@@ -109,6 +171,25 @@ class TaskConfig(Record):
     require_verifier: bool = False
     wait_for_children: bool = True
     success_metrics: dict[str, Any] = Field(default_factory=dict)
+    repository: str | None = None
+    base_commit: str | None = None
+    allowed_paths: list[str] = Field(default_factory=lambda: ["**"])
+    forbidden_paths: list[str] = Field(default_factory=list)
+    test_commands: list[list[str]] = Field(default_factory=list)
+    build_commands: list[list[str]] = Field(default_factory=list)
+    lint_commands: list[list[str]] = Field(default_factory=list)
+    typecheck_commands: list[list[str]] = Field(default_factory=list)
+    benchmark_commands: list[list[str]] = Field(default_factory=list)
+    benchmark: BenchmarkConfig | None = None
+    profiler_command: list[str] | None = None
+    require_clean_baseline: bool = True
+    capture_baseline: bool = True
+    require_tests: bool = True
+    prohibit_test_deletion: bool = True
+    protect_tests: bool = False
+    require_change: bool = True
+    required_files: list[str] = Field(default_factory=list)
+    allow_baseline_failures: bool = False
 
 
 class RunConfig(Record):
@@ -125,20 +206,41 @@ class RunConfig(Record):
     tool_allowlist: list[str] | None = None
     allow_sibling_messages: bool = True
     extensions: list[str] = Field(default_factory=list)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    features: Features = Field(default_factory=Features)
+    models: dict[str, ProviderConfig] = Field(default_factory=dict)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    loop: LoopPolicy = Field(default_factory=LoopPolicy)
 
     @model_validator(mode="after")
     def coherent(self):
-        if self.provider.max_output_tokens >= self.context.max_tokens:
+        if (
+            max(p.max_output_tokens for p in [self.provider, *self.models.values()])
+            >= self.context.max_tokens
+        ):
             raise ValueError("max_output_tokens must be smaller than context.max_tokens")
-        if self.task.require_verifier and self.task.verifier == "none":
+        if (
+            self.task.require_verifier
+            and self.task.verifier == "none"
+            and self.task.adapter != "coding"
+        ):
             raise ValueError("require_verifier needs a configured verifier")
-        if self.limits.cost_budget is not None and (
-            self.provider.input_cost_per_million is None
-            or self.provider.output_cost_per_million is None
+        priced = list(self.models.values()) + ([self.provider] if not self.routing.default else [])
+        if self.limits.cost_budget is not None and any(
+            p.input_cost_per_million is None or p.output_cost_per_million is None for p in priced
         ):
             raise ValueError("cost budgets require configured input/output prices for reservations")
         if self.task.verifier == "command" and "process" not in self.permissions:
             raise ValueError("command verifiers require process permission")
+        if self.execution.backend == "container" and not self.execution.image:
+            raise ValueError("container execution requires execution.image")
+        if self.execution.backend == "container" and "python" in self.permissions:
+            raise ValueError(
+                "Python workers are host processes: remove python permission for container-only runs"
+            )
+        for alias in [self.routing.default, *self.routing.roles.values()]:
+            if alias and alias not in self.models:
+                raise ValueError(f"Unknown routing model alias: {alias}")
         return self
 
 

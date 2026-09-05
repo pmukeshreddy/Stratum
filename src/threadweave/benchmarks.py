@@ -1,0 +1,114 @@
+"""Measured performance only: correctness, warmups, repetitions, distribution and comparison."""
+
+import math
+import re
+import statistics
+
+from .models import new_id, now
+from .storage import encode
+
+
+def summarize(values):
+    if not values or any(not math.isfinite(v) for v in values):
+        raise ValueError("Measurements must be nonempty finite numbers")
+    ordered = sorted(values)
+    return {
+        "median": statistics.median(values),
+        "p95": ordered[max(0, math.ceil(0.95 * len(values)) - 1)],
+        "min": min(values),
+        "max": max(values),
+        "count": len(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else 0,
+    }
+
+
+def compare(reference, candidate, config):
+    base, value = reference["median"], candidate["median"]
+    if base == 0:
+        raise ValueError("Relative improvement needs a nonzero baseline")
+    improvement = (
+        (base - value) / abs(base)
+        if config.direction == "lower_is_better"
+        else (value - base) / abs(base)
+    )
+    return {
+        "improvement": improvement,
+        "required_improvement": config.required_improvement,
+        "noise_tolerance": config.noise_tolerance,
+        "passed": improvement + config.noise_tolerance >= config.required_improvement,
+    }
+
+
+async def run_benchmark(
+    context, config, *, reference=None, label="candidate", correctness_passed=None
+):
+    from .coding import run_command
+
+    checks = [
+        await run_command(
+            context, c, kind="benchmark_correctness", timeout_seconds=config.timeout_seconds
+        )
+        for c in config.correctness_commands
+    ]
+    correct = all(r["passed"] for r in checks) and correctness_passed is not False
+    if not checks and correctness_passed is None:
+        raise ValueError(
+            "Benchmark requires correctness_commands or an independently supplied correctness result"
+        )
+    result = {
+        "label": label,
+        "config": config.model_dump(),
+        "correctness": checks,
+        "correct": correct,
+        "measurements": [],
+        "runs": [],
+        "passed": False,
+    }
+    if correct:
+        pattern = re.compile(config.metric_regex)
+        if pattern.groups != 1:
+            raise ValueError("metric_regex needs exactly one numeric capture group")
+        for i in range(config.warmups + config.repetitions):
+            run = await run_command(
+                context, config.command, kind="benchmark", timeout_seconds=config.timeout_seconds
+            )
+            run["warmup"] = i < config.warmups
+            result["runs"].append(run)
+            if not run["passed"]:
+                result["error"] = "Benchmark command failed"
+                break
+            raw = context.runtime.artifacts.load(context.session_id, run["stdout_artifact"])
+            matches = pattern.findall(raw)
+            if len(matches) != 1:
+                result["error"] = "metric_regex must match exactly one measurement per run"
+                break
+            metric = float(matches[0][0] if isinstance(matches[0], tuple) else matches[0])
+            if not math.isfinite(metric):
+                raise ValueError("Benchmark emitted a non-finite metric")
+            if not run["warmup"]:
+                result["measurements"].append(metric)
+        if len(result["measurements"]) == config.repetitions:
+            result.update(summarize(result["measurements"]))
+            result["passed"] = True
+            if reference:
+                if not reference.get("passed") or "median" not in reference:
+                    result.update(passed=False, error="No valid baseline measurement")
+                else:
+                    result["comparison"] = compare(reference, result, config)
+                    result["passed"] = result["comparison"]["passed"]
+    aid = context.runtime.artifacts.put(
+        context.session_id, result, source_event=context.source_event
+    )
+    result["raw_artifact"] = aid
+    identifier = new_id()
+    context.runtime.store.db.execute(
+        "INSERT INTO benchmark_measurements VALUES(?,?,?,?)",
+        (identifier, context.session_id, now(), encode(result)),
+    )
+    context.runtime.store.event(
+        context.session_id,
+        "benchmark_result",
+        {"measurement_id": identifier, **result},
+        parent=context.source_event,
+    )
+    return result

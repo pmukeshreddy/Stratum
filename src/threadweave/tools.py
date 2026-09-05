@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
-import sys
-import tempfile
+import hashlib
+import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,16 +21,33 @@ class ToolContext:
     action_id: str
     source_event: str
     from_python: bool = False
+    workspace_override: Any = None
 
     @property
     def session(self):
-        return self.runtime.store.session(self.session_id)
+        session = self.runtime.store.session(self.session_id)
+        return (
+            session.model_copy(update={"workspace": self.workspace_override})
+            if self.workspace_override
+            else session
+        )
 
     def path(self, path: str) -> Path:
-        root = Path(self.session.workspace.path).resolve()
-        resolved = (root / path).resolve()
-        if not resolved.is_relative_to(root):
-            raise PermissionError("Path must resolve within the session workspace")
+        from .repository import confined
+
+        config = self.runtime.store.config(self.session_id)
+        resolved = confined(
+            Path(self.session.workspace.path),
+            path,
+            allowed=config.task.allowed_paths,
+            forbidden=config.task.forbidden_paths,
+        )
+        if resolved.is_relative_to(self.runtime.store.directory) and not Path(
+            self.session.workspace.path
+        ).is_relative_to(self.runtime.store.directory / "workspaces"):
+            raise PermissionError(
+                "Runtime storage is private; retrieve evidence through artifact/history tools"
+            )
         return resolved
 
 
@@ -44,6 +59,8 @@ class Tool:
     execute: Callable[[ToolContext, Any], Awaitable[Any]]
     permissions: tuple[str, ...] = ()
     python_callable: bool = True
+    coding_only: bool = False
+    feature: str | None = None
 
     def schema(self):
         return {
@@ -70,7 +87,21 @@ class ToolRegistry:
         return (
             tool
             and set(tool.permissions) <= set(config.permissions)
+            and (not config.execution.read_only or "workspace.write" not in tool.permissions)
             and (config.tool_allowlist is None or name in config.tool_allowlist)
+            and (not tool.coding_only or config.task.adapter == "coding")
+            and (not tool.feature or getattr(config.features, tool.feature))
+            and (
+                name != "run_profile"
+                or config.task.profiler_command
+                or shutil.which("ncu")
+                or shutil.which("nsys")
+            )
+            and (name != "agent_spawn" or config.features.subagents)
+            and (
+                name not in {"history_read", "history_get", "history_search", "artifact_search"}
+                or config.features.history_retrieval
+            )
         )
 
     def schemas(self, config):
@@ -142,6 +173,7 @@ class SpawnArgs(Record):
     instruction: str = Field(default="", max_length=100000)
     name: str | None = Field(default=None, max_length=100)
     spec_id: str | None = None
+    role: str = Field(default="agent", max_length=100)
 
 
 class MessageArgs(Record):
@@ -184,6 +216,7 @@ class RefineArgs(Record):
 
 class SkillArgs(Record):
     entry_id: str
+    inputs: dict = Field(default_factory=dict)
 
 
 class ScheduleArgs(Record):
@@ -193,46 +226,23 @@ class ScheduleArgs(Record):
 
 
 async def run_process(context: ToolContext, args: ProcessArgs):
-    cwd = context.path(args.cwd)
+    from .execution import executor
+
     config = context.runtime.store.config(context.session_id)
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "threadweave.process_worker",
-            *args.command,
-            cwd=cwd,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
+    result = await executor(config.execution).run(
+        context,
+        args.command,
+        cwd=args.cwd,
+        timeout_seconds=min(args.timeout_seconds, config.limits.tool_timeout_seconds),
+    )
+    if result["timed_out"]:
+        raise HarnessError(
+            "tool",
+            "command_timeout",
+            "Command timed out; captured output is retained in execution_capture",
+            uncertain=True,
         )
-        try:
-            async with asyncio.timeout(
-                min(args.timeout_seconds, config.limits.tool_timeout_seconds)
-            ):
-                await proc.wait()
-        except (TimeoutError, asyncio.CancelledError):
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-            raise
-        finally:
-            # Do not leave subprocess descendants running after a command returns.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        result = {"returncode": proc.returncode}
-        for name, stream in (("stdout", stdout), ("stderr", stderr)):
-            stream.seek(0)
-            result[name] = stream.read(4000).decode(errors="replace")
-            stream.seek(0)
-            result[name + "_artifact"] = context.runtime.artifacts.put_stream(
-                context.session_id, stream, source_event=context.source_event
-            )
-        return result
+    return result
 
 
 def builtins() -> ToolRegistry:
@@ -252,9 +262,14 @@ def builtins() -> ToolRegistry:
             "text": data.decode(errors="replace"),
             "next_offset": a.offset + len(data),
             "bytes": c.path(a.path).stat().st_size,
+            "sha256": hashlib.sha256(c.path(a.path).read_bytes()).hexdigest(),
         }
 
     async def write(c, a):
+        if c.runtime.store.config(c.session_id).task.adapter == "coding":
+            from .editing import Editor
+
+            return Editor(c).apply({a.path: a.content.encode()})
         path = c.path(a.path)
         atomic_write(path, a.content.encode())
         return {"path": str(path), "bytes": len(a.content.encode())}
@@ -279,7 +294,7 @@ def builtins() -> ToolRegistry:
             instruction = entry["content"]["instruction"] + "\n" + instruction
         if not instruction.strip():
             raise ValueError("An instruction or subagent specification is required")
-        session = c.runtime.spawn(c.session_id, instruction, name=a.name)
+        session = c.runtime.spawn(c.session_id, instruction, name=a.name, role=a.role)
         return {"session_id": session.id, "name": session.name, "parent_id": session.parent_id}
 
     async def message(c, a):
@@ -323,7 +338,19 @@ def builtins() -> ToolRegistry:
         ]
 
     async def state_read(c, a):
-        return c.runtime.store.state(c.session_id, a.entry_id, a.version)
+        entry = c.runtime.store.state(c.session_id, a.entry_id, a.version)
+        if entry["kind"] == "skill":
+            rows = c.runtime.store.db.execute(
+                "SELECT passed FROM skill_outcomes WHERE entry_id=? AND version=? ORDER BY rowid DESC",
+                (a.entry_id, entry["version"]),
+            ).fetchall()
+            cap = c.runtime.store.config(c.session_id).refinement.skill_failure_limit
+            entry["statistics"] = {
+                "successes": sum(row[0] for row in rows),
+                "failures": sum(not row[0] for row in rows),
+                "quarantined": len(rows) >= cap and not any(row[0] for row in rows[:cap]),
+            }
+        return entry
 
     async def select(c, a):
         for eid in a.entry_ids:
@@ -339,10 +366,9 @@ def builtins() -> ToolRegistry:
         }
 
     async def skill(c, a):
-        entry = c.runtime.store.state(c.session_id, a.entry_id)
-        if entry["kind"] != "skill" or entry["deleted"]:
-            raise ValueError("A live skill entry is required")
-        return await c.runtime.execute_python(c, entry["content"]["code"])
+        from .refinement import run_skill
+
+        return await run_skill(c, a.entry_id, a.inputs)
 
     async def schedule(c, a):
         return {"schedule_id": c.runtime.schedule(c.session_id, **a.model_dump())}
@@ -479,5 +505,16 @@ def builtins() -> ToolRegistry:
         "Create a durable interval or five-field UTC cron schedule.",
         ScheduleArgs,
         schedule,
+    )
+    from .coding_tools import register
+
+    register(registry)
+    add("history_get", "Retrieve a durable event by ID.", HistoryArgs, history)
+    add(
+        "skill_inspect",
+        "Read an executable skill and its version/provenance.",
+        StateReadArgs,
+        state_read,
+        ("state",),
     )
     return registry

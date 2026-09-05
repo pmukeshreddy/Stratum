@@ -110,3 +110,23 @@ async def test_broken_checkpoint_reported_as_environment_failure(tmp_path):
         await kernel.start()
     assert caught.value.failure.category == "environment"
     assert kernel.process is None
+
+
+async def test_workspace_module_import_recovery_captures_native_startup_output(tmp_path):
+    (tmp_path / "local_module.py").write_text(
+        "import os\nprint('importing module')\nos.write(1, b'native import output\\n')\nanswer = 42\n"
+    )
+    kernel = Kernel(tmp_path / "kernel", tmp_path, bridge)
+    try:
+        assert (await kernel.execute(new_id(), "import local_module\nlocal_module.answer", 5))[
+            "value"
+        ] == "42"
+    finally:
+        await kernel.close()
+    restored = Kernel(tmp_path / "kernel", tmp_path, bridge)
+    try:
+        result = await restored.execute(new_id(), "local_module.answer", 5)
+        assert result["value"] == "42"
+        assert "native import output" in (tmp_path / "kernel/recovery.log").read_text()
+    finally:
+        await restored.close()

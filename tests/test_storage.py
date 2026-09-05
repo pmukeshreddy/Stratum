@@ -3,8 +3,10 @@ import sqlite3
 import pytest
 from pydantic import ValidationError
 
-from threadweave.models import Lifecycle, RunConfig, StateEdit, Usage, Workspace
+from threadweave.models import Lifecycle, StateEdit, Usage, Workspace
 from threadweave.storage import Store
+
+from .fakes import TestConfig as RunConfig
 
 
 def make(store, tmp_path, **kwargs):
@@ -28,7 +30,7 @@ def test_lifecycle_events_identity_and_restart(tmp_path):
     assert restored.session(child.id).parent_id == root.id
     assert restored.session(child.id).root_id == root.id
     assert restored.session(root.id).config_id == config_id
-    assert restored.config(root.id) == RunConfig()
+    assert restored.config(root.id).model_dump() == RunConfig().model_dump()
     event = restored.event_by_id(eid)
     assert event["payload"] == {"value": 42}
     assert event["timestamp"] > 0 and event["parent_event_id"]
@@ -142,7 +144,7 @@ def test_refinement_versioning_delete_rollback_and_conflict(tmp_path):
     [
         ("memory", {"text": "A fact"}),
         ("prompt_note", {"text": "Check evidence"}),
-        ("skill", {"code": "answer = 42"}),
+        ("skill", {"name": "answer", "description": "Compute answer", "code": "answer = 42"}),
         ("subagent_spec", {"instruction": "Review artifacts"}),
     ],
 )
