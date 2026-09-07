@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 
 from pydantic import Field
 
 from .context import token_bound
-from .models import ModelRequest, Record, StateEdit, new_id, now
+from .models import ModelRequest, Outcome, Record, StateEdit, new_id, now
 from .repository import RepositoryIndex
 from .routing import route
 from .storage import encode
@@ -269,7 +270,88 @@ class MemoryServices:
             # Optional summarization must not hide evidence or prevent recoverable compaction.
             self.store.event(sid, "compaction_fallback", {"reason": str(exc)[:500]})
 
+    def request_refinement(self, sid, *, source, request_id=None, source_event=None):
+        """Request a model-generated evidence pass, NOT a pre-authored StateEdit.
+
+        Durable IDs make retries idempotent. Admission never changes an agent's
+        outcome, pause state, budgets or ordinary-turn runnable flag.
+        """
+        session, config = self.store.session(sid), self.store.config(sid)
+        request_id = request_id or new_id()
+        if self.store.db.execute(
+            "SELECT 1 FROM refinement_requests WHERE id=?", (request_id,)
+        ).fetchone():
+            return self.store.refinement_request(sid, request_id)
+        with self.store.transaction():
+            event = self.store.event(
+                sid,
+                "refinement_trigger",
+                {
+                    "source": source,
+                    "request_id": request_id,
+                },
+                parent=source_event,
+            )
+            self.store.db.execute(
+                "INSERT INTO refinement_requests VALUES(?,?,?,?,?)",
+                (
+                    request_id,
+                    sid,
+                    event,
+                    "pending",
+                    encode({"waiting_for_resume": session.paused}),
+                ),
+            )
+            if not config.refinement.enabled:
+                return self.store.refinement_request_result(
+                    sid,
+                    request_id,
+                    "skipped",
+                    reason="Refinement is disabled in this session configuration",
+                )
+            if session.outcome not in {Outcome.ACTIVE, Outcome.COMPLETED}:
+                return self.store.refinement_request_result(
+                    sid,
+                    request_id,
+                    "failed",
+                    reason="Session is cancelled, failed or resource-limited; not reactivated",
+                )
+            self.store.event(
+                sid,
+                "refinement_status",
+                {"request_id": request_id, "status": "requested"},
+                parent=event,
+            )
+        self._wake.set()
+        return self.store.refinement_request(sid, request_id)
+
+    def recover_refinement_requests(self):
+        # Never replay an in-flight auxiliary request after a crash: provider
+        # effects/billing may be uncertain. An operator can explicitly request again.
+        for row in self.store.db.execute(
+            "SELECT * FROM refinement_requests WHERE status='running'"
+        ).fetchall():
+            self.store.refinement_request_result(
+                row["session_id"],
+                row["id"],
+                "failed",
+                reason="Refinement interrupted by runtime restart; no automatic replay",
+                uncertain=True,
+            )
+
     async def auto_refine(self, sid, trigger=None):
+        requests = self.store.pending_refinement_requests(sid)
+        if requests:
+            for request in requests:
+                # A session's scheduler slot serializes passes; this claim also
+                # protects direct callers from processing the same request twice.
+                claimed = self.store.db.execute(
+                    "UPDATE refinement_requests SET status='running' WHERE id=? AND status='pending'",
+                    (request["id"],),
+                ).rowcount
+                if claimed:
+                    await self._refinement_pass(sid, "manual", request_id=request["id"])
+            return
         config, session = self.store.config(sid), self.store.session(sid)
         if not config.refinement.enabled or not config.features.automatic_refinement:
             return
@@ -277,10 +359,7 @@ class MemoryServices:
             return
         last = self.store.events(sid, kind="automatic_refinement", limit=1)
         after = last[0]["seq"] if last else 0
-        manual = self.store.events(sid, kind="refinement_trigger", limit=1)
-        if manual and manual[0]["seq"] > after:
-            trigger = "manual"
-        if not config.refinement.automatic and trigger != "manual":
+        if not config.refinement.automatic:
             return
         recent = [event for event in self.store.events(sid, limit=100) if event["seq"] > after]
         failures = [
@@ -304,6 +383,13 @@ class MemoryServices:
             and last[0]["payload"].get("trigger") == trigger
         ):
             return
+        await self._refinement_pass(sid, trigger)
+
+    async def _refinement_pass(self, sid, trigger, *, request_id=None):
+        config, session = self.store.config(sid), self.store.session(sid)
+        last = self.store.events(sid, kind="automatic_refinement", limit=1)
+        after = last[0]["seq"] if last else 0
+        recent = [e for e in self.store.events(sid, limit=100) if e["seq"] > after]
         evidence = [
             e
             for e in recent
@@ -317,6 +403,10 @@ class MemoryServices:
                 "agent_message_received",
                 "completion_attempt",
             }
+            and not (
+                e["type"] == "agent_message_received"
+                and e["payload"].get("body", "").strip() == "/refine"
+            )
         ][-15:]
         marker = self.store.event(
             sid,
@@ -325,11 +415,23 @@ class MemoryServices:
                 "trigger": trigger,
                 "turn": session.turns,
                 "source_events": [e["id"] for e in evidence],
+                "request_id": request_id,
             },
         )
+
+        def finish(status, **details):
+            if request_id:
+                return self.store.refinement_request_result(sid, request_id, status, **details)
+            self.store.event(sid, "refinement_status", {"status": status, **details}, parent=marker)
+
+        if not config.refinement.enabled:
+            finish("skipped", reason="Refinement is disabled in this session configuration")
+            return
         if not evidence:
+            finish("skipped", reason="No new usable trajectory evidence; no changes made")
             return
         try:
+            self._check_limits(sid, resource="turns")
             response, source = await self.auxiliary(
                 sid,
                 "refinement",
@@ -342,21 +444,43 @@ class MemoryServices:
             if not isinstance(proposals, list) or len(proposals) > config.refinement.max_proposals:
                 raise ValueError("Invalid proposal count")
             allowed = {e["id"] for e in evidence}
-            for proposal in proposals:
-                try:
-                    edit = StateEdit.model_validate(proposal)
-                    if not set(edit.source_events) <= allowed:
-                        raise ValueError("Proposal cites evidence outside selected trajectory")
-                    if edit.kind == "skill":
-                        edit.content = validate_skill(edit.content, config.permissions)
-                    self.store.queue_refinement(sid, edit)
-                except ValueError as exc:
-                    self.store.event(
-                        sid, "refinement_rejected", {"reason": str(exc)[:1000]}, parent=source
-                    )
-            self.store.apply_refinements(sid)
+            # State versions and terminal request status commit together. A crash
+            # cannot apply the same proposal twice or report success before writes.
+            with self.store.transaction():
+                queued, rejected = [], 0
+                for proposal in proposals:
+                    try:
+                        edit = StateEdit.model_validate(proposal)
+                        if not set(edit.source_events) <= allowed:
+                            raise ValueError("Proposal cites evidence outside selected trajectory")
+                        if edit.kind == "skill":
+                            edit.content = validate_skill(edit.content, config.permissions)
+                        queued.append(self.store.queue_refinement(sid, edit))
+                    except (ValueError, PermissionError, KeyError) as exc:
+                        rejected += 1
+                        self.store.event(
+                            sid, "refinement_rejected", {"reason": str(exc)[:1000]}, parent=source
+                        )
+                applied = self.store.apply_refinements(sid, request_ids=queued)
+                rejected += len(queued) - len(applied)
+                finish(
+                    "applied" if applied else "failed" if rejected else "skipped",
+                    entry_ids=applied,
+                    applied_count=len(applied),
+                    rejected_count=rejected,
+                    source_event=source,
+                    reason="Validated changes committed"
+                    if applied
+                    else "All proposals rejected"
+                    if rejected
+                    else "Model proposed no reusable changes",
+                )
+        except asyncio.CancelledError:
+            finish("failed", reason="Refinement interrupted; no automatic replay", uncertain=True)
+            raise
         except Exception as exc:
             self.store.event(sid, "refinement_failed", {"reason": str(exc)[:1000]}, parent=marker)
+            finish("failed", reason=str(exc)[:1000])
 
     def retain_failure(self, sid, event, verification):
         if self.store.config(sid).task.adapter != "coding":

@@ -526,10 +526,12 @@ class Store:
             )
         return rid
 
-    def apply_refinements(self, sid: str) -> list[str]:
+    def apply_refinements(self, sid: str, *, request_ids=None) -> list[str]:
         rows = self.db.execute(
             "SELECT * FROM refinements WHERE session_id=? AND status='pending'", (sid,)
         ).fetchall()
+        if request_ids is not None:
+            rows = [r for r in rows if r["id"] in request_ids]
         applied = []
         for row in rows:
             try:
@@ -552,6 +554,39 @@ class Store:
                     parent=row["source_event"],
                 )
         return applied
+
+    def pending_refinement_requests(self, sid):
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM refinement_requests WHERE session_id=? AND status='pending' ORDER BY rowid",
+                (sid,),
+            )
+        ]
+
+    def refinement_request(self, sid, request_id):
+        row = self.db.execute(
+            "SELECT * FROM refinement_requests WHERE id=? AND session_id=?", (request_id, sid)
+        ).fetchone()
+        if row is None:
+            raise KeyError("Unknown refinement request for this session")
+        return {
+            "request_id": row["id"],
+            "event_id": row["trigger_event"],
+            "status": "requested" if row["status"] == "pending" else row["status"],
+            **json.loads(row["result"]),
+        }
+
+    def refinement_request_result(self, sid, request_id, status, **result):
+        with self.transaction():
+            self.db.execute(
+                "UPDATE refinement_requests SET status=?,result=? WHERE id=? AND session_id=?",
+                (status, encode(result), request_id, sid),
+            )
+            self.event(
+                sid, "refinement_status", {"request_id": request_id, "status": status, **result}
+            )
+        return self.refinement_request(sid, request_id)
 
     def _apply_edit(self, sid: str, edit: StateEdit, source: str) -> str:
         eid = edit.entry_id or new_id()
@@ -659,6 +694,14 @@ class Store:
                 (outcome.value, now(), sid),
             )
             self.db.execute("UPDATE schedules SET enabled=0 WHERE session_id=?", (sid,))
+            if outcome in {Outcome.CANCELLED, Outcome.FAILED, Outcome.LIMITED}:
+                for request in self.pending_refinement_requests(sid):
+                    self.refinement_request_result(
+                        sid,
+                        request["id"],
+                        "failed",
+                        reason=f"Session {outcome.value} before refinement could run",
+                    )
             self.event(
                 sid,
                 "completion" if outcome == Outcome.COMPLETED else "termination",

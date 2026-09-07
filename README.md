@@ -83,13 +83,21 @@ Long-horizon controls: autonomous mode, persistent goals, heartbeats, budgets
 `await rlm(instruction, name=None)` returns a stable child handle after admission without
 waiting for a child answer. Children have independent contexts, REPLs and histories;
 they can create descendants. Related sessions communicate through durable queues.
-A failed child does not destroy the root.
+A parent (or human) can send follow-up work to a completed child to continue that
+same session, including after its kernel has been unloaded. History, recoverable
+Python values and accumulated budgets are retained. Paused, cancelled, failed and
+resource-exhausted children are not automatically restarted. A failed child does
+not destroy the root.
 
 The Continual Harness retains append-only history and versioned memories,
 executable skills, prompt notes and reusable subagent specifications. `rlm.harness`
 provides immediate, audited CRUD from Python. Automatic refinement proposals are
 validated and applied at turn boundaries. Explicit selection, deletion, rollback
 and optional global scope are supported. Foundational policy and weights are unchanged.
+Interactive `/refine` requests an evidence-based model pass at a safe boundary,
+even when periodic automatic refinement is off. It reports requested, applied,
+skipped or failed; a request is not a claim that learning has occurred. Refinement
+must be enabled, and a pass with no new usable evidence makes no changes.
 
 Compaction only changes L1. History, REPL values and children remain intact.
 Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,

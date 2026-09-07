@@ -272,12 +272,12 @@ async def dispatch(context, request):
     if op.startswith("harness."):
         if op == "harness.refine":
             permission(context, "state")
-            return {
-                "event_id": store.event(
-                    sid, "refinement_trigger", {"source": "python"}, parent=context.source_event
-                ),
-                "applies": "next turn",
-            }
+            return runtime.request_refinement(
+                sid,
+                source="python",
+                request_id=context.action_id,
+                source_event=context.source_event,
+            )
         return harness(context, op.split(".")[1], p)
     if op.startswith("agent_observe."):
         permission(context, "agents")

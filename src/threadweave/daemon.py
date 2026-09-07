@@ -117,7 +117,7 @@ class Daemon:
             return {
                 "pid": os.getpid(),
                 "data": str(self.directory),
-                "schema_version": 4,
+                "schema_version": 5,
                 "capabilities": [
                     "interactive_chat",
                     "information_hierarchy",
@@ -264,11 +264,17 @@ class Daemon:
                 "infrastructure_error": error,
             }
         if method == "refine":
+            if "edit" not in args:
+                return runtime.request_refinement(
+                    args["session_id"], source="human", request_id=args.get("request_id")
+                )
             return {
                 "refinement_id": store.queue_refinement(
                     args["session_id"], StateEdit.model_validate(args["edit"])
                 )
             }
+        if method == "refinement_status":
+            return store.refinement_request(args["session_id"], args["request_id"])
         if method == "compact":
             sid = args["session_id"]
             if sid in runtime.tasks:

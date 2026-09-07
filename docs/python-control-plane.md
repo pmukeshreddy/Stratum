@@ -75,20 +75,20 @@ processes are never silently replayed.
 ## Environment and orchestration APIs
 
 ```python
-files = list(workspace.rglob('*.py'))
-matches = repo.search('Lifecycle')
-outline = repo.outline('src/threadweave/runtime.py')
-await edit('notes.txt', 'one unique old passage', 'replacement')
+files = list(workspace.rglob("*.py"))
+matches = repo.search("Lifecycle")
+outline = repo.outline("src/threadweave/runtime.py")
+await edit("notes.txt", "one unique old passage", "replacement")
 diff = git.diff()
-job = bash('uv run pytest -q')
+job = bash("uv run pytest -q")
 print(job.pid, job.running)
 result = await job
 print(result.exit_code, result.output[-1200:])
 
-review = await rlm('Inspect persistence; explicitly message your findings.', name='review')
+review = await rlm("Inspect persistence; explicitly message your findings.", name="review")
 local_value = 123  # executes without waiting for review to finish
 status = await agent_observe.get_agent(review.session_id)
-await agent_message.send('Check restart handling.', receiver_role='child', receiver_name='review')
+await agent_message.send("Check restart handling.", receiver_role="child", receiver_name="review")
 # Child: await agent_message.send('Evidence...', receiver_role='parent')
 messages = history.messages()
 ```
@@ -114,18 +114,22 @@ lifecycle notice, not an implicit answer; useful results require explicit messag
 ## Continual state and skills
 
 ```python
-entry = harness.create_memory('Observation', 'Retained fact', id='observation')
-harness.update_memory('observation', 'Observation', 'Corrected fact')
-harness.rollback('memory', 'observation', 1)
+entry = harness.create_memory("Observation", "Retained fact", id="observation")
+harness.update_memory("observation", "Observation", "Corrected fact")
+harness.rollback("memory", "observation", 1)
 harness.select([entry.id])
 
-procedure = harness.create_skill('Increment', {
-    'name': 'increment', 'description': 'Increment the retained counter',
-    'code': 'counter += 1\nskill_result = counter',
-    'required_permissions': ['python'],
-})
+procedure = harness.create_skill(
+    "Increment",
+    {
+        "name": "increment",
+        "description": "Increment the retained counter",
+        "code": "counter += 1\nskill_result = counter",
+        "required_permissions": ["python"],
+    },
+)
 counter = 0
-answer = await skills.run('increment')
+answer = await skills.run("increment")
 ```
 
 Memory/prompt/subagent entries use text/instruction contents. Explicit CRUD commits
@@ -171,9 +175,9 @@ Servers start lazily, so a greeting does not start MCP servers.
 
 ```python
 servers = await mcp.list_servers()
-schemas = await mcp.list_tools('local')
-value = await mcp.call_tool('local', 'lookup', {'query': 'evidence'})
-await mcp.reload('local')
+schemas = await mcp.list_tools("local")
+value = await mcp.call_tool("local", "lookup", {"query": "evidence"})
+await mcp.reload("local")
 ```
 
 Credential values are resolved by the daemon, not stored in config or passed to
@@ -203,6 +207,13 @@ destroying the recurring session. Waiting for all children is an explicit
 `task.wait_for_children` gate, not the default.
 
 ## Deliberate boundaries and remaining differences
+
+The completed-child follow-up and interactive `/refine` fixes are behavioral bugs,
+not reasons to change other policies. Model-controlled SQLite FTS5 history search,
+ripgrep/Python repository search and arbitrary Python processing are retained.
+Refinement defaults, global-state write permissions, context sizing, checkpoint
+limits and run budgets are Threadweave implementation choices and are unchanged.
+An unspecified paper detail is not evidence that these choices are defects.
 
 This is a source-traced implementation of the default Python control plane, not
 byte-for-byte API equivalence to every reference extension. Important limits:

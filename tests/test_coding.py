@@ -216,6 +216,15 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
     directory = tmp_path / "runtime"
     runtime = Runtime(directory)
     child_patch = '--- a/mathops.py\n+++ b/mathops.py\n@@ -1,2 +1,3 @@\n def add(a, b):\n+    """Add two numbers."""\n     return a + b\n'
+    overlap = asyncio.Barrier(2)
+
+    async def parent_after_spawn(request):
+        await asyncio.wait_for(overlap.wait(), 10)
+        return response("python", code="retained = {'fixed': True}\nretained")
+
+    async def child_first_turn(request):
+        await asyncio.wait_for(overlap.wait(), 10)
+        return response("apply_patch", patch=child_patch)
 
     def consume(request):
         child = next(s for s in runtime.store.sessions(root_id=request.root_id) if s.parent_id)
@@ -233,7 +242,7 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
             response(
                 "agent_spawn", instruction="Add a useful docstring and test it", name="candidate"
             ),
-            response("python", code="retained = {'fixed': True}\nretained"),
+            parent_after_spawn,
             response("agent_wait", seconds=0.5),
             consume,
             response("agent_wait", seconds=0.5),
@@ -241,12 +250,14 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
             response("finish", result="Arithmetic fixed and verified"),
         ],
         "candidate": [
-            response("apply_patch", patch=child_patch),
+            child_first_turn,
             response("run_tests"),
             response("finish", result="Docstring added; tests pass"),
         ],
     }
-    provider = ScriptedProvider(scripts, delay=0.3)
+    # Real provider-call overlap is required even with instant model responses.
+    # The old 300ms sleep happened to overlap only when coding preparation was fast.
+    provider = ScriptedProvider(scripts)
     runtime.providers["test"] = provider
     root = runtime.create(
         "Repair arithmetic and retain verification evidence", repository, config=coding_config

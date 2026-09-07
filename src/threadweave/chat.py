@@ -10,7 +10,7 @@ from pathlib import Path
 from .configuration import load_config
 from .daemon import request
 from .gitops import git
-from .models import RunConfig
+from .models import RunConfig, new_id
 from .terminal import EventRenderer, Terminal
 
 HELP = """/help         Show commands
@@ -23,6 +23,7 @@ HELP = """/help         Show commands
 /history      Recent conversation and tool activity
 /experiments  Durable experiments
 /compact      Compact active context (pause first if working)
+/refine       Request evidence-based learning at a safe boundary (not a StateEdit)
 /pause        Interrupt this session's current turn; keep state
 /resume       Continue paused work
 /new          Start a new conversation; keep the old one
@@ -317,17 +318,36 @@ class Chat:
             "compact",
             "pause",
             "resume",
+            "refine",
         }:
             await self.notice("Unknown command. Type /help.")
             return True
         result = await self.current(
             "status" if command == "usage" else "information" if command == "state" else command,
-            **({"limit": 40, "tree": True} if command == "history" else {}),
+            **(
+                {"limit": 40, "tree": True}
+                if command == "history"
+                else {"request_id": new_id()}
+                if command == "refine"
+                else {}
+            ),
         )
         if self.terminal.json_mode:
             await self.terminal.json(
                 {"type": "control_result", "command": command, "result": result}
             )
+        elif command == "refine":
+            if result["status"] == "requested":
+                await self.notice(
+                    "Refinement requested; no changes applied yet. "
+                    + (
+                        "Session is paused; use /resume to process it."
+                        if result.get("waiting_for_resume")
+                        else "It will run at the next safe boundary."
+                    )
+                )
+            else:
+                await self.notice(f"Refinement {result['status']}: {result.get('reason', '')}")
         elif command == "usage":
             usage = result["tree_usage"]
             cost = "subscription / unavailable" if usage["cost"] is None else str(usage["cost"])

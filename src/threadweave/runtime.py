@@ -334,15 +334,70 @@ class Runtime(MemoryServices):
         with self.store.transaction():
             mid = self.store.send(sender_id, recipient_id, body)
             if sender_id is None and body.strip() == "/refine":
-                self.store.event(
-                    recipient_id, "refinement_trigger", {"reason": "human", "message_id": mid}
+                self.request_refinement(
+                    recipient_id,
+                    source="human",
+                    request_id=mid,
+                    source_event=self.store.db.execute(
+                        "SELECT source_event FROM messages WHERE id=?", (mid,)
+                    ).fetchone()[0],
                 )
+                # Control input is consumed by the refinement queue, not by an
+                # ordinary agent turn (and is not evidence of reusable learning).
+                self.store.db.execute("UPDATE messages SET received_at=? WHERE id=?", (now(), mid))
+                return mid
+            self._continue_completed_child(recipient_id)
             recipient = self.store.session(recipient_id)
-            # Terminal sessions retain messages, but are resumed only by explicit human control.
             if recipient.outcome == Outcome.ACTIVE and not recipient.paused:
                 self.store.update(recipient_id, runnable=True, wake_at=None)
         self._wake.set()
         return mid
+
+    def _continue_completed_child(self, sid):
+        """Admit queued explicit parent/human follow-ups without resetting a trajectory.
+
+        Called inside the send/completion transaction and during recovery. Replies
+        from descendants are observations, not new assignments to a finished parent.
+        The scheduler's per-session task slot owns execution, including kernel cleanup.
+        """
+        session = self.store.session(sid)
+        if not session.parent_id or session.outcome != Outcome.COMPLETED or session.paused:
+            return False
+        message = self.store.db.execute(
+            "SELECT id FROM messages WHERE recipient_id=? AND received_at IS NULL "
+            "AND (sender_id=? OR sender_id IS NULL) ORDER BY created_at LIMIT 1",
+            (sid, session.parent_id),
+        ).fetchone()
+        if not message:
+            return False
+        ancestor = self.store.session(session.parent_id)
+        while ancestor:
+            if ancestor.outcome in {Outcome.CANCELLED, Outcome.FAILED, Outcome.LIMITED}:
+                return False
+            ancestor = self.store.session(ancestor.parent_id) if ancestor.parent_id else None
+        try:
+            self._check_limits(sid, resource="turns")
+            self._check_limits(sid, resource="model_calls")
+        except LimitReached:
+            return False
+        except BudgetBusy:
+            # Reservations are temporary; normal invocation admission will wait.
+            pass
+        self.store.update(sid, outcome=Outcome.ACTIVE, runnable=True, wake_at=None, result=None)
+        self.store.db.execute(
+            "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
+        )
+        self.store.event(
+            sid,
+            "subagent_continued",
+            {
+                "message_id": message["id"],
+                "previous_outcome": "completed",
+                "kernel_id": session.kernel_id,
+            },
+        )
+        self._wake.set()
+        return True
 
     def receive(self, sid):
         cap = self.store.config(sid).context.result_chars
@@ -364,6 +419,8 @@ class Runtime(MemoryServices):
         """Atomic human input + continuation; no client-side input/resume race."""
         if not body.strip():
             raise ValueError("Message cannot be empty")
+        if body.strip() == "/refine":
+            return self.message(None, sid, body)
         session = self.store.session(sid)
         if session.outcome == Outcome.LIMITED:
             raise ValueError("Session resource limit reached; use /new or fork a new run")
@@ -491,7 +548,9 @@ class Runtime(MemoryServices):
         ancestor = session
         while ancestor:
             goal = self.store.goal(ancestor.id)
-            if goal and goal["status"] == "active" and goal.get("token_budget"):
+            # Completion does not erase a trajectory budget: completed children
+            # may accept follow-ups, and completed ancestors still own their spend.
+            if goal and goal["status"] in {"active", "completed"} and goal.get("token_budget"):
                 bound = (
                     input_bound + (provider or self.store.config(sid).provider).max_output_tokens
                     if resource == "model_calls"
@@ -553,6 +612,7 @@ class Runtime(MemoryServices):
 
     async def recover(self):
         await self.environment.recover()
+        self.recover_refinement_requests()
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
         for row in self.store.db.execute("SELECT * FROM reservations").fetchall():
@@ -628,6 +688,9 @@ class Runtime(MemoryServices):
                         row["source_event"],
                         recovered=True,
                     )
+            with self.store.transaction():
+                self._continue_completed_child(session.id)
+            session = self.store.session(session.id)
             if session.outcome == Outcome.ACTIVE:
                 eid = self.store.event(
                     session.id,
@@ -671,8 +734,18 @@ class Runtime(MemoryServices):
                         break
                     if (
                         session.id in self.tasks
-                        or not session.runnable
-                        or session.outcome != Outcome.ACTIVE
+                        or session.paused
+                        or (
+                            not session.runnable
+                            and not self.store.pending_refinement_requests(session.id)
+                        )
+                        or (
+                            session.outcome != Outcome.ACTIVE
+                            and not (
+                                session.outcome == Outcome.COMPLETED
+                                and self.store.pending_refinement_requests(session.id)
+                            )
+                        )
                     ):
                         continue
                     root_limit = self.store.config(session.root_id).limits.concurrency
@@ -729,6 +802,11 @@ class Runtime(MemoryServices):
             config = self.store.config(sid)
             pending = session.pending_turn
             if pending is None:
+                if not session.runnable or session.outcome == Outcome.COMPLETED:
+                    # Control-only work from idle/completed sessions does not
+                    # launch an unsolicited agent turn or a coding preparation.
+                    await self.auto_refine(sid)
+                    return
                 self._check_limits(sid, resource="turns")
                 self.store.apply_refinements(sid)
                 self.receive(sid)
@@ -872,6 +950,7 @@ class Runtime(MemoryServices):
                         )
                 current = self.store.session(sid)
                 self.store.update(sid, pending_turn=None, turns=current.turns + 1)
+                self._continue_completed_child(sid)
                 self.store.event(sid, "turn_completed", {"turn": current.turns})
                 if current.mode == "interactive":
                     if not response.actions:

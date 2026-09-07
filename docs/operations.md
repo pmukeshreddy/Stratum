@@ -60,7 +60,7 @@ Typing while busy queues a durable intervention for the next safe turn boundary.
 Partial external actions are not assumed rolled back after cancellation.
 
 Slash controls: /help, /status, /state, /states, /usage, /tree, /diff, /history, /experiments,
-/compact, /pause, /resume, /new, /exit. Diff and manual compaction require the
+/compact, /refine, /pause, /resume, /new, /exit. Diff and manual compaction require the
 session to be idle/paused. /new retains prior sessions and does not stop their work.
 --json gives debug events; --verbose adds low-level event/artifact details.
 Clients reconnect to an already restarted daemon without changing session identity.
@@ -73,18 +73,41 @@ compact, schedule, schedules, unschedule, artifact and daemon start/status/stop.
 
 Use the same global --data directory for every command, preferably outside the
 repository. Pause before manual diff/verification for a stable workspace.
-Ctrl-C during attach detaches; it does not cancel. Terminal sessions require resume.
+Ctrl-C during attach detaches; it does not cancel. A completed child accepts explicit
+parent/human follow-ups without an additional resume command. Its existing ID,
+kernel association, workspace, history, reusable state and accounting remain intact;
+serializable Python values recover from the existing checkpoint if unloaded.
+Completion notifications from descendants do not revive a finished parent. Sibling
+messages still queue, but do not automatically reopen completed work. Paused,
+failed, cancelled and exhausted sessions require explicit operator control; a
+follow-up cannot reset a goal budget or bypass recursive root limits.
 Resource-limited sessions require a new fork for a fresh budget; original spend
 remains recorded.
 
 Schedules accept intervals or five-field UTC cron, coalescing missed ticks.
 Reboot requires daemon startup, manually or through a service manager.
 
-refine SESSION_ID edit.json queues an evidence-backed StateEdit. Automatic refinement
-can also be explicitly requested with refine SESSION_ID or input SESSION_ID /refine.
-The request runs at the next turn boundary; paused sessions still need resume.
-Periodic refinement
-is separately controlled by refinement.automatic and interval/completion settings.
+`refine SESSION_ID edit.json` queues a pre-authored evidence-backed StateEdit; it
+does not request model generation. `/refine` in chat, `refine SESSION_ID`,
+`input SESSION_ID /refine` and Python `await refine()` instead request a
+model-generated pass over selected trajectory evidence. The request runs at a
+safe boundary. An idle or completed session can run a refinement-only pass without
+starting an ordinary agent turn or coding preparation. Paused sessions still need
+`/resume`. The mechanism requires `refinement.enabled`; periodic refinement and
+the `features.automatic_refinement` ablation flag do not disable explicit requests.
+Periodic scheduling remains separately controlled by `refinement.automatic` and
+its interval/completion settings. No defaults or resource allowances are changed.
+
+Requests have durable IDs and requested/running/applied/skipped/failed statuses.
+The chat reports admission before work and renders the eventual outcome from the
+event stream. Daemon clients can query `refinement_status(session_id, request_id)`;
+repeating the same request ID does not enqueue another pass. Validated state
+versions and the applied status commit atomically with source-event provenance.
+No new usable evidence or no proposals is an explicit no-op; invalid proposals
+and failed model calls are reported, not treated as learning. Interrupted in-flight
+passes are marked failed/uncertain and are **not** automatically replayed after
+restart; queued, unstarted requests survive. Request a new pass explicitly after
+reviewing interruption evidence. Model calls still use existing cumulative budgets.
 Only explicitly selected durable contents enter context; default Python mode also
 provides bounded state/skill discovery menus.
 
