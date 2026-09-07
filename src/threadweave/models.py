@@ -214,8 +214,46 @@ class TaskConfig(Record):
     allow_baseline_failures: bool = False
 
 
+class McpServerConfig(Record):
+    type: Literal["stdio", "http"] = "stdio"
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    cwd: str = "."
+    url: str | None = None
+    enabled: bool = True
+    enabled_tools: list[str] | None = None
+    disabled_tools: list[str] = Field(default_factory=list)
+    # Values are ENVIRONMENT VARIABLE NAMES, never credentials in persisted configs.
+    env_from: dict[str, str] = Field(default_factory=dict)
+    headers_from: dict[str, str] = Field(default_factory=dict)
+    startup_timeout_seconds: float = Field(default=30, gt=0)
+    call_timeout_seconds: float = Field(default=60, gt=0)
+
+    @model_validator(mode="after")
+    def transport_config(self):
+        if self.type == "stdio" and not self.command:
+            raise ValueError("stdio MCP requires command")
+        if self.type == "http" and not self.url:
+            raise ValueError("http MCP requires url")
+        if self.url:
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(self.url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.username
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("MCP URL must not contain credentials, query secrets or fragments")
+        return self
+
+
 class RunConfig(Record):
     schema_version: Literal[1] = 1
+    control_plane: Literal["python", "direct"] = "python"
+    skill_paths: list[str] = Field(default_factory=list)
+    mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     context: ContextPolicy = Field(default_factory=ContextPolicy)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
@@ -236,6 +274,8 @@ class RunConfig(Record):
 
     @model_validator(mode="after")
     def coherent(self):
+        if self.control_plane == "python" and "wait_for_children" not in self.task.model_fields_set:
+            self.task.wait_for_children = False
         if (
             max(p.max_output_tokens for p in [self.provider, *self.models.values()])
             >= self.context.max_tokens

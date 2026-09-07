@@ -1,4 +1,4 @@
-"""Opt-in exact architecture acceptance over a real terminal and subscription provider.
+"""Opt-in legacy direct-tool acceptance over a real terminal and subscription provider.
 
 THREADWEAVE_LIVE_ARCHITECTURE=1 uv run pytest -s tests/test_architecture_live.py
 No test provider, external coding agent, API key, or implicit coding preparation.
@@ -40,6 +40,7 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
     assert not (workspace / ".git").exists()
     (workspace / "environment.txt").write_text("Shared environment observation: blue cedar.\n")
     config = RunConfig.model_validate_json((PROJECT / "configs/session.json").read_text())
+    config.control_plane = "direct"  # Default Python-only acceptance: test_python_control_live.py.
     config.provider.parameters["reasoning_effort"] = "low"
     config.limits.wall_seconds = 1800
     config.tool_allowlist = [

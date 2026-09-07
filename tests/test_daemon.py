@@ -63,6 +63,7 @@ async def until_status(data, sid, predicate, seconds=15):
 async def test_real_daemon_kill_restart_recovers_full_recursive_trajectory(tmp_path):
     data, log = tmp_path / "data", tmp_path / "daemon.log"
     config = RunConfig(
+        control_plane="direct",
         provider={"name": "recovery_scenario", "model": "deterministic", "max_output_tokens": 128},
         context={"max_tokens": 26000, "compact_at": 0.45, "summary_chars": 600, "recent_blocks": 2},
         extensions=["tests.scenario_plugin:install"],
@@ -142,6 +143,7 @@ async def test_cli_detach_does_not_cancel_and_controls_are_usable(tmp_path):
     process = await start_daemon(data, log)
     try:
         config = RunConfig(
+            control_plane="direct",
             provider={
                 "name": "recovery_scenario",
                 "model": "deterministic",
@@ -220,6 +222,7 @@ async def test_daemon_single_owner_and_private_socket(tmp_path):
 async def test_killed_daemon_does_not_replay_uncertain_tool_side_effect(tmp_path, scenario):
     data, log = tmp_path / "data", tmp_path / "log"
     config = RunConfig(
+        control_plane="direct",
         provider={
             "name": "recovery_scenario",
             "max_output_tokens": 128,

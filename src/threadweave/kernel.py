@@ -40,18 +40,25 @@ def fork_checkpoint(source, destination, old_workspace, new_workspace):
 
 
 class Kernel:
-    def __init__(self, directory: Path, workspace: Path, bridge, *, env=None):
+    def __init__(self, directory: Path, workspace: Path, bridge, *, env=None, bootstrap=None):
         self.directory, self.workspace, self.bridge = directory, workspace, bridge
         self.process: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
         self.recovery = {}
         self._stderr = None
         self.env = env
+        self.bootstrap = bootstrap or {}
+        self.reader = None
+        self.calls, self.results = set(), {}
+        self.write_lock = asyncio.Lock()
 
     async def start(self):
         if self.process and self.process.returncode is None:
             return
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        from .artifacts import atomic_write
+
+        atomic_write(self.directory / "bootstrap.json", json.dumps(self.bootstrap).encode())
         self._stderr = (self.directory / "worker.log").open("ab")
         self.process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -75,6 +82,7 @@ class Kernel:
                     "environment", "kernel_restore", ready.get("error", "Invalid handshake")
                 )
             self.recovery = ready["recovery"]
+            self.reader = asyncio.create_task(self._pump())
         except BaseException:
             await self.close()
             raise
@@ -96,32 +104,50 @@ class Kernel:
             ) from exc
 
     async def _send(self, value):
-        self.process.stdin.write((json.dumps(value, allow_nan=False) + "\n").encode())
-        await self.process.stdin.drain()
+        async with self.write_lock:
+            self.process.stdin.write((json.dumps(value, allow_nan=False) + "\n").encode())
+            await self.process.stdin.drain()
+
+    async def _reply(self, packet):
+        try:
+            result = await self.bridge(packet["name"], packet["arguments"])
+            await self._send({"id": packet["id"], "result": result})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self.process and self.process.returncode is None:
+                await self._send({"id": packet["id"], "error": str(exc)[:2000]})
+
+    async def _pump(self):
+        try:
+            while True:
+                packet = await self._read()
+                if packet["type"] == "result":
+                    result = self.results.get(packet["id"])
+                    if result and not result.done():
+                        result.set_result(packet["result"])
+                elif packet["type"] == "tool_request":
+                    task = asyncio.create_task(self._reply(packet))
+                    self.calls.add(task)
+                    task.add_done_callback(self.calls.discard)
+                else:
+                    raise HarnessError(
+                        "environment", "kernel_protocol", "Unexpected worker packet", uncertain=True
+                    )
+        except Exception as exc:
+            for result in list(self.results.values()):
+                if not result.done():
+                    result.set_exception(exc)
 
     async def execute(self, execution_id: str, code: str, timeout: float):  # noqa: ASYNC109
         async with self.lock:
             await self.start()
             try:
                 async with asyncio.timeout(timeout):
+                    result = asyncio.get_running_loop().create_future()
+                    self.results[execution_id] = result
                     await self._send({"type": "execute", "id": execution_id, "code": code})
-                    while True:
-                        packet = await self._read()
-                        if packet["type"] == "result":
-                            return packet["result"]
-                        if packet["type"] == "tool_request":
-                            try:
-                                result = await self.bridge(packet["name"], packet["arguments"])
-                                await self._send({"result": result})
-                            except Exception as exc:
-                                await self._send({"error": str(exc)[:2000]})
-                        else:
-                            raise HarnessError(
-                                "environment",
-                                "kernel_protocol",
-                                "Unexpected packet",
-                                uncertain=True,
-                            )
+                    return await result
             except TimeoutError as exc:
                 await self.close()
                 raise HarnessError(
@@ -138,8 +164,26 @@ class Kernel:
                 raise HarnessError(
                     "environment", "kernel_disconnected", str(exc), uncertain=True
                 ) from exc
+            finally:
+                self.results.pop(execution_id, None)
 
     async def close(self):
+        jobs = [
+            t
+            for t in [self.reader, *self.calls]
+            if t is not None and t is not asyncio.current_task()
+        ]
+        for task in jobs:
+            task.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        self.reader = None
+        for result in self.results.values():
+            if not result.done():
+                result.set_exception(
+                    HarnessError(
+                        "environment", "kernel_closed", "Kernel interrupted", uncertain=True
+                    )
+                )
         if self.process:
             # Reap the process group even if the direct child already exited.
             try:

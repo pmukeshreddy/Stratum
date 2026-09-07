@@ -63,6 +63,7 @@ class Environment:
         if name in {"finish", "rlm", "agent_spawn"} or set(tool.permissions) & {
             "workspace.write",
             "python",
+            "ipython",
             "process",
         }:
             await self.prepare(sid, force=True)

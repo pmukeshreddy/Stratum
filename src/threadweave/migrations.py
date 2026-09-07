@@ -1,6 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 2
+VERSION = 4
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -48,4 +48,17 @@ def migrate(db, previous, timestamp):
             "BEGIN IMMEDIATE;"
             + CODING_SCHEMA
             + f"INSERT INTO schema_migrations VALUES(2,{timestamp}); PRAGMA user_version=2; COMMIT;"
+        )
+    if previous < 3:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE process_jobs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), body TEXT NOT NULL);"
+            f"INSERT INTO schema_migrations VALUES(3,{timestamp}); PRAGMA user_version=3; COMMIT;"
+        )
+    if previous < 4:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE goal_budgets(session_id TEXT PRIMARY KEY REFERENCES goals(session_id), "
+            "token_budget INTEGER NOT NULL, starting_tokens INTEGER NOT NULL);"
+            f"INSERT INTO schema_migrations VALUES(4,{timestamp}); PRAGMA user_version=4; COMMIT;"
         )

@@ -44,8 +44,9 @@ models.Session and runtime.Runtime implement the persistent session loop:
 3. Persist the response/action cursor before executing chosen tools.
 4. Retain observations externally, select bounded results for L1, continue.
 
-No mandatory planning/action graph exists. finish requests completion; only a
-configured verifier/end-condition supplies independent verification. Interactive
+No mandatory planning/action graph exists. In default Python mode final text ends
+an autonomous request or yields an interactive one. Persistent goals explicitly
+request `await goal.complete()`. Only a configured verifier/end-condition supplies independent verification. Interactive
 text replies yield to the human. Neither text nor unverified finish is reported as
 independent verification.
 
@@ -53,26 +54,27 @@ environment.Environment owns adapter admission, preparation, coding checkpoints,
 candidate isolation and external-effect recovery. TaskAdapters retain their
 prepare/verify interface. tools.ToolRegistry exposes typed permission-controlled
 primitives. Files/processes/repository/editor/Git/tests/builds/experiments/profilers
-are capabilities, not stages. Tools are exposed independently of the task adapter;
+are capabilities, not stages. The model receives only the `ipython` schema. All
+other registered capabilities are accessed from Python, independently of the adapter;
 missing prerequisites return structured errors. Standalone build/test actions run
 configured/detected commands without requiring a baseline.
 
 ## Root → rlm() → Recursive Subagents
 
-The model tool rlm and Python helper rlm(instruction, name=None, **options) use
-Runtime.spawn and its existing scheduler. agent_spawn is a compatible spelling.
-They return JSON-safe metadata containing the stable session ID, not a child
-answer. Creation does not await child model execution.
+`await rlm(instruction, name=None, model=None, thinking=None)` uses a correlated
+worker-to-daemon request, Runtime.spawn and its existing scheduler. It returns an
+AgentHandle with stable session identity, not a child answer. Creation does not
+await child model execution. Handles have explicit recovery codecs.
 
 Children use the same Session, model loop, history, permissions and worker
 implementation as roots, with independent context/kernel identity. They can call
 rlm recursively. Root values are not implicitly copied. Generic environments share
-workspace metadata. Explicit coding environments isolate writable candidates
-before admission: a large copy may delay admission, but never waits for the
-child's reasoning/result. Candidate patches require explicit acceptance.
+workspace metadata. The default Python rlm path shares the workspace even for a
+coding-configured parent. Isolated candidates require explicit selection through
+the optional coding capability; candidate patches require explicit acceptance.
 
-agent_message, agent_receive, agent_sessions, session_inspect and agent_wait expose
-persistent communication/inspection. Parent/child and permitted sibling messages
+`agent_message.send/receive/list_agents` and `agent_observe.get_agent/recent_messages`
+expose programmatic persistent communication/inspection. Parent/child and permitted sibling messages
 are queued in SQLite, timestamped, referenced by events and delivered at boundaries.
 Paused or terminated recipients retain messages; terminated sessions need explicit
 resumption. Completed children preserve identity/history/recoverable state.
@@ -96,13 +98,17 @@ storage.Store and refinement.MemoryServices implement the existing Continual
 Harness: append-only history and typed, versioned memories, executable skills,
 prompt notes and reusable subagent specifications.
 
-refine(edit=StateEdit(...)) queues create/update/delete/rollback operations with
+`harness.create_memory/create_prompt_note/create_skill/create_subagent`, get/list,
+update/delete/rollback provide immediate daemon-transactional CRUD within a Python
+cell. The cell is the provenance source; selected prompt changes apply at the next
+invocation. The optional `tools.call('refine', edit=...)` queues operations with
 source events, intended effect and optional expected_version. Runtime applies them
 at turn boundaries. Deletion and rollback append versions, never overwrite history.
-Entries have session-local or explicitly permitted global scope. state_list,
-state_read, state_select, skill_search, skill_inspect and skill_run provide access.
+Entries have session-local or explicitly permitted global scope. `skills.list/load/run`
+and `harness.select` expose retrieval/execution/selection without another model tool surface.
 
-Only selected entries enter supplemental L1. Skills validate syntax/input schemas/
+Compact state/skill menus enter supplemental L1; complete contents require selection
+or retrieval. Skills validate syntax/input schemas/
 declared permissions, record outcomes and quarantine repeatedly failing versions.
 This is not a sandbox. Automatic refinement optionally proposes evidence-backed
 state at configured boundaries. Auxiliary calls use the same provider retry,
@@ -115,14 +121,15 @@ selected entries, bounded summaries, recent complete model/tool blocks and messa
 It does not automatically dump arbitrary REPL values or disk history.
 
 kernel.Kernel and kernel_worker.Worker implement L2, one persistent process per
-loaded session. Variables survive incremental executions. Top-level await,
-tools.call, tools.acall, rlm, workspace, forget and remember_recipe are available.
+loaded session. IPython transformation and a persistent asyncio loop support magic
+syntax, top-level await and background tasks across cells. Tools, rlm, bash, messaging,
+MCP, skills, durable state, workspace, forget and remember_recipe are preloaded.
 Full programmatic results can stay in Python. Printing/returning them is explicit
 selection, with bounded capture and full retained artifacts.
 
 SQLite WAL/full synchronization, private artifacts and kernel checkpoints implement
 L3: events, messages, metadata/tree, contexts, compactions, versions, goals,
-schedules, action receipts and usage. FTS/history/artifact retrieval is scoped to
+schedules, process handles, action receipts and usage. FTS/history/artifact retrieval is scoped to
 the tree and explicit branch ancestry.
 
 Model compaction works in every environment, with recorded extractive fallback.
@@ -164,7 +171,8 @@ API prices. Resume/detach never resets limits.
 | Daemon ↔ Continual Harness, versions/provenance/rollback | test_architecture.py, test_storage.py, test_intelligence.py |
 | L1/L2/L3, compaction, persistent Python/recovery | test_architecture.py, test_context.py, test_kernel.py |
 | Autonomous/goal/heartbeat, gates, budgets/accounting | test_runtime.py, test_tools_and_controls.py, test_architecture.py |
-| Real subscription + CLI + children + compaction + hard restart | opt-in test_architecture_live.py |
+| Python-only provider schema, async rlm, shell, MCP, executable skill packages, history export | test_python_control.py, test_python_capabilities.py |
+| Real subscription + Python-only CLI + children + compaction + hard restart | opt-in test_python_control_live.py |
 
 No distributed daemon, arbitrary-object serialization, exactly-once external
 effects or host-execution sandbox is claimed.

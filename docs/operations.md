@@ -19,7 +19,8 @@ explicit commands because target names and build directories vary.
 
 models maps aliases to full provider configurations. routing supports fixed or
 role_based policies, a default alias, and mappings such as agent, reviewer,
-compaction and refinement. rlm (or agent_spawn) can specify a role. Every decision/reason is
+compaction and refinement. The optional agent_spawn capability can specify a role;
+Python rlm selects an optional provider/model and thinking level. Every decision/reason is
 recorded. Cost budgets require prices for every routed API model; subscription
 usage has null monetary cost and cannot use dollar budgets.
 
@@ -84,7 +85,8 @@ can also be explicitly requested with refine SESSION_ID or input SESSION_ID /ref
 The request runs at the next turn boundary; paused sessions still need resume.
 Periodic refinement
 is separately controlled by refinement.automatic and interval/completion settings.
-Only explicitly selected durable entries enter context.
+Only explicitly selected durable contents enter context; default Python mode also
+provides bounded state/skill discovery menus.
 
 ## Security boundaries
 
@@ -106,6 +108,7 @@ For container commands configure, adapting the image to an installed toolchain:
 
 ```json
 {
+  "control_plane": "direct",
   "execution": {
     "backend": "container", "engine": "docker",
     "image": "your-prebuilt-toolchain-image:immutable-tag",

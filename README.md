@@ -1,9 +1,10 @@
 # Threadweave
 
 Threadweave is a persistent recursive agent harness. An interactive Agents View
-attaches to a daemon-owned Root Session. The model selects computation, tools,
-environment actions, recursive children, messages or completion. Each session owns
-its context and persistent Python REPL; history and reusable state live on disk.
+attaches to a daemon-owned Root Session. The default model-facing tool is **ipython**.
+The model writes Python to select computation, environment actions, persistent
+recursive children and messages. Each session owns its context and persistent
+IPython kernel; history and reusable state live on disk.
 Ordinary conversation does not require a repository or a coding workflow.
 
 ## Open the Agents View
@@ -79,22 +80,49 @@ L3: disk-backed history, artifacts, messages, reusable state, session metadata
 Long-horizon controls: autonomous mode, persistent goals, heartbeats, budgets
 ```
 
-rlm(instruction, name=None) returns a stable child handle after admission without
+`await rlm(instruction, name=None)` returns a stable child handle after admission without
 waiting for a child answer. Children have independent contexts, REPLs and histories;
 they can create descendants. Related sessions communicate through durable queues.
 A failed child does not destroy the root.
 
 The Continual Harness retains append-only history and versioned memories,
-executable skills, prompt notes and reusable subagent specifications. refine queues
-typed, evidence-backed edits applied at turn boundaries. Read, explicit selection,
-deletion, rollback and optional global scope are supported. Foundational policy and
-model weights are never modified.
+executable skills, prompt notes and reusable subagent specifications. `rlm.harness`
+provides immediate, audited CRUD from Python. Automatic refinement proposals are
+validated and applied at turn boundaries. Explicit selection, deletion, rollback
+and optional global scope are supported. Foundational policy and weights are unchanged.
 
 Compaction only changes L1. History, REPL values and children remain intact.
 Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,
 accounting and supported Python checkpoint values. Non-serializable objects require
 explicit reconstruction recipes; missing/uncertain state is reported, not invented.
 [Component implementation and connection tests](docs/architecture.md).
+
+## Programmable control plane
+
+These are Python cells chosen by the model, not direct model tool calls:
+
+```python
+x = 123
+py_files = list(workspace.rglob("*.py"))  # retained outside the model prompt
+matches = repo.search("class Session")
+review = await rlm("Inspect persistence; message me your findings.", name="reviewer")
+# Admission returns a handle; the parent can keep computing here.
+status = await agent_observe.get_agent(review.session_id)
+await agent_message.send("Focus on recovery.", receiver_role="child", receiver_name="reviewer")
+result = await bash("uv run pytest -q")
+print(result.exit_code, result.output[-1000:])
+note = harness.create_memory("Observation", "The test command above completed.")
+```
+
+Files/Path, shell handles, editing, repository retrieval, MCP, skills and durable
+state are preloaded in roots and children. `tools.catalog()` retrieves optional
+capability schemas into Python. The full instruction is in `context['task']`;
+`context['messages_path']` points to a readable full-history JSONL projection.
+Only explicitly returned/printed selections enter L1. Normal final text ends/yields
+ordinary interaction; there is no universal coding verifier or finish tool.
+
+[Exact API, source trace, configuration and boundaries](docs/python-control-plane.md).
+Legacy direct tools require explicit `"control_plane": "direct"`; they are not the default.
 
 ## Environment capabilities
 
@@ -110,11 +138,12 @@ uv run threadweave run "Fix the failing tests without weakening them." \
   --workspace /path/to/repository --config configs/coding.json --attach
 ```
 
-This optional environment captures baseline evidence and verifies finish against
+This optional environment captures baseline evidence and verifies completion against
 configured commands and repository constraints. Interactive greetings/inspection
-do not run its baseline. Writable coding children use private repository copies;
-parent acceptance is explicit. Generic children share the Environment: coordinate
-writes or supply an isolated environment when needed. Nothing is automatically
+do not run its baseline. Python `rlm()` shares the current workspace even when the
+parent selected coding gates. Isolated coding candidates remain available through
+explicit `tools.call('agent_spawn', instruction=..., isolate=True)` in a coding environment; parent acceptance
+is explicit. Coordinate shared writes or choose isolation. Nothing is automatically
 committed or stashed. configs/kernel.json selects optional compile/correctness/
 performance commands through the same architecture.
 
@@ -141,9 +170,9 @@ uv run ruff format --check src tests
 uv build
 
 # Real subscription, terminal, root/children, compaction and hard restart:
-env -u OPENAI_API_KEY THREADWEAVE_LIVE_ARCHITECTURE=1 \
-  THREADWEAVE_ARCHITECTURE_OUTPUT=/absolute/path/to/acceptance-results \
-  uv run pytest -s tests/test_architecture_live.py
+env -u OPENAI_API_KEY THREADWEAVE_LIVE_PARITY=1 \
+  THREADWEAVE_PARITY_OUTPUT=/absolute/path/to/acceptance-results \
+  uv run pytest -s tests/test_python_control_live.py
 ```
 
 Deterministic providers exist only in tests. The opt-in test uses the real provider

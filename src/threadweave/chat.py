@@ -65,6 +65,7 @@ def chat_config(workspace, explicit=None):
                 "process",
                 "agents",
                 "state",
+                "mcp",
             ],
         )
     return config
@@ -471,9 +472,12 @@ async def chat(args):
     if not args.resume_id and not args.continue_recent:
         config = await resolved_config(chat_config(workspace, args.config))
     info = await ensure_daemon(directory)
-    if not {"interactive_chat", "information_hierarchy", "recursive_sessions"} <= set(
-        info.get("capabilities", [])
-    ):
+    if not {
+        "interactive_chat",
+        "information_hierarchy",
+        "recursive_sessions",
+        "python_control_plane_v1",
+    } <= set(info.get("capabilities", [])):
         raise ValueError(
             f"An older daemon owns {directory}. Stop it with threadweave --data {directory} daemon stop, then retry; sessions are preserved."
         )

@@ -8,6 +8,7 @@ from threadweave.models import RunConfig as ProductionConfig
 
 class TestConfig(ProductionConfig):
     __test__ = False
+    control_plane: str = "direct"
     provider: ProviderConfig = Field(
         default_factory=lambda: ProviderConfig(name="mock", model="deterministic")
     )

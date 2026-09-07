@@ -15,6 +15,10 @@ from .storage import encode
 
 
 class Skill(Record):
+    harness_id: str | None = None
+    path: str = "general"
+    reference: dict = Field(default_factory=dict)
+    arguments: dict = Field(default_factory=dict)
     name: str = Field(min_length=1, max_length=100)
     description: str = Field(min_length=1, max_length=2000)
     inputs: dict = Field(

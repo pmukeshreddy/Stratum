@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .models import HarnessError
 from .storage import Store, encode
 
@@ -28,6 +30,42 @@ The Environment exposes capabilities, not a required sequence of actions. Ordina
 needs no repository, test baseline or code change. Never invent observations or measurements.
 """
 
+PYTHON_CONTROL = """You operate a persistent agent session. You decide strategy. Your sole tool is ipython.
+Use the persistent IPython namespace as the programmable control plane. Variables and top-level
+await are supported. Only printed/returned information enters model context. Keep large values in
+variables; access the full original instruction as context['task'], and history/artifacts through
+history.read(), history.search(), history.messages(), artifacts.load(id). Nothing requires coding.
+Preloaded APIs (help()/inspect work):
+- pathlib, Path, os, asyncio, json; workspace is a Path; session and context contain metadata.
+- bash(command) starts immediately and returns a handle; await bash(command) returns exit_code,
+  output, stdout, stderr, duration and artifact IDs. Background handles have pid, running, poll(),
+  output(), tail(), kill(). Use the project's own environment (e.g. uv run pytest) via bash.
+- await rlm(prompt, name=None, model=None, thinking=None) returns a persistent child HANDLE upon
+  admission, never its answer. Children share your workspace, not Python variables. Root continues.
+  await rlm.list_subagents(); await rlm.find_models(); await rlm.delete_subagent(handle).
+- await agent_message.send(text, receiver_role='parent'|'child'|'sibling', receiver_name=...);
+  omit receiver_name for parent; await agent_message.list_agents(); await agent_message.receive().
+- await edit(path, old_str, new_str) replaces one unique match. Path read/write and repo helpers
+  are available. repo.search(query=...), repo.map(), repo.symbols(query=...), git.diff().
+- tools.call(name, **args) / await tools.acall(name, **args) invoke optional capabilities;
+  tools.catalog() returns full schemas into Python, not automatically into your prompt.
+- rlm.harness / harness: create_memory, create_prompt_note, create_skill, create_subagent;
+  get(kind,id), list(kind=None), update(kind,id,title,content), delete(kind,id), rollback(kind,id,version),
+  select(ids). Writes are versioned and attributed to the executing cell. Skills are executable
+  modules or validated code; use skills.list(), skills.load(name), await skills.run(name, **inputs).
+- mcp: await mcp.list_servers(), await mcp.list_tools(server), await mcp.call_tool(server,tool,args),
+  await mcp.reload(server). Only configured/enabled MCP capabilities are permitted.
+- await goal.get(), await goal.create(objective), await goal.complete(); await compact();
+  await refine(); await heartbeat(interval_seconds=..., instruction=...). Create goals only if asked.
+Normal text replies yield/end ordinary interaction; there is no universal finish tool or coding
+verifier. Explicit goals and configured task gates remain binding. Do not claim tests you did not run.
+L1 is selected context; L2 is persistent Python and recursive sessions; L3 is durable history/state.
+Compaction does not delete values or children. Recovery restores codecs and explicit recipes, not
+arbitrary live objects; use remember_recipe(name,code) / forget(*names) and inspect warnings.
+Tools enforce permissions, but Python and local shell are trusted-host code, NOT a sandbox.
+Respect the user's scope. Never change foundational policy through supplemental state.
+"""
+
 
 def token_bound(value) -> int:
     """Conservative UTF-8 byte bound plus framing; provider-reported usage remains authoritative."""
@@ -37,6 +75,31 @@ def token_bound(value) -> int:
 class Context:
     def __init__(self, store: Store):
         self.store = store
+        self._export_cursors = {}
+
+    def history_file(self, sid):
+        """Materialized, readable conversation/event log; SQLite remains authoritative.
+
+        Append only newly committed events between turns. A runtime restart rebuilds
+        this disposable projection, never the original trajectory.
+        """
+        from .artifacts import atomic_write
+
+        directory = self.store.directory / "session_logs" / sid
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / "messages.jsonl"
+        if sid not in self._export_cursors:
+            atomic_write(path, b"")
+            self._export_cursors[sid] = 0
+        rows = self.store.db.execute(
+            "SELECT seq,payload,type,id,timestamp FROM events WHERE session_id=? AND seq>? ORDER BY seq",
+            (sid, self._export_cursors[sid]),
+        )
+        with path.open("a", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(encode({**dict(row), "payload": json.loads(row["payload"])}) + "\n")
+                self._export_cursors[sid] = row["seq"]
+        return path
 
     def supplemental(self, sid: str) -> str:
         session, config = self.store.session(sid), self.store.config(sid)
@@ -67,7 +130,7 @@ class Context:
         cap = min(6000, self.store.config(sid).context.max_tokens // 4)
         task = session.instruction[:cap]
         if len(session.instruction) > cap:
-            task += "\n[Task excerpt. Retrieve the full instruction with session_inspect.]"
+            task += "\n[Task excerpt. Full instruction: context['task'] in Python; or session_inspect in direct mode.]"
         metadata = {
             "id": sid,
             "root_id": session.root_id,
@@ -80,14 +143,21 @@ class Context:
             "features": self.store.config(sid).features.model_dump(),
             "execution_backend": self.store.config(sid).execution.backend,
         }
+        if self.store.config(sid).control_plane == "python":
+            metadata["conversation_log"] = str(self.history_file(sid))
         # A long goal is still available in L3, and must not defeat context bounds.
         if metadata["goal"]:
             metadata["goal"]["objective"] = metadata["goal"]["objective"][:cap]
         messages = [
-            {"role": "system", "content": FOUNDATION},
+            {
+                "role": "system",
+                "content": PYTHON_CONTROL
+                if self.store.config(sid).control_plane == "python"
+                else FOUNDATION,
+            },
             {"role": "user", "content": "Session: " + encode(metadata) + "\nTask: " + task},
         ]
-        if session.mode == "interactive":
+        if session.mode == "interactive" and self.store.config(sid).control_plane == "direct":
             messages.insert(
                 1,
                 {
@@ -104,6 +174,32 @@ class Context:
                 },
             )
         supplemental = self.supplemental(sid)
+        if self.store.config(sid).control_plane == "python":
+            # Bounded state/skill menus mirror available capabilities, not a ranking
+            # of coding evidence. Full procedures/content stay outside L1.
+            from pathlib import Path
+
+            from .skills import discover
+
+            config = self.store.config(sid)
+            menu = {
+                "state": [
+                    {k: e[k] for k in ("id", "kind", "title", "version")}
+                    for e in self.store.states(sid)[:20]
+                ],
+                "skills": [
+                    {k: e[k] for k in ("name", "path", "description", "import_name") if k in e}
+                    for e in discover(Path(session.workspace.path), config.skill_paths)[:20]
+                ],
+            }
+            if menu["state"] or menu["skills"]:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Available supplemental state/skills (inspect from Python): "
+                        + encode(menu)[: config.context.supplemental_chars],
+                    }
+                )
         if supplemental:
             messages.append(
                 {"role": "user", "content": "Selected supplemental state:\n" + supplemental}
@@ -120,7 +216,11 @@ class Context:
             messages.extend(block["messages"])
         from .retrieval import coding_focus
 
-        focus = coding_focus(self.store, sid)
+        focus = (
+            coding_focus(self.store, sid)
+            if self.store.config(sid).control_plane == "direct"
+            else None
+        )
         if focus:
             messages.append({"role": "user", "content": "Current coding evidence: " + focus})
         return messages

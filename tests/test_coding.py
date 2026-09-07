@@ -445,6 +445,8 @@ def test_migration_preserves_v1_history(tmp_path):
     connection.executescript(SCHEMA + "PRAGMA user_version=1;")
     connection.close()
     store = Store(directory)
-    assert store.db.execute("PRAGMA user_version").fetchone()[0] == 2
+    from threadweave.migrations import VERSION
+
+    assert store.db.execute("PRAGMA user_version").fetchone()[0] == VERSION
     assert store.db.execute("SELECT name FROM sqlite_master WHERE name='history_fts'").fetchone()
     store.close()

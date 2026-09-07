@@ -12,6 +12,14 @@ from threadweave.runtime import Runtime
 pytest_plugins = ["tests.coding_fixtures"]
 
 
+@pytest.fixture
+def python_config(config):
+    config.control_plane = "python"
+    config.permissions += ["process", "mcp"]
+    config.features.model_compaction = False
+    return config
+
+
 def response(tool_name: str, /, **arguments):
     return ModelResponse(
         actions=[Action(name=tool_name, arguments=arguments)],
@@ -31,6 +39,7 @@ async def eventually(predicate, seconds=10):
 @pytest.fixture
 def config():
     return RunConfig(
+        control_plane="direct",
         provider={"name": "mock", "model": "deterministic", "max_output_tokens": 128},
         retry={"initial_delay": 0, "max_delay": 0},
         limits={"max_turns": 50, "wall_seconds": 30},

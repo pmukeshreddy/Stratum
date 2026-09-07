@@ -36,6 +36,7 @@ def repository(tmp_path):
 @pytest.fixture
 def coding_config():
     return RunConfig(
+        control_plane="direct",
         provider={"name": "test", "model": "test-only", "max_output_tokens": 256},
         task={
             "adapter": "coding",

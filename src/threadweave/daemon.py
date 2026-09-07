@@ -117,8 +117,13 @@ class Daemon:
             return {
                 "pid": os.getpid(),
                 "data": str(self.directory),
-                "schema_version": 2,
-                "capabilities": ["interactive_chat", "information_hierarchy", "recursive_sessions"],
+                "schema_version": 4,
+                "capabilities": [
+                    "interactive_chat",
+                    "information_hierarchy",
+                    "recursive_sessions",
+                    "python_control_plane_v1",
+                ],
             }
         if method == "create":
             config = RunConfig.model_validate(args.pop("config", {}))

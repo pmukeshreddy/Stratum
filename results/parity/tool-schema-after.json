@@ -1,0 +1,24 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "ipython",
+      "description": "Execute code in the persistent IPython kernel. Use bash for project commands; rlm, agent_message, mcp, skills and rlm.harness are preloaded. Only printed/returned values enter model context.",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "maxLength": 200000,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "PythonArgs",
+        "type": "object"
+      }
+    }
+  }
+]

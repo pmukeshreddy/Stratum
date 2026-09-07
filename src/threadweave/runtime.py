@@ -39,6 +39,7 @@ from .models import (
 from .providers import default_providers
 from .refinement import MemoryServices
 from .routing import route
+from .skills import discover
 from .storage import Store, encode
 from .tools import ToolContext, builtins
 
@@ -47,6 +48,12 @@ log = logging.getLogger("threadweave.runtime")
 
 class LimitReached(Exception):
     pass
+
+
+class GoalLimitReached(LimitReached):
+    def __init__(self, sid):
+        self.session_id = sid
+        super().__init__("Persistent goal token budget exhausted")
 
 
 class BudgetBusy(Exception):
@@ -164,7 +171,16 @@ class Runtime(MemoryServices):
         self._wake.set()
         return session
 
-    def spawn(self, parent_id: str, instruction: str, *, name=None, role="agent"):
+    def spawn(
+        self,
+        parent_id: str,
+        instruction: str,
+        *,
+        name=None,
+        role="agent",
+        isolate=None,
+        provider=None,
+    ):
         parent = self.store.session(parent_id)
         if parent.outcome != Outcome.ACTIVE:
             raise ValueError("Cannot spawn from a terminated session")
@@ -182,6 +198,13 @@ class Runtime(MemoryServices):
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
+        if provider is not None:
+            config.provider = provider
+            config.routing.default = None
+        if isolate is None:
+            isolate = config.control_plane == "direct"
+        if not isolate:
+            config.task.adapter = "workspace"
         workspace, checkpoint = self.environment.continuation_workspace(parent, config, child=True)
         config.refinement.selected_entries = [
             eid
@@ -194,7 +217,7 @@ class Runtime(MemoryServices):
             config,
             parent_id=parent_id,
             name=name or f"child-{usage.subagent_count + 1}",
-            mode="goal",
+            mode="autonomous" if config.control_plane == "python" else "goal",
         )
         if checkpoint:
             self.store.db.execute(
@@ -465,6 +488,23 @@ class Runtime(MemoryServices):
         limits = config.limits
         if root.outcome == Outcome.LIMITED:
             raise LimitReached("Root resource limit already reached")
+        ancestor = session
+        while ancestor:
+            goal = self.store.goal(ancestor.id)
+            if goal and goal["status"] == "active" and goal.get("token_budget"):
+                bound = (
+                    input_bound + (provider or self.store.config(sid).provider).max_output_tokens
+                    if resource == "model_calls"
+                    else 0
+                )
+                if goal["tokens_used"] + goal["tokens_reserved"] + bound >= goal["token_budget"]:
+                    if (
+                        goal["tokens_reserved"]
+                        and goal["tokens_used"] + bound < goal["token_budget"]
+                    ):
+                        raise BudgetBusy()
+                    raise GoalLimitReached(ancestor.id)
+            ancestor = self.store.session(ancestor.parent_id) if ancestor.parent_id else None
         if self._elapsed(root.id) >= limits.wall_seconds:
             raise LimitReached("Root wall-clock budget exhausted")
         reserved_tokens, reserved_cost = self.store.reserved(root.id)
@@ -566,7 +606,7 @@ class Runtime(MemoryServices):
             for row in rows:
                 raw = (
                     self._kernel(session.id).receipt(row["id"])
-                    if row["name"] in ("python", "skill_run")
+                    if row["name"] in ("python", "ipython", "skill_run")
                     else None
                 )
                 if raw is not None:
@@ -697,7 +737,11 @@ class Runtime(MemoryServices):
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 response, response_event = await self._invoke(sid)
-                if not response.actions and self.store.session(sid).mode in {"autonomous", "goal"}:
+                if (
+                    not response.actions
+                    and config.control_plane == "direct"
+                    and self.store.session(sid).mode in {"autonomous", "goal"}
+                ):
                     from .guardrails import observe
 
                     if observe(self, sid, "model_no_actions", {}):
@@ -746,6 +790,16 @@ class Runtime(MemoryServices):
                     pending["context_committed"] = True
                     self.store.update(sid, pending_turn=pending)
             completion = pending.get("completion")
+            # Ordinary assistant text ends a request; explicit persistent goals still
+            # require goal.complete(). Task-specific verifiers remain optional gates.
+            if (
+                completion is None
+                and not response.actions
+                and response.text
+                and config.control_plane == "python"
+                and self.store.session(sid).mode not in {"goal", "interactive", "heartbeat"}
+            ):
+                completion = response.text
             if completion is not None:
                 self.store.event(
                     sid, "completion_attempt", {"result": completion}, parent=response_event
@@ -808,7 +862,13 @@ class Runtime(MemoryServices):
                         self.message(
                             sid,
                             self.store.session(sid).parent_id,
-                            "Child completed: " + (completion or "Task verifier passed"),
+                            (
+                                "Child session completed: "
+                                + sid
+                                + ". Results require an explicit message or artifact."
+                                if config.control_plane == "python"
+                                else "Child completed: " + (completion or "Task verifier passed")
+                            ),
                         )
                 current = self.store.session(sid)
                 self.store.update(sid, pending_turn=None, turns=current.turns + 1)
@@ -824,6 +884,15 @@ class Runtime(MemoryServices):
                 if current.mode == "heartbeat" and current.outcome == Outcome.ACTIVE:
                     pending_input = bool(self.store.messages(sid, pending=True, limit=1))
                     self.store.update(sid, runnable=pending_input and not current.paused)
+        except GoalLimitReached as exc:
+            current = asyncio.current_task()
+            for target in [exc.session_id, *self._active_descendants(exc.session_id)]:
+                self.store.finish(target, Outcome.LIMITED, str(exc))
+                task = self.tasks.get(target)
+                if task and task is not current:
+                    task.cancel()
+                if hasattr(self, "background"):
+                    await self.background.close_session(target)
         except LimitReached as exc:
             self._limit_tree(self.store.session(sid).root_id, str(exc))
         except asyncio.CancelledError:
@@ -1128,10 +1197,16 @@ class Runtime(MemoryServices):
         context = ToolContext(self, sid, action_id, eid, from_python)
         external_checkpoint = None
         try:
+            if not from_python and config.control_plane == "python" and action.name != "ipython":
+                raise HarnessError(
+                    "model",
+                    "tool_not_exposed",
+                    "Only ipython is exposed; call capabilities from Python",
+                )
             external_checkpoint = await self.environment.before_action(context, action.name)
             timeout = (
                 config.limits.python_timeout_seconds + 25
-                if action.name in ("python", "skill_run")
+                if action.name in ("python", "ipython", "skill_run")
                 else config.limits.tool_timeout_seconds
             )
             async with asyncio.timeout(timeout):
@@ -1211,11 +1286,30 @@ class Runtime(MemoryServices):
                 Path(session.workspace.path),
                 bridge,
                 env=environment(self.store.config(sid).execution),
+                bootstrap={
+                    "session_id": sid,
+                    "root_id": session.root_id,
+                    "parent_id": session.parent_id,
+                    "name": session.name,
+                    "task": session.instruction,
+                    "messages_path": str(self.context.history_file(sid)),
+                    "control_plane": self.store.config(sid).control_plane,
+                    "skills": [
+                        e
+                        for e in discover(
+                            Path(session.workspace.path), self.store.config(sid).skill_paths
+                        )
+                        if set(e.get("required_permissions", []))
+                        <= set(self.store.config(sid).permissions)
+                    ],
+                },
             )
         return self.kernels[sid]
 
     async def execute_python(self, context, code):
         sid = context.session_id
+        if self.store.config(sid).control_plane == "python":
+            self.context.history_file(sid)
         if not self.store.config(sid).features.persistent_repl:
             await self._close_kernel(sid)
             checkpoint = (
@@ -1356,6 +1450,10 @@ class Runtime(MemoryServices):
             *(self.tasks[target] for target in ids if target in self.tasks), return_exceptions=True
         )
         for target in ids:
+            if hasattr(self, "background"):
+                await self.background.close_session(target)
+            if hasattr(self, "mcp"):
+                await self.mcp.close_session(target)
             await self.unload(target)
 
     async def _close_kernel(self, sid):
@@ -1484,6 +1582,9 @@ class Runtime(MemoryServices):
         await asyncio.gather(*tasks, return_exceptions=True)
         for sid in list(self.kernels):
             await self._close_kernel(sid)
+        for service in ("background", "mcp"):
+            if hasattr(self, service):
+                await getattr(self, service).close()
         for session in self.store.sessions():
             if session.lifecycle != Lifecycle.INACTIVE:
                 self.store.transition(session.id, Lifecycle.INACTIVE)

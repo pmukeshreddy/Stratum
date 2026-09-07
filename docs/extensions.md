@@ -58,6 +58,9 @@ configured Executor/run_command for processes. Respect cancellation and use
 context.action_id as an external idempotency key where available. The harness cannot
 undo arbitrary external effects. Tool metadata controls permissions and feature
 availability; a tool does not require selecting a coding task adapter.
+In default Python-control mode, newly registered tools are programmatic only:
+`tools.call('inspect_size', path='file.py')`. The model schema remains ipython.
+Do not add direct model tools to implement an Environment capability.
 
 ## Task/environment
 
@@ -84,6 +87,10 @@ properties/required/additionalProperties, items, enum, minimum/maximum and strin
 minLength/maxLength. Unsupported schema keywords fail instead of being ignored.
 
 Code executes in the trusted worker with skill_inputs and normal output capture.
+Use `await skills.run(name, **inputs)` inside an active cell: preparation validates
+in the daemon, execution stays in the existing kernel and outcomes return through
+the bridge. It does not recursively reenter a busy worker. SKILL.md Python package
+discovery and MCP setup are described in [Python APIs](python-control-plane.md).
 Versions record provenance and validation status; skill_inspect includes outcome
 counts and quarantine state. Repeatedly failing versions require a validated
 update/rollback. Syntax and permission declarations do not prove safety or constrain

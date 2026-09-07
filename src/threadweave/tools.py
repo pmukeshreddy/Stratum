@@ -87,7 +87,12 @@ class ToolRegistry:
             tool
             and set(tool.permissions) <= set(config.permissions)
             and (not config.execution.read_only or "workspace.write" not in tool.permissions)
-            and (config.tool_allowlist is None or name in config.tool_allowlist)
+            and (
+                config.tool_allowlist is None
+                or name in config.tool_allowlist
+                or name == "ipython"
+                and "python" in config.tool_allowlist
+            )
             and (not tool.feature or getattr(config.features, tool.feature))
             and (
                 name != "run_profile"
@@ -103,7 +108,12 @@ class ToolRegistry:
         )
 
     def schemas(self, config):
-        return [tool.schema() for name, tool in self.entries.items() if self.allowed(name, config)]
+        return [
+            tool.schema()
+            for name, tool in self.entries.items()
+            if self.allowed(name, config)
+            and (name == "ipython" if config.control_plane == "python" else name != "ipython")
+        ]
 
     async def call(self, context: ToolContext, name: str, arguments: dict):
         config = context.runtime.store.config(context.session_id)
@@ -172,6 +182,7 @@ class SpawnArgs(Record):
     name: str | None = Field(default=None, max_length=100)
     spec_id: str | None = None
     role: str = Field(default="agent", max_length=100)
+    isolate: bool | None = None
 
 
 class MessageArgs(Record):
@@ -194,7 +205,7 @@ class FinishArgs(Record):
 class HistoryArgs(Record):
     event_id: str | None = None
     session_id: str | None = None
-    after: int = Field(default=0, ge=0)
+    after: int = Field(default=0, ge=-1)
     limit: int = Field(default=20, ge=1, le=100)
     kind: str | None = None
 
@@ -292,7 +303,9 @@ def builtins() -> ToolRegistry:
             instruction = entry["content"]["instruction"] + "\n" + instruction
         if not instruction.strip():
             raise ValueError("An instruction or subagent specification is required")
-        session = c.runtime.spawn(c.session_id, instruction, name=a.name, role=a.role)
+        session = c.runtime.spawn(
+            c.session_id, instruction, name=a.name, role=a.role, isolate=a.isolate
+        )
         return {"session_id": session.id, "name": session.name, "parent_id": session.parent_id}
 
     async def message(c, a):
@@ -377,6 +390,14 @@ def builtins() -> ToolRegistry:
     add(
         "python",
         "Execute Python in this session's persistent worker; last value is retained as _.",
+        PythonArgs,
+        python,
+        ("python",),
+        False,
+    )
+    add(
+        "ipython",
+        "Execute code in the persistent IPython kernel. Use bash for project commands; rlm, agent_message, mcp, skills and rlm.harness are preloaded. Only printed/returned values enter model context.",
         PythonArgs,
         python,
         ("python",),
@@ -523,6 +544,9 @@ def builtins() -> ToolRegistry:
     from .coding_tools import register
 
     register(registry)
+    from .host_api import register as register_programmatic
+
+    register_programmatic(registry)
     add("history_get", "Retrieve a durable event by ID.", HistoryArgs, history)
     add(
         "skill_inspect",

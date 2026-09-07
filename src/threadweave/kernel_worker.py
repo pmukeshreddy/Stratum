@@ -15,6 +15,7 @@ import importlib
 import inspect
 import json
 import os
+import queue
 import reprlib
 import signal
 import sys
@@ -22,12 +23,20 @@ import threading
 import time
 import traceback
 import types
+import uuid
 from pathlib import Path
 
 from .artifacts import atomic_write
 
 
 def pack(value, seen=None):
+    from .kernel_api import Record, snapshot_handle
+
+    handle = snapshot_handle(value)
+    if handle:
+        return handle
+    if isinstance(value, Record):
+        return ["record", pack(dict(value), seen)]
     seen = set() if seen is None else seen
     if value is None or type(value) in (str, int, float, bool):
         return ["scalar", value]
@@ -48,15 +57,29 @@ def pack(value, seen=None):
     raise TypeError(f"{type(value).__module__}.{type(value).__name__} requires a recovery recipe")
 
 
-def unpack(record):
+def unpack(record, host=None):
     kind, value = record
+    if kind == "agent_handle":
+        from .kernel_api import AgentHandle
+
+        return AgentHandle(**value)
+    if kind == "bash_handle":
+        from .kernel_api import BashHandle
+
+        if host is None:
+            raise ValueError("Process handle requires the owning session bridge")
+        return BashHandle(host, value)
     if kind == "scalar":
         return value
+    if kind == "record":
+        from .kernel_api import Record
+
+        return Record(unpack(value, host))
     if kind == "dict":
-        return {unpack(k): unpack(v) for k, v in value}
+        return {unpack(k, host): unpack(v, host) for k, v in value}
     if kind in ("list", "tuple", "set", "frozenset"):
         return {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}[kind](
-            unpack(v) for v in value
+            unpack(v, host) for v in value
         )
     if kind == "bytes":
         return base64.b64decode(value)
@@ -79,7 +102,10 @@ class Bridge:
         return answer["result"]
 
     async def acall(self, tool_name: str, /, **arguments):
-        return self.call(tool_name, **arguments)
+        return await asyncio.to_thread(self.call, tool_name, **arguments)
+
+    def catalog(self):
+        return self.call("host_request", operation="catalog", payload={})
 
 
 class Worker:
@@ -91,25 +117,84 @@ class Worker:
         fcntl.flock(self.ownership, fcntl.LOCK_EX)
         self.checkpoint = directory / "checkpoint.json"
         self.protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
+        # Protocol has its own descriptor. Imports and asynchronous work may print
+        # outside a cell; retain those bytes without corrupting the RPC channel.
+        self.console = (directory / "background.log").open("a")
+        (directory / "background.log").chmod(0o600)
+        os.dup2(self.console.fileno(), 1)
+        os.dup2(self.console.fileno(), 2)
         self.input = sys.stdin
         self.recipes = {}
+        self.pending_replies, self.requests = {}, queue.Queue()
+        self.write_lock = threading.Lock()
+        from IPython.core.interactiveshell import InteractiveShell
+
+        self.shell = InteractiveShell()
         self.values = {
             "__name__": "__session__",
-            "tools": Bridge(self.emit, self.receive),
+            "tools": self.make_bridge(),
             "workspace": workspace,
             "remember_recipe": self.remember_recipe,
             "forget": self.forget,
             "rlm": self.rlm,
         }
+        metadata_path = directory / "bootstrap.json"
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
+        metadata["console_log"] = str(directory / "background.log")
+        os.chdir(workspace)
+        sys.path.insert(0, str(workspace))
+        from .kernel_api import bootstrap
+
+        self.host = bootstrap(self.values["tools"], self.values, metadata)
+        if metadata.get("control_plane", "direct") == "direct":
+            self.values["rlm"] = self.rlm
+        self.values["get_ipython"] = lambda: self.shell
+        self.shell.user_ns = self.values
         self.protected = set(self.values)
         self.receipt = None
-        os.chdir(workspace)
-        # -m initializes sys.path from the daemon's cwd, not this session's repository.
-        sys.path.insert(0, str(workspace))
 
     def emit(self, value):
-        self.protocol.write(json.dumps(value, ensure_ascii=True, allow_nan=False) + "\n")
-        self.protocol.flush()
+        with self.write_lock:
+            self.protocol.write(json.dumps(value, ensure_ascii=True, allow_nan=False) + "\n")
+            self.protocol.flush()
+
+    def make_bridge(self):
+        worker = self
+
+        class MultiplexBridge(Bridge):
+            def call(self, tool_name, /, **arguments):
+                identifier, replies = uuid.uuid4().hex, queue.Queue()
+                worker.pending_replies[identifier] = replies
+                try:
+                    worker.emit(
+                        {
+                            "type": "tool_request",
+                            "id": identifier,
+                            "name": tool_name,
+                            "arguments": arguments,
+                        }
+                    )
+                    answer = replies.get()
+                    if answer.get("error"):
+                        raise RuntimeError(answer["error"])
+                    return answer["result"]
+                finally:
+                    worker.pending_replies.pop(identifier, None)
+
+        return MultiplexBridge(self.emit, self.receive)
+
+    def read_packets(self):
+        try:
+            while True:
+                packet = self.receive()
+                if packet.get("type") in {"execute", "shutdown"}:
+                    self.requests.put(packet)
+                elif packet.get("id") in self.pending_replies:
+                    self.pending_replies[packet["id"]].put(packet)
+        except (EOFError, ValueError):
+            for replies in list(self.pending_replies.values()):
+                replies.put({"error": "Runtime disconnected"})
+            self.requests.put({"type": "shutdown"})
 
     def receive(self):
         line = self.input.readline()
@@ -146,7 +231,7 @@ class Worker:
             missing.update(data.get("missing", {}))
             for name, value in data["values"].items():
                 try:
-                    self.values[name] = unpack(value)
+                    self.values[name] = unpack(value, self.host)
                     restored.append(name)
                 except Exception as exc:
                     missing[name] = str(exc)
@@ -199,6 +284,7 @@ class Worker:
         return missing
 
     async def evaluate(self, code):
+        code = self.shell.transform_cell(code)
         tree = ast.parse(code, mode="exec")
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         compiled = compile(tree, "<session>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -216,7 +302,7 @@ class Worker:
             self.values["_"] = outcome
             return outcome
 
-    def execute(self, request):
+    async def execute(self, request):
         execution_id = request["id"]
         if self.receipt and self.receipt["id"] == execution_id:
             return self.receipt["result"]
@@ -236,7 +322,7 @@ class Worker:
                 os.dup2(out.fileno(), 1)
                 os.dup2(err.fileno(), 2)
                 try:
-                    value = asyncio.run(self.evaluate(request["code"]))
+                    value = await self.evaluate(request["code"])
                     result["value"] = reprlib.repr(value)
                 except BaseException as exc:
                     result["error"] = {
@@ -262,7 +348,8 @@ class Worker:
         result["not_checkpointed"] = self.snapshot(self.receipt)
         return result
 
-    def run(self):
+    async def run(self):
+        threading.Thread(target=self.read_packets, daemon=True).start()
         try:
             saved_out, saved_err = os.dup(1), os.dup(2)
             try:
@@ -282,14 +369,13 @@ class Worker:
             self.emit({"type": "fatal", "error": str(exc)})
             return
         while True:
-            try:
-                request = self.receive()
-            except EOFError:
-                return
+            request = await asyncio.to_thread(self.requests.get)
             if request["type"] == "shutdown":
                 return
             if request["type"] == "execute":
-                self.emit({"type": "result", "result": self.execute(request)})
+                self.emit(
+                    {"type": "result", "id": request["id"], "result": await self.execute(request)}
+                )
 
 
 def main():
@@ -302,7 +388,7 @@ def main():
                 os.killpg(os.getpgrp(), signal.SIGKILL)
 
     threading.Thread(target=watch_owner, daemon=True).start()
-    Worker(Path(sys.argv[1]), Path(sys.argv[2])).run()
+    asyncio.run(Worker(Path(sys.argv[1]), Path(sys.argv[2])).run())
 
 
 if __name__ == "__main__":

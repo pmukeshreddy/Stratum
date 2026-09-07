@@ -333,6 +333,13 @@ class Store:
             rows.reverse()
         return [self._event_row(r) for r in rows]
 
+    def iter_events(self, sid: str, *, tree=False, kind=None, after=-1):
+        """Forward pagination over the complete trajectory, unlike bounded tail inspection."""
+        cursor = after
+        while page := self.events(sid, tree=tree, kind=kind, after=cursor, limit=500):
+            yield from page
+            cursor = page[-1]["seq"]
+
     def history_roots(self, sid: str) -> set[str]:
         """Readable tree ancestry, including children admitted under a forked root."""
         roots, visited, pending = set(), set(), [self.session(sid)]
@@ -611,7 +618,38 @@ class Store:
 
     def goal(self, sid: str) -> dict | None:
         row = self.db.execute("SELECT * FROM goals WHERE session_id=?", (sid,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        result = dict(row)
+        budget = self.db.execute("SELECT * FROM goal_budgets WHERE session_id=?", (sid,)).fetchone()
+        if budget:
+            used, reserved = self.subtree_tokens(sid)
+            result.update(
+                token_budget=budget["token_budget"],
+                tokens_used=max(0, used - budget["starting_tokens"]),
+                tokens_reserved=reserved,
+            )
+        return result
+
+    def subtree_tokens(self, sid):
+        ids = [
+            r[0]
+            for r in self.db.execute(
+                "WITH RECURSIVE descendants(id) AS (SELECT ? UNION ALL "
+                "SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id) "
+                "SELECT id FROM descendants",
+                (sid,),
+            )
+        ]
+        used = sum(self.usage(id).input_tokens + self.usage(id).output_tokens for id in ids)
+        reserved = sum(
+            self.db.execute(
+                "SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM reservations WHERE session_id=?",
+                (id,),
+            ).fetchone()[0]
+            for id in ids
+        )
+        return used, reserved
 
     def finish(self, sid: str, outcome: Outcome, result: str | None = None):
         with self.transaction():

@@ -178,8 +178,10 @@ def tool_summary(name, args):
         return ", ".join(paths)[:240] or "validated patch"
     fields = ("pattern", "query", "path", "symbol", "targets", "command", "name", "instruction")
     parts = [f"{k}: {args[k]}" for k in fields if k in args]
-    if name == "python":
+    if name in {"python", "ipython"}:
         parts = [args.get("code", "").split("\n")[0]]
+    if name == "host_request":
+        parts = [str(args.get("operation", "")), str(args.get("payload", ""))[:220]]
     return safe_text(" · ".join(parts))[:320]
 
 
