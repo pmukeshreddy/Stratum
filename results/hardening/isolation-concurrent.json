@@ -1,0 +1,68 @@
+{
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.12.12",
+    "cpu_logical": 10,
+    "cpu_physical": 10,
+    "memory_bytes": 17179869184,
+    "versions": {
+      "git": "git version 2.48.1\n",
+      "clang": "Apple clang version 17.0.0 (clang-1700.6.3.2)\nTarget: arm64-apple-darwin25.3.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+      "gcc": "Apple clang version 17.0.0 (clang-1700.6.3.2)\nTarget: arm64-apple-darwin25.3.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin\n",
+      "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\n",
+      "node": "v24.11.0\n"
+    },
+    "environment": {}
+  },
+  "rows": [
+    {
+      "files": 101,
+      "concurrent_backend_requests": 1,
+      "checkpoint_ms": 74.92383295902982,
+      "spawn_ms": 25.495167006738484,
+      "diff_ms": 8.109332993626595,
+      "diff_bytes": 127,
+      "cleanup_ms": 10.572750004939735,
+      "checkout_bytes": 351259,
+      "source_bytes": 351100,
+      "git_objects": "shared"
+    },
+    {
+      "files": 101,
+      "concurrent_backend_requests": 4,
+      "checkpoint_ms": 66.85445795301348,
+      "spawn_ms": 37.345666030887514,
+      "diff_ms": 8.709333022125065,
+      "diff_bytes": 127,
+      "cleanup_ms": 41.35816695634276,
+      "checkout_bytes": 1405036,
+      "source_bytes": 351100,
+      "git_objects": "shared"
+    },
+    {
+      "files": 10001,
+      "concurrent_backend_requests": 1,
+      "checkpoint_ms": 775.053083023522,
+      "spawn_ms": 1102.4282919825055,
+      "diff_ms": 166.45949997473508,
+      "diff_bytes": 127,
+      "cleanup_ms": 408.3946669707075,
+      "checkout_bytes": 35129061,
+      "source_bytes": 35128900,
+      "git_objects": "shared"
+    },
+    {
+      "files": 10001,
+      "concurrent_backend_requests": 4,
+      "checkpoint_ms": 346.47975000552833,
+      "spawn_ms": 1259.09537501866,
+      "diff_ms": 152.09979197243229,
+      "diff_bytes": 127,
+      "cleanup_ms": 2216.8864580453373,
+      "checkout_bytes": 140516244,
+      "source_bytes": 35128900,
+      "git_objects": "shared"
+    }
+  ]
+}

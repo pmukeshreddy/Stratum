@@ -117,7 +117,7 @@ class Daemon:
             return {
                 "pid": os.getpid(),
                 "data": str(self.directory),
-                "schema_version": 5,
+                "schema_version": 8,
                 "capabilities": [
                     "interactive_chat",
                     "information_hierarchy",

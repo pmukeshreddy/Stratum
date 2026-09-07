@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 from .artifacts import atomic_write
@@ -14,22 +15,24 @@ from .repository import confined, digest
 from .storage import encode
 
 
-def git(root, *arguments):
+def git(root, *arguments, errors="replace", extra_env=None, input=None, binary=False):
     result = subprocess.run(
         ["git", "-c", "core.hooksPath=/dev/null", "--no-pager", *arguments],
         cwd=root,
         capture_output=True,
         timeout=30,
         check=False,
+        input=input,
         env={
             **{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
+            **(extra_env or {}),
         },
     )
     if result.returncode:
         raise ValueError("Git failed: " + result.stderr.decode(errors="replace")[:2000])
-    return result.stdout.decode(errors="replace")
+    return result.stdout if binary else result.stdout.decode(errors=errors)
 
 
 def revision(value):
@@ -102,6 +105,65 @@ class GitWorkspace:
         )
         return cid
 
+    def snapshot_tree(self, label="candidate-source"):
+        """Capture dirty inputs with a temporary index; never stage/commit user's index/HEAD.
+
+        Git objects are shared. The unreachable commit is retained by its worktree
+        and a harness-owned ref until explicit workspace cleanup.
+        """
+        with tempfile.TemporaryDirectory(prefix="threadweave-index-") as directory:
+            env = {"GIT_INDEX_FILE": str(Path(directory) / "index")}
+            head = self.status()["head"]
+            git(self.root, "read-tree", head, extra_env=env)
+            git(self.root, "add", "--all", "--", ".", extra_env=env)
+            tree = git(self.root, "write-tree", extra_env=env).strip()
+            env.update(
+                GIT_AUTHOR_NAME="Threadweave",
+                GIT_AUTHOR_EMAIL="local@localhost",
+                GIT_COMMITTER_NAME="Threadweave",
+                GIT_COMMITTER_EMAIL="local@localhost",
+            )
+            commit = git(
+                self.root,
+                "commit-tree",
+                tree,
+                "-p",
+                head,
+                input=b"Captured candidate input\n",
+                extra_env=env,
+            ).strip()
+        manifest = {}
+        for entry in git(self.root, "ls-tree", "-rz", commit).split("\0"):
+            if not entry:
+                continue
+            header, path = entry.split("\t", 1)
+            mode, kind, oid = header.split()
+            if kind != "blob":
+                raise ValueError("Candidate submodules require explicit environment preparation")
+            if mode == "120000":
+                manifest[path] = {"symlink": git(self.root, "cat-file", "blob", oid)}
+            else:
+                manifest[path] = {"git_blob": oid, "mode": int(mode, 8) & 0o777}
+        cid = new_id()
+        git(self.root, "update-ref", "refs/threadweave/checkpoints/" + cid, commit)
+        self.store.db.execute(
+            "INSERT INTO checkpoints VALUES(?,?,?,?,?,?)",
+            (cid, self.context.session_id, now(), label, encode(manifest), commit),
+        )
+        self.store.event(
+            self.context.session_id,
+            "git_checkpoint",
+            {
+                "checkpoint_id": cid,
+                "label": label,
+                "head": head,
+                "captured_commit": commit,
+                "backend": "git_object_database",
+            },
+            parent=self.context.source_event,
+        )
+        return cid
+
     def observe_effects(self, checkpoint_id, action_id, *, recovered=False):
         before = self.checkpoint(checkpoint_id)["manifest"]
         after_id = self.snapshot("after-external-action")
@@ -142,6 +204,8 @@ class GitWorkspace:
         return {**dict(row), "manifest": json.loads(row["manifest"])}
 
     def content(self, entry):
+        if "git_blob" in entry:
+            return git(self.root, "cat-file", "blob", entry["git_blob"], binary=True)
         meta = self.artifacts.metadata(self.context.session_id, entry["artifact"])
         raw = (self.store.directory / meta["path"]).read_bytes()
         if digest(raw) != entry["hash"]:
@@ -207,6 +271,23 @@ class GitWorkspace:
         """Copy a captured working state into a private repository (including uncommitted inputs)."""
         checkpoint = self.checkpoint(checkpoint_id)
         destination = self.store.directory / "workspaces" / new_id()
+        if all("git_blob" in e or "symlink" in e for e in checkpoint["manifest"].values()):
+            for relative, entry in checkpoint["manifest"].items():
+                if "symlink" in entry and not (destination / relative).parent.joinpath(
+                    entry["symlink"]
+                ).resolve().is_relative_to(destination):
+                    raise PermissionError(f"Candidate contains an escaping symlink: {relative}")
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            git(
+                self.root,
+                "worktree",
+                "add",
+                "--detach",
+                "--quiet",
+                str(destination),
+                checkpoint["head"],
+            )
+            return destination
         destination.mkdir(parents=True, mode=0o700)
         for relative, entry in checkpoint["manifest"].items():
             path = confined(destination, relative)
@@ -235,6 +316,13 @@ class GitWorkspace:
             "Captured candidate input",
         )
         return destination
+
+    def cleanup_isolation(self, path):
+        path = Path(path).resolve()
+        owned = (self.store.directory / "workspaces").resolve()
+        if path.parent != owned or path == self.root.resolve():
+            raise PermissionError("Cleanup requires an exact harness-owned child workspace")
+        git(self.root, "worktree", "remove", "--force", str(path))
 
 
 def candidate_result(context, child_id, *, accept=False):

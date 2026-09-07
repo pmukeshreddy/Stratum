@@ -213,13 +213,18 @@ class MemoryServices:
 
     def index(self, sid):
         config = self.store.config(sid)
-        return RepositoryIndex(
-            self.store,
-            self.store.session(sid).workspace.path,
-            enhanced=config.features.enhanced_code_index,
-            allowed=config.task.allowed_paths,
-            forbidden=config.task.forbidden_paths,
-        )
+        if not hasattr(self, "_repository_indexes"):
+            self._repository_indexes = {}
+        key = (sid, self.store.session(sid).workspace.path)
+        if key not in self._repository_indexes:
+            self._repository_indexes[key] = RepositoryIndex(
+                self.store,
+                self.store.session(sid).workspace.path,
+                enhanced=config.features.enhanced_code_index,
+                allowed=config.task.allowed_paths,
+                forbidden=config.task.forbidden_paths,
+            )
+        return self._repository_indexes[key]
 
     async def auxiliary(self, sid, role, instruction, evidence):
         session, config = self.store.session(sid), self.store.config(sid)
@@ -238,7 +243,7 @@ class MemoryServices:
             messages=messages,
             tools=[],
             config=provider,
-            input_token_bound=token_bound(messages),
+            input_token_bound=token_bound(messages, provider.model),
             metadata={"purpose": role},
         )
         return await self._model_call(sid, request, persist_turn=False)
@@ -249,7 +254,9 @@ class MemoryServices:
             return
         schemas = self.tools.schemas(config)
         if (
-            token_bound({"messages": self.context.messages(sid), "tools": schemas})
+            token_bound(
+                {"messages": self.context.messages(sid), "tools": schemas}, config.provider.model
+            )
             < (config.context.max_tokens - config.provider.max_output_tokens)
             * config.context.compact_at
         ):

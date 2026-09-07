@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -114,7 +115,7 @@ async def external_verify(runtime, sid, instance, base_directory):
     event = runtime.store.event(sid, "external_verifier_started", {"instance": instance.id})
     context = ToolContext(runtime, sid, new_id(), event)
     workspace = GitWorkspace(context)
-    checkpoint = workspace.snapshot("external-evaluation-input")
+    checkpoint = workspace.snapshot_tree("external-evaluation-input")
     isolated = workspace.isolate(checkpoint)
     if instance.test_patch:
         file = (base_directory / instance.test_patch).resolve()
@@ -151,6 +152,9 @@ def metrics(runtime, sid):
         for r in store.db.execute("SELECT * FROM events WHERE root_id=? ORDER BY seq", (sid,))
     ]
     counts = Counter(e["type"] for e in events)
+    actions = [json.loads(e["payload"]) for e in events if e["type"] == "tool_call"]
+    names = Counter(a["name"] for a in actions)
+    repeated = Counter(encode([a["name"], a["arguments"]]) for a in actions)
     commands = [json.loads(e["payload"]) for e in events if e["type"] == "coding_command"]
     failed_commands = Counter(encode(c["command"]) for c in commands if not c["passed"])
     fingerprints = [json.loads(e["payload"]) for e in events if e["type"] == "action_fingerprint"]
@@ -176,6 +180,34 @@ def metrics(runtime, sid):
         **store.usage(sid, tree=True).model_dump(),
         "wall_time": runtime._elapsed(sid),
         "context_compactions": counts["context_compaction"],
+        "python_cells": names["ipython"] + names["python"],
+        "repo_queries": sum(
+            v
+            for k, v in names.items()
+            if k.startswith("repo_")
+            or k in {"symbol_search", "references_search", "dependency_context", "file_outline"}
+        ),
+        "file_read_tool_calls": names["workspace_read"],
+        "arbitrary_python_reads_count": None,
+        "repeated_tool_requests": sum(n - 1 for n in repeated.values() if n > 1),
+        "failed_actions": sum(
+            bool(json.loads(e["payload"]).get("result", {}).get("error"))
+            for e in events
+            if e["type"] == "tool_result"
+        ),
+        "child_purposes": dict(
+            Counter(
+                json.loads(e["payload"])["purpose"] for e in events if e["type"] == "child_purpose"
+            )
+        ),
+        "context_estimates": [
+            json.loads(e["payload"]) for e in events if e["type"] == "context_estimate"
+        ],
+        "compaction_savings_estimate": sum(
+            json.loads(e["payload"]).get("savings_estimate", 0)
+            for e in events
+            if e["type"] == "context_compaction"
+        ),
         "retrieval_calls": counts["history_retrieval"],
         "experiments": counts["experiment_created"],
         "experiment_runs": counts["experiment_conclusion"],
@@ -224,7 +256,18 @@ def metrics(runtime, sid):
     }
 
 
-async def evaluate(tasks, config, directory, *, repetitions=1, seed=0, output, providers=None):
+async def evaluate(
+    tasks,
+    config,
+    directory,
+    *,
+    repetitions=1,
+    seed=0,
+    output,
+    providers=None,
+    profile="buffalo",
+    external_command=None,
+):
     from .runtime import Runtime
     from .tools import ToolContext
 
@@ -262,20 +305,41 @@ async def evaluate(tasks, config, directory, *, repetitions=1, seed=0, output, p
                 "seed_applied_to_model": False,
                 "config": config.model_dump(mode="json"),
                 "solved": False,
+                "profile": profile,
+                "instance": instance.model_dump(mode="json"),
             }
             try:
                 workspace, instruction, resolved = prepare_instance(
                     instance, run_dir, config, base_directory=tasks.parent
                 )
+                resolved = profile_config(resolved, profile)
+                result["base_revision"] = git(workspace, "rev-parse", "HEAD").strip()
+                result["harness_source"] = source_identity()
                 runtime = Runtime(run_dir / "state", providers=providers)
-                session = runtime.create(instruction, workspace, config=resolved)
+                session = runtime.create(
+                    instruction,
+                    workspace,
+                    config=resolved,
+                    mode="interactive" if external_command else "autonomous",
+                )
                 result.update(
                     session_id=session.id,
                     config_id=session.config_id,
                     resolved_config=runtime.store.config(session.id).model_dump(mode="json"),
                 )
-                await runtime.start()
-                finished = await runtime.wait(session.id, timeout=resolved.limits.wall_seconds + 30)
+                if external_command:
+                    external = await run_external(
+                        runtime, session, instruction, resolved, external_command
+                    )
+                    result["external_harness"] = external
+                    finished = session.model_copy(
+                        update={"outcome": "completed" if external.get("completed") else "failed"}
+                    )
+                else:
+                    await runtime.start()
+                    finished = await runtime.wait(
+                        session.id, timeout=resolved.limits.wall_seconds + 30
+                    )
                 # Final supplied verifier is separate from the model's completion request.
                 verified = await external_verify(runtime, session.id, instance, tasks.parent)
                 result.update(
@@ -299,6 +363,27 @@ async def evaluate(tasks, config, directory, *, repetitions=1, seed=0, output, p
             finally:
                 result["elapsed_seconds"] = now() - started
                 if runtime:
+                    from .trajectory_analysis import analyze_events
+
+                    events = [
+                        {**dict(r), "payload": json.loads(r["payload"])}
+                        for r in runtime.store.db.execute("SELECT * FROM events ORDER BY seq")
+                    ]
+                    analysis_path = run_dir / "analysis.json"
+                    atomic_write(analysis_path, encode(analyze_events(events)).encode())
+                    result["analysis_path"] = str(analysis_path)
+                    trajectory = run_dir / "events.jsonl"
+                    atomic_write(
+                        trajectory,
+                        b"".join(
+                            (
+                                encode({**dict(r), "payload": json.loads(r["payload"])}) + "\n"
+                            ).encode()
+                            for r in runtime.store.db.execute("SELECT * FROM events ORDER BY seq")
+                        ),
+                    )
+                    result["trajectory_path"] = str(trajectory)
+                    result["state_directory"] = str(run_dir / "state")
                     runtime.store.db.execute(
                         "INSERT INTO eval_runs VALUES(?,?,?,?)",
                         (identifier, result.get("session_id"), now(), encode(result)),
@@ -317,12 +402,123 @@ async def evaluate(tasks, config, directory, *, repetitions=1, seed=0, output, p
     }
 
 
+def source_identity():
+    root = Path(__file__).parent
+    files = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(root.rglob("*"))
+        if p.suffix in {".py", ".rs"}
+    }
+    for name in ("pyproject.toml", "uv.lock"):
+        path = root.parent.parent / name
+        if path.is_file():
+            files["dependencies/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "sha256": hashlib.sha256(encode(files).encode()).hexdigest(),
+        "files": files,
+        "note": "Content identity includes production Python/Rust and dependency declarations, not only HEAD",
+    }
+
+
+def profile_config(config, profile):
+    result = config.model_copy(deep=True)
+    if profile == "base":
+        result.features.subagents = False
+        result.features.history_retrieval = False
+        result.features.experiments = False
+        result.features.enhanced_code_index = False
+        result.features.automatic_refinement = False
+        result.features.model_compaction = False
+        result.refinement.automatic = False
+        result.tool_allowlist = [
+            "ipython",
+            "host_request",
+            "bash.start",
+            "bash.wait",
+            "bash.status",
+            "bash.kill",
+            "workspace_read",
+            "workspace_list",
+            "workspace_write",
+            "process_run",
+        ]
+    elif profile not in {"buffalo", "external"}:
+        raise ValueError("profile must be base, buffalo, or external")
+    return result
+
+
+async def run_external(runtime, session, instruction, config, command):
+    """Explicit adapter protocol: JSON request on stdin, final JSON on stdout.
+
+    The external harness chooses strategy and may edit only its supplied checkout.
+    Completion is a proposal; our supplied verifier still evaluates the patch.
+    External usage is self-reported, never conflated with measured core usage.
+    """
+    import asyncio
+    import contextlib
+    import signal
+    import tempfile
+
+    from .execution import environment
+
+    request = {
+        "protocol": 1,
+        "objective": instruction,
+        "workspace": session.workspace.path,
+        "provider": config.provider.model_dump(mode="json"),
+        "limits": config.limits.model_dump(),
+    }
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=session.workspace.path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=stdout,
+            stderr=stderr,
+            env=environment(config.execution),
+            start_new_session=True,
+        )
+        try:
+            async with asyncio.timeout(config.limits.wall_seconds):
+                await process.communicate(encode(request).encode())
+            if process.returncode:
+                raise ValueError(f"External harness exited {process.returncode}; logs retained")
+            stdout.seek(0)
+            contents = stdout.read(4_000_001)
+            if len(contents) > 4_000_000:
+                raise ValueError(
+                    "External JSON response exceeds 4 MB; return trajectory artifact paths"
+                )
+            response = json.loads(contents)
+            if not isinstance(response, dict) or "completed" not in response:
+                raise ValueError(
+                    "External harness must return an object with completed and optional usage"
+                )
+            return {**response, "usage_provenance": "external_self_reported"}
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
+            for stream in (stdout, stderr):
+                stream.seek(0)
+                runtime.artifacts.put_stream(session.id, stream)
+
+
 def analyze(path):
     rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     solved = sum(r["solved"] for r in rows)
     totals = {
         key: sum(r.get("metrics", {}).get(key, 0) or 0 for r in rows)
         for key in (
+            "input_tokens",
+            "output_tokens",
+            "model_calls",
+            "python_cells",
+            "repo_queries",
+            "tests_runs",
+            "build_runs",
+            "failed_actions",
+            "wall_time",
             "turns",
             "tool_calls",
             "subagent_count",
@@ -349,6 +545,19 @@ def analyze(path):
         if solved and totals["cost"] is not None
         else None,
         "turns_per_solved": totals["turns"] / solved if solved else None,
+        "tokens_per_task": (totals["input_tokens"] + totals["output_tokens"]) / len(rows)
+        if rows
+        else None,
+        "tokens_per_solved": (totals["input_tokens"] + totals["output_tokens"]) / solved
+        if solved
+        else None,
+        "verification_pass_rate": sum(
+            r.get("external_verification", {}).get("passed", False) for r in rows
+        )
+        / len(rows)
+        if rows
+        else None,
+        "wall_seconds_per_task": totals["wall_time"] / len(rows) if rows else None,
         "tool_calls_per_solved": totals["tool_calls"] / solved if solved else None,
         "mean_repeated_action_rate": sum(
             r.get("metrics", {}).get("repeated_action_rate", 0) for r in rows

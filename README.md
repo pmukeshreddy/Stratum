@@ -148,12 +148,28 @@ uv run threadweave run "Fix the failing tests without weakening them." \
 
 This optional environment captures baseline evidence and verifies completion against
 configured commands and repository constraints. Interactive greetings/inspection
-do not run its baseline. Python `rlm()` shares the current workspace even when the
-parent selected coding gates. Isolated coding candidates remain available through
-explicit `tools.call('agent_spawn', instruction=..., isolate=True)` in a coding environment; parent acceptance
-is explicit. Coordinate shared writes or choose isolation. Nothing is automatically
-committed or stashed. configs/kernel.json selects optional compile/correctness/
+do not run its baseline. Python `rlm()` defaults to a shared workspace. Its explicit
+`purpose="research"` sets read-only tool policy (not an OS sandbox);
+`purpose="candidate"` creates a coding environment in a Git worktree based on the
+parent's captured dirty state. Inspect with `await rlm.candidate(handle)` and
+explicitly accept with `await rlm.candidate(handle, accept=True)`. Worktrees share
+Git objects, not writable source files. No user branch is committed or stashed;
+harness checkpoints use private Git refs. configs/kernel.json selects compile/correctness/
 performance commands through the same architecture.
+
+Repository definitions/calls/references use persistent Tree-sitter syntax evidence
+for Python, Rust, Go, C/C++/CUDA and JavaScript/TypeScript. Results identify evidence
+quality; unresolved names are not compiler-semantic references. Native filesystem
+events drive warm mutation/index updates, with full reconciliation after recovery
+and at verification boundaries. See the [hardening ledger](docs/hardening-ledger.md)
+for APIs, measured costs and remaining limits.
+
+## Frozen coding comparisons
+
+The evaluation runner compares a basic filesystem/shell profile of this runtime
+with its full configured capabilities, holding model, task revision and resource
+limits fixed. It also accepts an external harness adapter. This is not a claim of
+superiority or a bundled public benchmark. [Reproduction and result definitions](docs/hardening-evaluation.md).
 
 ## Long-horizon sessions
 

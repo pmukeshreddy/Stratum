@@ -32,7 +32,8 @@ class Executor(Protocol):
 
 class LocalExecutor:
     def invocation(self, context, command, cwd):
-        return [sys.executable, "-m", "threadweave.process_worker", *command], cwd, None
+        bootstrap = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r}); from threadweave.process_worker import main; main()"
+        return [sys.executable, "-c", bootstrap, *command], cwd, None
 
     async def cleanup(self, name):
         return True
@@ -94,11 +95,27 @@ class LocalExecutor:
                     timed_out = True
                 finally:
                     try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), 0.3)
+                    except TimeoutError:
+                        pass
+                    try:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     await proc.wait()
-                    await asyncio.gather(*readers, return_exceptions=True)
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), 1)
+                    except TimeoutError:
+                        context.runtime.store.event(
+                            context.session_id,
+                            "process_output_incomplete",
+                            {"reason": "A detached writer retained the output pipe"},
+                            parent=context.source_event,
+                        )
             finally:
                 try:
                     cleaned = await self.cleanup(name)
@@ -133,6 +150,11 @@ class LocalExecutor:
             "returncode": proc.returncode,
             "duration": time.monotonic() - start,
             "timed_out": timed_out,
+            "state": "timed_out"
+            if timed_out
+            else "completed"
+            if proc.returncode == 0
+            else "failed",
             "passed": proc.returncode == 0 and not timed_out,
             "backend": config.backend,
             "network_policy_enforced": config.backend == "container",

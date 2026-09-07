@@ -156,6 +156,7 @@ class BenchmarkConfig(Record):
     required_improvement: float = Field(default=0, ge=0)
     noise_tolerance: float = Field(default=0.01, ge=0)
     timeout_seconds: float = Field(default=60, gt=0)
+    outlier_policy: Literal["retain", "iqr"] = "retain"
 
 
 class RoutingConfig(Record):

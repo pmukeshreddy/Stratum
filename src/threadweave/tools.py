@@ -22,6 +22,7 @@ class ToolContext:
     source_event: str
     from_python: bool = False
     workspace_override: Any = None
+    capability: Any = None
 
     @property
     def session(self):
@@ -62,12 +63,21 @@ class Tool:
     feature: str | None = None
 
     def schema(self):
+        def compact(value):
+            if isinstance(value, dict):
+                return {k: compact(v) for k, v in value.items() if k != "title"}
+            if isinstance(value, list):
+                return [compact(v) for v in value]
+            return value
+
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.arguments.model_json_schema(),
+                "parameters": self.arguments.model_json_schema()
+                if self.name == "ipython"
+                else compact(self.arguments.model_json_schema()),
             },
         }
 
@@ -83,6 +93,10 @@ class ToolRegistry:
 
     def allowed(self, name, config):
         tool = self.entries.get(name)
+        return self.permitted(tool, config) if tool else False
+
+    def permitted(self, tool, config):
+        name = tool.name
         return (
             tool
             and set(tool.permissions) <= set(config.permissions)
@@ -115,7 +129,7 @@ class ToolRegistry:
             and (name == "ipython" if config.control_plane == "python" else name != "ipython")
         ]
 
-    async def call(self, context: ToolContext, name: str, arguments: dict):
+    def resolve(self, context: ToolContext, name: str, arguments: dict):
         config = context.runtime.store.config(context.session_id)
         if name not in self.entries:
             raise HarnessError("tool", "unknown_tool", f"Unknown tool: {name}")
@@ -130,6 +144,30 @@ class ToolRegistry:
             validated = tool.arguments.model_validate(arguments)
         except ValidationError as exc:
             raise HarnessError("tool", "invalid_arguments", str(exc)[:3000]) from exc
+        if name == "host_request":
+            from .host_api import resolve_capability
+
+            tool = resolve_capability(validated)
+            # The envelope never grants the permissions of its contained operation.
+            # An explicit host_request allowlist entry permits RPC discovery, not
+            # bypassing permission/read-only checks on its resolved capability.
+            policy = (
+                config.model_copy(update={"tool_allowlist": None})
+                if tool.name == "catalog"
+                else config
+            )
+            if not self.permitted(tool, policy):
+                raise HarnessError(
+                    "tool", "permission_denied", f"Capability not permitted: {tool.name}"
+                )
+        context.capability = tool
+        return tool, validated
+
+    async def call(self, context: ToolContext, name: str, arguments: dict):
+        tool, validated = self.resolve(context, name, arguments)
+        return await self.execute(context, tool, validated)
+
+    async def execute(self, context, tool, validated):
         try:
             return await tool.execute(context, validated)
         except (HarnessError, asyncio.CancelledError):

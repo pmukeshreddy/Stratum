@@ -168,6 +168,8 @@ async def execute(args):
                 repetitions=args.repetitions,
                 seed=args.seed,
                 output=args.output,
+                profile=args.profile,
+                external_command=args.external_command,
             )
         )
         return 0
@@ -387,6 +389,12 @@ def parser():
     evaluation.add_argument("--output", type=Path, required=True)
     evaluation.add_argument("--repetitions", type=int, default=1)
     evaluation.add_argument("--seed", type=int, default=0)
+    evaluation.add_argument("--profile", choices=["base", "buffalo", "external"], default="buffalo")
+    evaluation.add_argument(
+        "--external-command",
+        nargs="+",
+        help="Explicit external harness JSON-stdin/JSON-stdout adapter",
+    )
     analysis = sub.add_parser("analyze", help="Aggregate measured evaluation results")
     analysis.add_argument("results", type=Path)
     return p

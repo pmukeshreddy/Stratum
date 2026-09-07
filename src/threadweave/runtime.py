@@ -180,6 +180,7 @@ class Runtime(MemoryServices):
         role="agent",
         isolate=None,
         provider=None,
+        purpose=None,
     ):
         parent = self.store.session(parent_id)
         if parent.outcome != Outcome.ACTIVE:
@@ -198,6 +199,15 @@ class Runtime(MemoryServices):
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
+        if purpose not in {None, "research", "shared", "candidate"}:
+            raise ValueError("Child purpose must be research, shared, or candidate")
+        if purpose:
+            isolate = purpose == "candidate"
+        if purpose == "research":
+            config.execution.read_only = True
+            instruction += "\nResearch assignment: do not mutate the parent workspace. Python is trusted-host, not sandboxed."
+        if purpose == "candidate":
+            config.task.adapter = "coding"
         if provider is not None:
             config.provider = provider
             config.routing.default = None
@@ -218,6 +228,17 @@ class Runtime(MemoryServices):
             parent_id=parent_id,
             name=name or f"child-{usage.subagent_count + 1}",
             mode="autonomous" if config.control_plane == "python" else "goal",
+        )
+        self.store.event(
+            session.id,
+            "child_purpose",
+            {
+                "purpose": purpose or ("candidate" if isolate else "shared"),
+                "workspace_mode": "isolated" if isolate else "shared",
+                "base": workspace.metadata.get("base_revision"),
+                "parent": parent_id,
+                "trusted_python_mutation_risk": not isolate,
+            },
         )
         if checkpoint:
             self.store.db.execute(
@@ -612,6 +633,15 @@ class Runtime(MemoryServices):
 
     async def recover(self):
         await self.environment.recover()
+        if (
+            not hasattr(self, "background")
+            and self.store.db.execute("SELECT 1 FROM process_jobs LIMIT 1").fetchone()
+        ):
+            from .background import BackgroundProcesses
+
+            self.background = BackgroundProcesses(self)
+        if hasattr(self, "background"):
+            self.background.recover()
         self.recover_refinement_requests()
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
@@ -718,6 +748,7 @@ class Runtime(MemoryServices):
             self._wake.clear()
             try:
                 self._schedules_due()
+                self.environment.mutations.poll()
                 for root in self.store.sessions(roots_only=True):
                     if root.started_at and (
                         root.outcome == Outcome.ACTIVE or self._active_descendants(root.id)
@@ -1042,6 +1073,35 @@ class Runtime(MemoryServices):
         schemas = self.tools.schemas(config)
         messages, size = self.context.assemble(sid, schemas)
         session = self.store.session(sid)
+        usage = self.store.usage(session.root_id, tree=True)
+        remaining = (
+            self.store.config(session.root_id).limits.token_budget
+            - usage.input_tokens
+            - usage.output_tokens
+        )
+        reserve = max(p.max_output_tokens for p in [config.provider, *config.models.values()])
+        # Evidence-driven context pressure: leave room for continuation when repeated
+        # replay approaches the cumulative budget. Limits/accounting are unchanged.
+        if session.context and remaining < 3 * (size + reserve):
+            target = max(4096, remaining // 2 - reserve)
+            if target < size:
+                self.store.event(
+                    sid,
+                    "budget_context_pressure",
+                    {
+                        "remaining_tokens": remaining,
+                        "previous_estimate": size,
+                        "target_input_tokens": target,
+                    },
+                )
+                try:
+                    messages, size = self.context.assemble(sid, schemas, input_budget=target)
+                except HarnessError as exc:
+                    if exc.failure.code != "context_capacity":
+                        raise
+                    raise LimitReached(
+                        "Remaining token budget cannot fit necessary context"
+                    ) from exc
         request = ModelRequest(
             session_id=sid,
             root_id=session.root_id,
@@ -1275,6 +1335,9 @@ class Runtime(MemoryServices):
         config = self.store.config(sid)
         context = ToolContext(self, sid, action_id, eid, from_python)
         external_checkpoint = None
+        interrupted = None
+        raw = None
+        admitted = False
         try:
             if not from_python and config.control_plane == "python" and action.name != "ipython":
                 raise HarnessError(
@@ -1282,32 +1345,33 @@ class Runtime(MemoryServices):
                     "tool_not_exposed",
                     "Only ipython is exposed; call capabilities from Python",
                 )
-            external_checkpoint = await self.environment.before_action(context, action.name)
+            tool, validated = self.tools.resolve(context, action.name, action.arguments)
+            external_checkpoint = await self.environment.before_action(context, tool.name)
+            admitted = True
+            self.store.event(
+                sid,
+                "environment_action_started",
+                {"action_id": action_id, "capability": tool.name, "from_python": from_python},
+                parent=eid,
+            )
             timeout = (
                 config.limits.python_timeout_seconds + 25
                 if action.name in ("python", "ipython", "skill_run")
                 else config.limits.tool_timeout_seconds
             )
             async with asyncio.timeout(timeout):
-                raw = await self.tools.call(context, action.name, action.arguments)
+                raw = await self.tools.execute(context, tool, validated)
                 encode(raw)  # Structured tools must produce JSON-compatible values.
-        except LimitReached:
-            raise
-        except asyncio.CancelledError:
-            self._action_result(
-                sid,
-                action_id,
-                {
-                    "error": HarnessError(
-                        "runtime",
-                        "action_cancelled",
-                        "Action cancelled; inspect external effects before retrying",
-                        uncertain=True,
-                    ).failure.model_dump()
-                },
-                eid,
-            )
-            raise
+        except (LimitReached, asyncio.CancelledError) as exc:
+            interrupted = exc
+            raw = {
+                "error": HarnessError(
+                    "runtime",
+                    "action_cancelled",
+                    "Action cancelled; inspect external effects before retrying",
+                    uncertain=True,
+                ).failure.model_dump()
+            }
         except Exception as exc:
             failure = (
                 exc.failure
@@ -1319,8 +1383,32 @@ class Runtime(MemoryServices):
             raw = {"error": failure.model_dump()}
             self.store.event(sid, "failure", failure.model_dump(), parent=eid)
         finally:
-            self.environment.after_action(context, external_checkpoint)
+            if admitted:
+                try:
+                    self.environment.after_action(context, external_checkpoint)
+                    self.store.event(
+                        sid,
+                        "environment_action_finished",
+                        {"action_id": action_id, "capability": tool.name},
+                        parent=eid,
+                    )
+                except Exception as exc:
+                    failure = HarnessError(
+                        "environment", "after_action_failed", str(exc), uncertain=True
+                    ).failure
+                    # Execution may already have changed the workspace. Preserve its
+                    # result separately and never report a successful/rolled-back action.
+                    execution = self.artifacts.expose(sid, raw, source_event=eid)
+                    raw = {
+                        "error": failure.model_dump(),
+                        "execution_result": execution,
+                        "rollback_performed": False,
+                    }
+                    self.store.event(sid, "failure", failure.model_dump(), parent=eid)
+                    self.store.update(sid, paused=True, runnable=False)
         result = self._action_result(sid, action_id, raw, eid)
+        if interrupted is not None:
+            raise interrupted
         # Python receives full values for computation, while the action journal/context
         # always stores a bounded preview plus the durable artifact.
         if from_python:
@@ -1386,6 +1474,23 @@ class Runtime(MemoryServices):
         return self.kernels[sid]
 
     async def execute_python(self, context, code):
+        observation = None
+        if self.store.config(context.session_id).task.adapter == "coding":
+            await self.environment.prepare(context.session_id, force=True)
+            observation = self.environment.mutations.begin(context)
+        try:
+            return await self._execute_python(context, code)
+        finally:
+            if observation:
+                try:
+                    self.environment.mutations.end(context, observation)
+                except Exception as exc:
+                    self.environment.mutations.failed(context, exc)
+                    raise HarnessError(
+                        "environment", "observation_failed", str(exc), uncertain=True
+                    ) from exc
+
+    async def _execute_python(self, context, code):
         sid = context.session_id
         if self.store.config(sid).control_plane == "python":
             self.context.history_file(sid)
@@ -1667,5 +1772,8 @@ class Runtime(MemoryServices):
         for session in self.store.sessions():
             if session.lifecycle != Lifecycle.INACTIVE:
                 self.store.transition(session.id, Lifecycle.INACTIVE)
+        self.environment.mutations.close()
+        for index in getattr(self, "_repository_indexes", {}).values():
+            index.close()
         self.store.close()
         self._owner_lock.close()

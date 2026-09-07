@@ -11,6 +11,7 @@ import asyncio
 
 from .coding import CodingTask
 from .models import HarnessError, Workspace, new_id
+from .mutations import MutationObserver
 from .storage import encode
 from .tasks import WorkspaceTask
 from .tools import ToolContext
@@ -19,6 +20,7 @@ from .tools import ToolContext
 class Environment:
     def __init__(self, runtime, adapters=None):
         self.runtime = runtime
+        self.mutations = MutationObserver(runtime)
         self.adapters = (
             adapters
             if adapters is not None
@@ -57,17 +59,27 @@ class Environment:
     async def before_action(self, context, name):
         runtime, sid = self.runtime, context.session_id
         config = runtime.store.config(sid)
-        if config.task.adapter != "coding" or not runtime.tools.allowed(name, config):
+        if config.task.adapter != "coding":
             return None
-        tool = runtime.tools.entries[name]
-        if name in {"finish", "rlm", "agent_spawn"} or set(tool.permissions) & {
+        tool = context.capability or runtime.tools.entries[name]
+        if name in {"finish", "rlm", "rlm.run", "agent_spawn"} or set(tool.permissions) & {
             "workspace.write",
             "python",
             "ipython",
             "process",
         }:
             await self.prepare(sid, force=True)
-        if context.from_python or name not in {
+        if "process" in tool.permissions:
+            # A preceding Path.write_text in the SAME cell must be visible to tests,
+            # including same-size writes with timestamp-based Python bytecode.
+            self.mutations.reconcile(context, reason="before_process")
+        # The executable capability, not its origin/envelope, determines policy.
+        # Keep explicit legacy snapshot behavior; Python-first cells use incremental
+        # metadata observation rather than copying all content for every invocation.
+        token = {"window": None, "checkpoint": None}
+        if name not in {"python", "ipython", "skill_run"}:
+            token["window"] = self.mutations.begin(context)
+        if config.control_plane != "direct" or name not in {
             "python",
             "skill_run",
             "process_run",
@@ -80,7 +92,7 @@ class Environment:
             "run_profile",
             "experiment_run",
         }:
-            return None
+            return token
         from .gitops import GitWorkspace
 
         checkpoint = GitWorkspace(context).snapshot("before-external-action")
@@ -90,23 +102,23 @@ class Environment:
             {"action_id": context.action_id, "checkpoint_id": checkpoint},
             parent=context.source_event,
         )
-        return checkpoint
+        token["checkpoint"] = checkpoint
+        return token
 
-    def after_action(self, context, checkpoint):
-        if not checkpoint:
+    def after_action(self, context, token):
+        if not token:
             return
         from .gitops import GitWorkspace
 
         try:
-            GitWorkspace(context).observe_effects(checkpoint, context.action_id)
-        except (ValueError, OSError) as exc:
-            self.runtime.store.event(
-                context.session_id,
-                "workspace_observation_failed",
-                {"action_id": context.action_id, "reason": str(exc)},
-                parent=context.source_event,
-            )
-            self.runtime.store.update(context.session_id, paused=True, runnable=False)
+            self.mutations.end(context, token["window"])
+            if token["checkpoint"]:
+                GitWorkspace(context).observe_effects(token["checkpoint"], context.action_id)
+        except Exception as exc:
+            self.mutations.failed(context, exc)
+            raise HarnessError(
+                "environment", "observation_failed", str(exc), uncertain=True
+            ) from exc
 
     def continuation_workspace(self, source, config, *, child=False):
         """Explicit coding environments isolate writable continuations; others share metadata."""
@@ -122,14 +134,15 @@ class Environment:
             source.id, "candidate_preparing" if child else "fork_workspace", {}
         )
         git = GitWorkspace(ToolContext(self.runtime, source.id, new_id(), event))
-        checkpoint = git.snapshot("candidate-source" if child else "fork-source")
+        checkpoint = git.snapshot_tree("candidate-source" if child else "fork-source")
         isolated = git.isolate(checkpoint)
         workspace = Workspace(
             path=str(isolated),
             metadata={
                 "source_session": source.id,
                 "source_checkpoint": checkpoint,
-                "isolation": "private_git_copy",
+                "isolation": "git_worktree",
+                "base_revision": git.checkpoint(checkpoint)["head"],
             },
         )
         config.task.repository = str(isolated)
@@ -147,6 +160,7 @@ class Environment:
         recover_edits(self.runtime)
         await recover_containers(self.runtime)
         await recover_workspace_effects(self.runtime)
+        self.mutations.recover()
         self.runtime.store.db.execute(
             "UPDATE experiments SET status='interrupted' WHERE status='running'"
         )

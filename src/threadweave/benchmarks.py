@@ -14,15 +14,26 @@ def summarize(values):
     ordered = sorted(values)
     return {
         "median": statistics.median(values),
+        "p50": statistics.median(values),
         "p95": ordered[max(0, math.ceil(0.95 * len(values)) - 1)],
+        "p99": ordered[max(0, math.ceil(0.99 * len(values)) - 1)],
         "min": min(values),
         "max": max(values),
         "count": len(values),
         "stdev": statistics.stdev(values) if len(values) > 1 else 0,
+        "variance": statistics.variance(values) if len(values) > 1 else 0,
+        "percentile_method": "nearest rank; median uses midpoint",
     }
 
 
 def compare(reference, candidate, config):
+    if (
+        not reference
+        or not candidate
+        or reference.get("correct") is False
+        or candidate.get("correct") is False
+    ):
+        raise ValueError("Performance comparison requires correctness-passing measurements")
     base, value = reference["median"], candidate["median"]
     if base == 0:
         raise ValueError("Relative improvement needs a nonzero baseline")
@@ -64,6 +75,9 @@ async def run_benchmark(
         "runs": [],
         "passed": False,
     }
+    from .machine import metadata
+
+    result["environment"] = metadata()
     if correct:
         pattern = re.compile(config.metric_regex)
         if pattern.groups != 1:
@@ -88,7 +102,14 @@ async def run_benchmark(
             if not run["warmup"]:
                 result["measurements"].append(metric)
         if len(result["measurements"]) == config.repetitions:
-            result.update(summarize(result["measurements"]))
+            selected = result["measurements"]
+            result["excluded_measurements"] = []
+            if config.outlier_policy == "iqr" and len(selected) >= 4:
+                q1, _, q3 = statistics.quantiles(selected, n=4, method="inclusive")
+                lower, upper = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+                result["excluded_measurements"] = [x for x in selected if not lower <= x <= upper]
+                selected = [x for x in selected if lower <= x <= upper]
+            result.update(summarize(selected))
             result["passed"] = True
             if reference:
                 if not reference.get("passed") or "median" not in reference:

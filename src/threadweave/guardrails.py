@@ -17,7 +17,11 @@ def state_fingerprint(runtime, sid):
     state["messages"] = [m["id"] for m in store.messages(sid, limit=20)]
     state["entries"] = [(e["id"], e["version"]) for e in store.states(sid)]
     if store.config(sid).task.adapter == "coding":
-        state["files"] = [(r["path"], r["sha256"]) for r in runtime.index(sid).entries()]
+        row = store.db.execute(
+            "SELECT state_id FROM mutation_workspaces WHERE path=?", (session.workspace.path,)
+        ).fetchone()
+        state["files"] = row[0] if row else "not-yet-observed"
+        state["edits"] = [e["id"] for e in store.events(sid, kind="code_edit", limit=1)]
     return hashlib.sha256(encode(state).encode()).hexdigest()
 
 

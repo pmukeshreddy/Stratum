@@ -16,6 +16,41 @@ class Request(Record):
     payload: dict = Field(default_factory=dict)
 
 
+def resolve_capability(request):
+    """Expose the operation's policy identity to the common action pipeline.
+
+    These are internal RPC capabilities, never additional model-facing tools.
+    Operation-specific ownership, schema and server checks remain in dispatch.
+    """
+    from .tools import Tool
+
+    op = request.operation
+    if op == "edit":
+        permissions = ("workspace.write",)
+    elif op.startswith("bash."):
+        permissions = ("process",)
+    elif op.startswith("mcp."):
+        permissions = ("mcp",)
+    elif op.startswith(("rlm.", "agent_message.", "agent_observe.")):
+        permissions = ("agents",)
+    elif op.startswith(("harness.", "skills.")):
+        permissions = ("state",)
+    elif op == "catalog" or op.startswith("goal.") or op == "context.compact":
+        permissions = ()
+    else:
+        raise ValueError(f"Unknown host operation: {op}")
+    if op == "skills.prepare":
+        permissions = ("state", "python")
+    return Tool(
+        op,
+        "Internal Python capability",
+        Request,
+        dispatch,
+        permissions,
+        feature="subagents" if op.startswith("rlm.") else None,
+    )
+
+
 def permission(context, name):
     if name not in context.runtime.store.config(context.session_id).permissions:
         raise PermissionError(f"Capability requires {name} permission")
@@ -212,7 +247,14 @@ async def dispatch(context, request):
                 provider.parameters["reasoning_effort"] = p["thinking"]
             if provider.name == "codex_subscription" and (p.get("model") or p.get("thinking")):
                 provider, _ = await runtime.providers[provider.name].resolve(provider)
-            child = runtime.spawn(sid, p["prompt"], name=name, isolate=False, provider=provider)
+            child = runtime.spawn(
+                sid,
+                p["prompt"],
+                name=name,
+                isolate=False,
+                provider=provider,
+                purpose=p.get("purpose", "shared"),
+            )
             return {
                 "session_id": child.id,
                 "name": child.name,

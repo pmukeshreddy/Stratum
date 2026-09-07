@@ -6,12 +6,12 @@ import fnmatch
 import json
 from pathlib import Path
 
-from .diagnostics import parse_diagnostics
 from .execution import executor
 from .gitops import GitWorkspace
 from .models import Verification, new_id, now
 from .repository import confined, detect, is_test, symbols
 from .storage import encode
+from .test_evidence import machine_command, structured
 
 KINDS = {
     "test": "test_commands",
@@ -26,14 +26,34 @@ async def run_command(context, command, *, kind="command", timeout_seconds=None)
     config = context.runtime.store.config(context.session_id)
     if "process" not in config.permissions:
         raise PermissionError("Coding commands require process permission")
+    report = context.runtime.store.directory / "test-reports" / (new_id() + ".xml")
+    report.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    framework, executed = machine_command(
+        command, report, local=config.execution.backend == "local"
+    )
     result = await executor(config.execution).run(
-        context, command, timeout_seconds=timeout_seconds or config.limits.tool_timeout_seconds
+        context, executed, timeout_seconds=timeout_seconds or config.limits.tool_timeout_seconds
     )
     text = "\n".join(
         context.runtime.artifacts.load(context.session_id, result[k + "_artifact"])
         for k in ("stdout", "stderr")
     )
-    result.update(parse_diagnostics(text))
+    evidence = structured(text, framework, report.read_text() if report.is_file() else None)
+    evidence_id = context.runtime.artifacts.put(
+        context.session_id, evidence, source_event=context.source_event
+    )
+    if report.is_file():
+        result["test_report_artifact"] = context.runtime.artifacts.put_bytes(
+            context.session_id, report.read_bytes(), "application/xml"
+        )
+    result.update(
+        {
+            **evidence,
+            "tests": evidence["tests"][:30],
+            "structured_artifact": evidence_id,
+            "requested_command": command,
+        }
+    )
     result["kind"] = kind
     context.runtime.store.event(
         context.session_id, "coding_command", result, parent=context.source_event
@@ -152,12 +172,24 @@ class CodingTask:
         store.db.execute(
             "INSERT INTO coding_baselines VALUES(?,?)", (context.session_id, encode(result))
         )
+        _, manifest, artifact, _, _ = context.runtime.environment.mutations.scan(context)
+        result["mutation_baseline"] = {
+            "artifact": artifact,
+            "owner": context.session_id,
+            "state_id": manifest["state_id"],
+        }
+        store.db.execute(
+            "UPDATE coding_baselines SET body=? WHERE session_id=?",
+            (encode(result), context.session_id),
+        )
         context.runtime.index(context.session_id).refresh()
         store.event(context.session_id, "coding_baseline", result, parent=context.source_event)
         return result
 
     async def verify(self, context, task):
         original = baseline(context)
+        observer = context.runtime.environment.mutations
+        observer.reconcile(context, reason="before_verifier")
         git = GitWorkspace(context)
         violations, results, regressions = [], {}, []
         if task.require_tests and not original["commands"]["test"]:
@@ -250,6 +282,23 @@ class CodingTask:
             )
             if not measured["passed"]:
                 violations.append("Benchmark correctness/performance threshold failed")
+        observer.reconcile(context, reason="after_verifier")
+        _, final = observer.previous(str(git.root.resolve()))
+        if origin := original.get("mutation_baseline"):
+            observed = observer.load(origin["owner"], origin["artifact"])
+            governed_paths = set(git.files()) | set(prior)
+            for path in observed["files"].keys() | final["files"].keys():
+                if observed["files"].get(path, {}).get("value") == final["files"].get(path, {}).get(
+                    "value"
+                ):
+                    continue
+                if (
+                    path in governed_paths
+                    and not any(fnmatch.fnmatch(path, p) for p in task.allowed_paths)
+                ) or any(fnmatch.fnmatch(path, p) for p in task.forbidden_paths):
+                    message = f"Forbidden modification: {path}"
+                    if message not in violations:
+                        violations.append(message)
         aid = context.runtime.artifacts.put_bytes(context.session_id, patch.encode(), "text/x-diff")
         verification = Verification(
             passed=not violations and not regressions,
@@ -259,6 +308,8 @@ class CodingTask:
                 "results": results,
                 "patch_artifact": aid,
                 "benchmark": measured,
+                "observed_final_state": final["state_id"],
+                "diagnostic_oracle": verifier_evidence(context, original, results, patch),
             },
             metrics={
                 "diff_bytes": len(patch.encode()),
@@ -279,3 +330,31 @@ class CodingTask:
             ),
         )
         return verification
+
+
+def verifier_evidence(context, original, results, patch):
+    from .diagnostics import localize
+
+    failures, existing, localized = [], [], []
+    for kind, rows in results.items():
+        prior = original["results"].get(kind, [])
+        for i, result in enumerate(rows):
+            known = {f["name"] for f in prior[i].get("failures", [])} if i < len(prior) else set()
+            for failure in result.get("failures", []):
+                entry = {
+                    **failure,
+                    "kind": kind,
+                    "artifact": result["structured_artifact"],
+                    "baseline_state": "existing" if failure["name"] in known else "new_or_unknown",
+                }
+                (existing if failure["name"] in known else failures).append(entry)
+            if not result["passed"]:
+                localized.extend(localize(context, result)["evidence"])
+    return {
+        "new_or_unclassified_failures": failures[:8],
+        "baseline_existing_failures": existing[:5],
+        "source_evidence": localized[:5],
+        "diff_excerpt": patch[:3000],
+        "complete_results_external": True,
+        "independent": True,
+    }

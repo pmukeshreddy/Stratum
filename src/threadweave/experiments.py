@@ -22,7 +22,7 @@ class Experiments:
             "changes": changes,
             "metric": metric,
             "verifier": verifier,
-            "source_checkpoint": GitWorkspace(self.context).snapshot("experiment-input"),
+            "source_checkpoint": GitWorkspace(self.context).snapshot_tree("experiment-input"),
             "conclusion": None,
         }
         self.store.db.execute(
@@ -135,4 +135,6 @@ class Experiments:
                 "Metric configurations differ; these measurements are not directly comparable"
             )
         config = BenchmarkConfig.model_validate(a["body"]["metric"])
+        if not a["runs"][-1]["passed"] or not b["runs"][-1]["passed"]:
+            raise ValueError("Both experiment correctness gates must pass before comparison")
         return compare(a["runs"][-1]["metrics"], b["runs"][-1]["metrics"], config)

@@ -12,9 +12,10 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20):
     terms = re.findall(r"\w+", query, re.UNICODE)
     if not terms:
         return []
-    expression = " AND ".join('"' + term + '"' for term in terms[:20])
+    expression = " OR ".join('"' + term + '"' for term in terms[:20])
     sql = (
-        "SELECT id,session_id,kind,snippet(history_fts,4,'[',']','…',40) AS excerpt FROM history_fts WHERE history_fts MATCH ? AND root_id IN ("
+        "SELECT id,session_id,kind,bm25(history_fts) AS lexical_score,rowid AS ordinal,"
+        "snippet(history_fts,4,'[',']','…',40) AS excerpt FROM history_fts WHERE history_fts MATCH ? AND root_id IN ("
         + ",".join("?" for _ in roots)
         + ")"
     )
@@ -26,8 +27,25 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20):
         sql += " AND session_id=?"
         params.append(session_id)
     sql += " ORDER BY rank LIMIT ?"
-    params.append(min(100, limit))
-    return [dict(row) for row in store.db.execute(sql, params)]
+    params.append(min(100, max(20, limit * 4)))
+    candidates = [dict(row) for row in store.db.execute(sql, params)]
+    newest = max((r["ordinal"] for r in candidates), default=1)
+    important = {
+        "verifier_result",
+        "coding_command",
+        "failure",
+        "experiment_conclusion",
+        "agent_message_received",
+    }
+    for row in candidates:
+        overlap = sum(t.casefold() in row["excerpt"].casefold() for t in terms) / len(terms)
+        row["score"] = (
+            overlap + (0.2 if row["kind"] in important else 0) + 0.1 * row["ordinal"] / newest
+        )
+        row["ranking"] = (
+            "FTS/BM25 candidates + term overlap + evidence type + relative recency; not semantic"
+        )
+    return sorted(candidates, key=lambda r: (r["score"], -r["lexical_score"]), reverse=True)[:limit]
 
 
 def coding_focus(store, sid):
@@ -52,21 +70,20 @@ def coding_focus(store, sid):
             "status": experiments[1],
             "hypothesis": json.loads(experiments[2])["hypothesis"][:500],
         }
-    edits = store.events(sid, kind="code_edit", limit=3)
-    try:
-        from .gitops import git
-
-        state["current_diff_summary"] = git(
-            store.session(sid).workspace.path,
-            "diff",
-            "HEAD",
-            "--stat",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--",
-        )[:1000]
-    except (ValueError, OSError):
-        state["current_diff_summary"] = "Git diff currently unavailable"
+    edits = store.events(sid, kind="code_edit", limit=3) + store.events(
+        sid, kind="workspace_effects", limit=3
+    )
+    state["recent_failures"] = [
+        {"event_id": e["id"], "failures": e["payload"].get("failures", [])[:3]}
+        for e in store.events(sid, kind="coding_command", limit=5)
+        if not e["payload"].get("passed")
+    ]
+    state["recent_child_evidence"] = [
+        {"id": m["id"], "body": m["body"][:400]}
+        for m in store.messages(sid, limit=3)
+        if m.get("sender_id")
+    ]
+    state["diff_evidence_events"] = [e["id"] for e in edits[:3]]
     state["recently_modified_files"] = sorted(
         {p for e in edits for p in e["payload"].get("files", {})}
     )[:30]

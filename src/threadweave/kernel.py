@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .models import HarnessError
 
+SOURCE_ROOT = str(Path(__file__).resolve().parent.parent)
+
 
 def fork_checkpoint(source, destination, old_workspace, new_workspace):
     """Rebind explicit Path codecs; do not replay source-bound reconstruction recipes."""
@@ -29,6 +31,19 @@ def fork_checkpoint(source, destination, old_workspace, new_workspace):
         return value
 
     checkpoint["values"] = rebind(checkpoint["values"])
+    # Blob values may capture source-workspace paths. Do not silently rebind opaque
+    # procedure closures into a different environment.
+    for name, record in list(checkpoint["values"].items()):
+        if record[0] == "blob":
+            if record[1]["codec"] == "cloudpickle":
+                checkpoint.setdefault("missing", {})[name] = (
+                    "Procedure blob requires explicit reconstruction in isolated fork"
+                )
+                del checkpoint["values"][name]
+            else:
+                blob = source.parent / "values" / record[1]["sha256"]
+                data = json.loads(blob.read_bytes())
+                checkpoint["values"][name] = rebind(data)
     missing = checkpoint.setdefault("missing", {})
     for name in checkpoint.get("recipes", {}):
         missing[name] = (
@@ -51,6 +66,7 @@ class Kernel:
         self.reader = None
         self.calls, self.results = set(), {}
         self.write_lock = asyncio.Lock()
+        self.active_execution = None
 
     async def start(self):
         if self.process and self.process.returncode is None:
@@ -63,8 +79,8 @@ class Kernel:
         self.process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",
-            "-m",
-            "threadweave.kernel_worker",
+            "-c",
+            f"import sys; sys.path.insert(0, {SOURCE_ROOT!r}); from threadweave.kernel_worker import main; main()",
             str(self.directory),
             str(self.workspace),
             stdin=asyncio.subprocess.PIPE,
@@ -146,6 +162,7 @@ class Kernel:
                 async with asyncio.timeout(timeout):
                     result = asyncio.get_running_loop().create_future()
                     self.results[execution_id] = result
+                    self.active_execution = execution_id
                     await self._send({"type": "execute", "id": execution_id, "code": code})
                     return await result
             except TimeoutError as exc:
@@ -166,6 +183,18 @@ class Kernel:
                 ) from exc
             finally:
                 self.results.pop(execution_id, None)
+                self.active_execution = None
+
+    async def interrupt(self, execution_id):
+        """Identity-fenced hard interruption. A stale interrupt never targets a later cell.
+
+        Worker termination preserves the last committed snapshot, not partial live
+        namespace changes. It also cancels pending host RPCs before kernel replacement.
+        """
+        if execution_id != self.active_execution:
+            return False
+        await self.close()
+        return True
 
     async def close(self):
         jobs = [

@@ -90,6 +90,13 @@ class TargetArgs(Record):
     targets: list[str] = Field(min_length=1, max_length=100)
 
 
+class RelatedTestsArgs(Record):
+    files: list[str] = Field(default_factory=list)
+    symbols: list[str] = Field(default_factory=list)
+    tier: str = "related"
+    limit: int = Field(default=20, ge=1, le=100)
+
+
 class ResultArgs(Record):
     artifact_id: str
 
@@ -148,17 +155,34 @@ def register(registry):
         return c.runtime.index(c.session_id).symbol_search(**a.model_dump())
 
     async def references(c, a):
-        import re
-
-        return c.runtime.index(c.session_id).search(
-            r"\b" + re.escape(a.query) + r"\b", regex=True, limit=a.limit
-        )
+        return c.runtime.index(c.session_id).references(a.query, limit=a.limit)
 
     async def outline(c, a):
         return c.runtime.index(c.session_id).outline(a.path)
 
     async def dependencies(c, a):
         return c.runtime.index(c.session_id).dependencies(a.path)
+
+    for method in ("definition", "callers", "callees", "context_for_symbol"):
+
+        async def query(c, a, method=method):
+            return getattr(c.runtime.index(c.session_id), method)(a.query, limit=a.limit)
+
+        add(
+            "repo_" + method,
+            "Ranked syntax-derived evidence; names may be ambiguous.",
+            QueryArgs,
+            query,
+        )
+
+    async def dependents(c, a):
+        return c.runtime.index(c.session_id).dependents(a.path)
+
+    async def changed_symbols(c, a):
+        return c.runtime.index(c.session_id).changed_symbols()
+
+    add("repo_dependents", "Likely importing files, with evidence quality.", PathArgs, dependents)
+    add("repo_changed_symbols", "Definitions in recently indexed changes.", Empty, changed_symbols)
 
     async def patch(c, a):
         return Editor(c).apply_patch(a.patch)
@@ -254,6 +278,18 @@ def register(registry):
 
     async def targeted(c, a):
         return await run_checks(c, "test", targets=a.targets)
+
+    async def related_tests(c, a):
+        from .test_selection import related
+
+        return related(c, **a.model_dump())
+
+    add(
+        "related_tests",
+        "Select related tests with ranked reasons; does not replace final verification.",
+        RelatedTestsArgs,
+        related_tests,
+    )
 
     async def failure(c, a):
         return localize(c, c.runtime.artifacts.load(c.session_id, a.artifact_id))

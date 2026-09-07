@@ -101,14 +101,19 @@ class Recursive:
     def __init__(self, host):
         self.host, self.harness = host, Harness(host)
 
-    async def __call__(self, prompt, *, name=None, model=None, thinking=None):
-        return await self.run(prompt, name=name, model=model, thinking=thinking)
+    async def __call__(self, prompt, *, name=None, model=None, thinking=None, purpose="shared"):
+        return await self.run(prompt, name=name, model=model, thinking=thinking, purpose=purpose)
 
-    async def run(self, prompt, *, name=None, model=None, thinking=None):
+    async def run(self, prompt, *, name=None, model=None, thinking=None, purpose="shared"):
         result = await self.host.acall(
-            "rlm.run", prompt=prompt, name=name, model=model, thinking=thinking
+            "rlm.run", prompt=prompt, name=name, model=model, thinking=thinking, purpose=purpose
         )
         return AgentHandle(**result)
+
+    async def candidate(self, handle, *, accept=False):
+        return await self.host.bridge.acall(
+            "candidate_apply" if accept else "candidate_inspect", child_id=handle.session_id
+        )
 
     async def list_subagents(self):
         return [Record(s) for s in await self.host.acall("rlm.list_subagents")]
@@ -378,6 +383,12 @@ def bootstrap(bridge, values, metadata):
             "references": ("references_search", ["query"]),
             "outline": ("file_outline", ["path"]),
             "dependencies": ("dependency_context", ["path"]),
+            "dependents": ("repo_dependents", ["path"]),
+            "definition": ("repo_definition", ["query"]),
+            "callers": ("repo_callers", ["query"]),
+            "callees": ("repo_callees", ["query"]),
+            "context_for_symbol": ("repo_context_for_symbol", ["query"]),
+            "changed_symbols": ("repo_changed_symbols", []),
         },
     )
     values["git"] = Capability(
@@ -411,7 +422,13 @@ def bootstrap(bridge, values, metadata):
         ("build", "run_build"),
         ("bench", "run_benchmark"),
     ):
-        values[namespace] = Capability(bridge, {"run": (command, [])})
+        methods = {"run": (command, [])}
+        if namespace == "tests":
+            methods.update(
+                related_to=("related_tests", ["files"]),
+                targeted=("run_targeted_tests", ["targets"]),
+            )
+        values[namespace] = Capability(bridge, methods)
     values["skills"] = Skills(host, values, metadata.get("skills", []))
 
     async def compact():

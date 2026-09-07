@@ -1,7 +1,7 @@
 """Private subprocess protocol. Run only via Kernel, never in the daemon process.
 
 Python is trusted local code, not an OS sandbox. Checkpoints use explicit codecs,
-never pickle and never replay execution history. Only registered recovery recipes
+ explicit codecs plus trusted procedure blobs; never replay execution history. Registered recovery recipes
 are executed during reconstruction.
 """
 
@@ -152,6 +152,9 @@ class Worker:
         self.shell.user_ns = self.values
         self.protected = set(self.values)
         self.receipt = None
+        from .snapshots import SnapshotBlobs
+
+        self.blobs = SnapshotBlobs(directory)
 
     def emit(self, value):
         with self.write_lock:
@@ -231,7 +234,7 @@ class Worker:
             missing.update(data.get("missing", {}))
             for name, value in data["values"].items():
                 try:
-                    self.values[name] = unpack(value, self.host)
+                    self.values[name] = self.blobs.decode(value, lambda v: unpack(v, self.host))
                     restored.append(name)
                 except Exception as exc:
                     missing[name] = str(exc)
@@ -253,21 +256,33 @@ class Worker:
         return {"restored": restored, "reconstructed": reconstructed, "missing": missing}
 
     def snapshot(self, receipt):
+        from .snapshots import deadline
+
+        started = self.blobs.begin()
         values, missing, used = {}, {}, 0
         for name, value in list(self.values.items()):
             if name in self.protected or name.startswith("__") or name in self.recipes:
                 continue
             try:
-                encoded = pack(value)
-                size = len(json.dumps(encoded, allow_nan=False))
+                if time.monotonic() - started > 5:
+                    raise ValueError("Namespace snapshot exceeded 5 seconds; variable not saved")
+                with deadline(min(1, 5 - (time.monotonic() - started))):
+                    encoded, size = self.blobs.encode(name, value, pack)
                 if size > 16 * 1024 * 1024 or used + size > 64 * 1024 * 1024:
                     raise ValueError(
                         "Checkpoint size cap reached; persist an artifact and a recipe"
                     )
                 values[name] = encoded
                 used += size
-            except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+            except Exception as exc:
                 missing[name] = str(exc)
+        self.blobs.cache = {k: v for k, v in self.blobs.cache.items() if k in values}
+        receipt["result"]["snapshot_metrics"] = {
+            **self.blobs.stats,
+            "seconds": time.monotonic() - started,
+            "saved_variables": len(values),
+            "missing_variables": len(missing),
+        }
         atomic_write(
             self.checkpoint,
             json.dumps(

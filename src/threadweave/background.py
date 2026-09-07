@@ -32,7 +32,14 @@ class BackgroundProcesses:
         result = json.loads(row["body"])
         if result["running"] and id not in self.tasks:
             # An orphan worker kills its group after daemon loss. Never replay a command.
-            result.update(running=False, interrupted=True, exit_code=None, passed=False)
+            result.update(
+                running=False,
+                interrupted=True,
+                exit_code=None,
+                passed=False,
+                state="lost",
+                recovery_note="Daemon lost ownership; no command replay or unsafe PID-based adoption",
+            )
             self.save(id, row["session_id"], result)
         directory = self.runtime.store.directory / "processes" / id
         cap = self.runtime.store.config(context.session_id).execution.output_chars
@@ -122,6 +129,9 @@ class BackgroundProcesses:
             "id": id,
             "pid": proc.pid,
             "running": True,
+            "state": "running",
+            "started_at": time.time(),
+            "owner_pid": os.getpid(),
             "command": command,
             "cwd": str(cwd),
             "exit_code": None,
@@ -190,9 +200,18 @@ class BackgroundProcesses:
                 interrupted = True
             finally:
                 with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(proc.wait(), 0.3)
+                except TimeoutError:
+                    pass
+                with contextlib.suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGKILL)
                 await proc.wait()
-                await asyncio.gather(*readers, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(asyncio.gather(*readers, return_exceptions=True), 1)
+                except TimeoutError:
+                    body["output_incomplete"] = True
                 await engine.cleanup(container)
                 if container:
                     self.runtime.store.event(
@@ -208,6 +227,15 @@ class BackgroundProcesses:
             timed_out=timed_out,
             interrupted=interrupted or proc.returncode < 0,
             passed=proc.returncode == 0 and not timed_out and not interrupted,
+            state="timed_out"
+            if timed_out
+            else "cancelled"
+            if interrupted
+            else "killed"
+            if proc.returncode < 0
+            else "completed"
+            if proc.returncode == 0
+            else "failed",
         )
         for stream in ("stdout", "stderr", "output"):
             with (destination / stream).open("rb") as f:
@@ -218,7 +246,26 @@ class BackgroundProcesses:
         self.runtime.store.event(
             context.session_id, "execution_result", body, parent=context.source_event
         )
+        if self.runtime.store.config(context.session_id).task.adapter == "coding":
+            try:
+                self.runtime.environment.mutations.reconcile(
+                    context, reason="background_process_exit"
+                )
+            except Exception as exc:
+                self.runtime.environment.mutations.failed(context, exc)
         self.processes.pop(body["id"], None)
+
+    def recover(self):
+        from .tools import ToolContext
+
+        for row in self.runtime.store.db.execute("SELECT * FROM process_jobs").fetchall():
+            if json.loads(row["body"]).get("running"):
+                event = self.runtime.store.event(
+                    row["session_id"], "process_recovery", {"id": row["id"], "state": "lost"}
+                )
+                self.status(
+                    ToolContext(self.runtime, row["session_id"], new_id(), event), row["id"]
+                )
 
     async def close_session(self, sid):
         ids = [

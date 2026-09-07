@@ -4,6 +4,7 @@ import json
 
 from .models import HarnessError
 from .storage import Store, encode
+from .tokenization import estimate, method
 
 # Foundational instructions are code-owned. Adaptive entries never replace this message.
 FOUNDATION = """You operate a persistent agent session. Decide your own strategy and next actions.
@@ -40,8 +41,11 @@ Preloaded APIs (help()/inspect work):
 - bash(command) starts immediately and returns a handle; await bash(command) returns exit_code,
   output, stdout, stderr, duration and artifact IDs. Background handles have pid, running, poll(),
   output(), tail(), kill(). Use the project's own environment (e.g. uv run pytest) via bash.
-- await rlm(prompt, name=None, model=None, thinking=None) returns a persistent child HANDLE upon
-  admission, never its answer. Children share your workspace, not Python variables. Root continues.
+- await rlm(prompt, name=None, model=None, thinking=None, purpose='shared') returns a persistent
+  child HANDLE upon admission, never its answer. Root continues. purpose='research' shares files
+  with read-only tool policy (trusted Python is not sandboxed); 'shared' explicitly allows shared
+  worktree collaboration; 'candidate' captures dirty state in an isolated writable Git worktree.
+  await rlm.candidate(handle) inspects a completed candidate; accept=True applies its validated patch.
   await rlm.list_subagents(); await rlm.find_models(); await rlm.delete_subagent(handle).
 - await agent_message.send(text, receiver_role='parent'|'child'|'sibling', receiver_name=...);
   omit receiver_name for parent; await agent_message.list_agents(); await agent_message.receive().
@@ -63,13 +67,15 @@ L1 is selected context; L2 is persistent Python and recursive sessions; L3 is du
 Compaction does not delete values or children. Recovery restores codecs and explicit recipes, not
 arbitrary live objects; use remember_recipe(name,code) / forget(*names) and inspect warnings.
 Tools enforce permissions, but Python and local shell are trusted-host code, NOT a sandbox.
+Session.permitted_host_capabilities, when non-null, restricts the preloaded helpers. Do not call
+disabled helpers; ordinary Path/open Python and permitted bash remain available.
 Respect the user's scope. Never change foundational policy through supplemental state.
 """
 
 
-def token_bound(value) -> int:
+def token_bound(value, model=None) -> int:
     """Conservative UTF-8 byte bound plus framing; provider-reported usage remains authoritative."""
-    return len(encode(value).encode("utf-8")) + 64
+    return estimate(value, model)
 
 
 class Context:
@@ -142,6 +148,7 @@ class Context:
             "goal": self.store.goal(sid),
             "features": self.store.config(sid).features.model_dump(),
             "execution_backend": self.store.config(sid).execution.backend,
+            "permitted_host_capabilities": self.store.config(sid).tool_allowlist,
         }
         if self.store.config(sid).control_plane == "python":
             metadata["conversation_log"] = str(self.history_file(sid))
@@ -216,11 +223,7 @@ class Context:
             messages.extend(block["messages"])
         from .retrieval import coding_focus
 
-        focus = (
-            coding_focus(self.store, sid)
-            if self.store.config(sid).control_plane == "direct"
-            else None
-        )
+        focus = coding_focus(self.store, sid)
         if focus:
             messages.append({"role": "user", "content": "Current coding evidence: " + focus})
         return messages
@@ -239,10 +242,26 @@ class Context:
                     content = message.get("content") or encode(message.get("tool_calls", []))
                     pieces.append(f"{message['role']}: {content[:400]}")
                 excerpts.append(f"event={block['event_id']} " + " | ".join(pieces))
+            # Keep unresolved negative evidence before less consequential excerpts.
+            critical = [
+                e
+                for e in excerpts
+                if any(
+                    word in e.lower()
+                    for word in (
+                        "failed",
+                        "error",
+                        "constraint",
+                        "hypothesis",
+                        "regression",
+                        "must not",
+                    )
+                )
+            ]
             additions = "\n".join(excerpts)
             cap = policy.summary_chars
             # Preserve part of the prior digest and the most recent observations.
-            prior = session.summary[: cap // 3] if session.summary else ""
+            prior = (session.summary[: cap // 4] + "\n" + "\n".join(critical)[-cap // 3 :]).strip()
             summary = (
                 summary[:cap]
                 if summary
@@ -257,6 +276,14 @@ class Context:
                     "summary": summary,
                     "method": "model_structured" if provenance else "bounded_extractive",
                     "model_response_event": provenance,
+                    "removed_tokens_estimate": estimate(
+                        removed, self.store.config(sid).provider.model
+                    ),
+                    "summary_tokens_estimate": estimate(
+                        summary, self.store.config(sid).provider.model
+                    ),
+                    "savings_estimate": estimate(removed, self.store.config(sid).provider.model)
+                    - estimate(summary, self.store.config(sid).provider.model),
                 },
             )
             self.store.db.execute(
@@ -272,18 +299,20 @@ class Context:
             self.store.update(sid, context=session.context[count:], summary=summary)
             return eid
 
-    def assemble(self, sid: str, tools: list[dict]) -> tuple[list[dict], int]:
+    def assemble(self, sid: str, tools: list[dict], *, input_budget=None) -> tuple[list[dict], int]:
         config = self.store.config(sid)
         available = config.context.max_tokens - max(
             p.max_output_tokens for p in [config.provider, *config.models.values()]
         )
+        if input_budget is not None:
+            available = min(available, input_budget)
         messages = self.messages(sid)
-        size = token_bound({"messages": messages, "tools": tools})
+        size = token_bound({"messages": messages, "tools": tools}, config.provider.model)
         threshold = int(available * config.context.compact_at)
         while size > threshold and self.store.session(sid).context:
             self.compact(sid)
             messages = self.messages(sid)
-            size = token_bound({"messages": messages, "tools": tools})
+            size = token_bound({"messages": messages, "tools": tools}, config.provider.model)
         if size > available:
             raise HarnessError(
                 "runtime",
@@ -291,4 +320,18 @@ class Context:
                 f"Instructions and tool schemas need {size} token-bound units; "
                 f"only {available} available. Increase context.max_tokens or reduce tools.",
             )
+        self.store.event(
+            sid,
+            "context_estimate",
+            {
+                "estimated_pre_call_tokens": size,
+                **method(config.provider.model),
+                "summary_tokens": estimate(self.store.session(sid).summary, config.provider.model),
+                "evidence_tokens": sum(
+                    estimate(m, config.provider.model)
+                    for m in messages
+                    if (m.get("content") or "").startswith("Current coding evidence:")
+                ),
+            },
+        )
         return messages, size

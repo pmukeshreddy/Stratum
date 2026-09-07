@@ -1,6 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 5
+VERSION = 8
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -70,4 +70,33 @@ def migrate(db, previous, timestamp):
             "status TEXT NOT NULL, result TEXT NOT NULL);"
             "CREATE INDEX refinement_requests_pending ON refinement_requests(session_id,status);"
             f"INSERT INTO schema_migrations VALUES(5,{timestamp}); PRAGMA user_version=5; COMMIT;"
+        )
+    if previous < 6:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE mutation_workspaces(path TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
+            "manifest_artifact TEXT NOT NULL, state_id TEXT NOT NULL);"
+            "CREATE TABLE mutation_windows(id TEXT PRIMARY KEY, workspace TEXT NOT NULL, "
+            "session_id TEXT NOT NULL, action_id TEXT NOT NULL, source_event TEXT NOT NULL, "
+            "before_artifact TEXT NOT NULL, before_owner TEXT NOT NULL, status TEXT NOT NULL);"
+            f"INSERT INTO schema_migrations VALUES(6,{timestamp}); PRAGMA user_version=6; COMMIT;"
+        )
+    if previous < 7:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE code_evidence(workspace TEXT NOT NULL,path TEXT NOT NULL,kind TEXT NOT NULL,"
+            "name TEXT NOT NULL,enclosing TEXT,body TEXT NOT NULL);"
+            "CREATE INDEX code_lookup ON code_evidence(workspace,kind,name);"
+            "CREATE INDEX code_file ON code_evidence(workspace,path);"
+            "CREATE INDEX code_owner ON code_evidence(workspace,kind,enclosing);"
+            f"INSERT INTO schema_migrations VALUES(7,{timestamp}); PRAGMA user_version=7; COMMIT;"
+        )
+    if previous < 8:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "ALTER TABLE code_evidence ADD COLUMN short_name TEXT;"
+            "UPDATE code_evidence SET short_name=CASE WHEN json_valid(body) THEN COALESCE(json_extract(body,'$.short_name'),name) ELSE name END;"
+            "CREATE INDEX code_short_lookup ON code_evidence(workspace,kind,short_name,path);"
+            "CREATE INDEX code_exact_lookup ON code_evidence(workspace,kind,name,path);"
+            f"INSERT INTO schema_migrations VALUES(8,{timestamp}); PRAGMA user_version=8; COMMIT;"
         )

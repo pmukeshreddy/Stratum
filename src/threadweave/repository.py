@@ -12,7 +12,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .change_tracking import ChangeTracker, expand_paths
 from .storage import encode
+from .syntax_index import parse as parse_syntax
 
 EXCLUDED = {
     ".git",
@@ -85,6 +87,9 @@ def digest(data: bytes) -> str:
 
 
 def symbols(text: str, language: str) -> dict:
+    syntax = parse_syntax(text, language)
+    if language != "python" and syntax is not None:
+        return syntax
     found, imports = [], []
     if language == "python":
         try:
@@ -121,7 +126,12 @@ def symbols(text: str, language: str) -> dict:
                     visit(child, prefix)
 
             visit(tree)
-            return {"symbols": found, "imports": imports, "parser": "python_ast"}
+            return {
+                **(syntax or {}),
+                "symbols": (syntax or {}).get("symbols", found),
+                "imports": imports,
+                "parser": "python_ast",
+            }
         except SyntaxError:
             pass  # Broken intermediate edits must remain navigable.
     declaration = re.compile(
@@ -143,6 +153,30 @@ class RepositoryIndex:
     def __init__(self, store, root, *, enhanced=True, allowed=None, forbidden=()):
         self.store, self.root = store, Path(root).resolve()
         self.enhanced, self.allowed, self.forbidden = enhanced, allowed, forbidden
+        self.tracker = None
+        self.initialized = False
+        self.last_changed = []
+
+    def close(self):
+        if self.tracker:
+            self.tracker.close()
+
+    def ensure_current(self):
+        if self.tracker is None:
+            self.tracker = ChangeTracker(self.root)
+        full, candidates = self.tracker.candidates()
+        if full or not self.initialized:
+            self.refresh()
+            self.tracker.reconciled()
+        elif candidates:
+            previous = {
+                r[0]
+                for r in self.store.db.execute(
+                    "SELECT path FROM repository_files WHERE workspace=?", (str(self.root),)
+                )
+            }
+            paths = expand_paths(self.root, candidates, previous)
+            self.refresh(p for p in paths if not set(Path(p).parts) & EXCLUDED)
 
     def paths(self):
         for directory, dirs, files in os.walk(self.root, followlinks=False):
@@ -153,6 +187,8 @@ class RepositoryIndex:
                 path = Path(directory) / name
                 if path.is_symlink():
                     continue
+                if name.startswith(".threadweave-watch-"):
+                    continue
                 rel = path.relative_to(self.root).as_posix()
                 try:
                     confined(self.root, rel, allowed=self.allowed, forbidden=self.forbidden)
@@ -162,10 +198,16 @@ class RepositoryIndex:
                     yield rel
 
     def refresh(self, paths=None):
+        with self.store.transaction():
+            return self._refresh(paths)
+
+    def _refresh(self, paths=None):
         full = paths is None
         paths = list(self.paths()) if full else list(paths)
         changed = []
         for relative in paths:
+            if set(Path(relative).parts) & EXCLUDED:
+                continue
             path = confined(self.root, relative, allowed=self.allowed, forbidden=self.forbidden)
             old = self.store.db.execute(
                 "SELECT * FROM repository_files WHERE workspace=? AND path=?",
@@ -173,23 +215,56 @@ class RepositoryIndex:
             ).fetchone()
             if not path.is_file() or path.is_symlink() or path.stat().st_size > 2_000_000:
                 self.store.db.execute(
+                    "DELETE FROM code_evidence WHERE workspace=? AND path=?",
+                    (str(self.root), relative),
+                )
+                self.store.db.execute(
                     "DELETE FROM repository_files WHERE workspace=? AND path=?",
                     (str(self.root), relative),
                 )
                 continue
             stat = path.stat()
-            if old and old["mtime_ns"] == stat.st_mtime_ns and old["size"] == stat.st_size:
+            try:
+                old_body = json.loads(old["body"]) if old else {}
+                indexed = old and "quality" in old_body
+            except (ValueError, TypeError):
+                indexed = False  # Disposable corrupt index row is rebuilt, not trajectory data.
+            if (
+                full
+                and old
+                and indexed
+                and old["mtime_ns"] == stat.st_mtime_ns
+                and old["size"] == stat.st_size
+                and old_body.get("stat_identity") == [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
+            ):
                 continue
             raw = path.read_bytes()
             if b"\0" in raw:
+                self.store.db.execute(
+                    "DELETE FROM repository_files WHERE workspace=? AND path=?",
+                    (str(self.root), relative),
+                )
+                self.store.db.execute(
+                    "DELETE FROM code_evidence WHERE workspace=? AND path=?",
+                    (str(self.root), relative),
+                )
                 continue
             text = raw.decode(errors="replace")
             language = LANGUAGES.get(path.suffix, "text")
+            if old and indexed and old["sha256"] == digest(raw) and old["language"] == language:
+                old_body["stat_identity"] = [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
+                self.store.db.execute(
+                    "UPDATE repository_files SET mtime_ns=?,size=?,body=? WHERE workspace=? AND path=?",
+                    (stat.st_mtime_ns, stat.st_size, encode(old_body), str(self.root), relative),
+                )
+                continue
             body = (
                 symbols(text, language)
                 if self.enhanced
                 else {"symbols": [], "imports": [], "parser": "disabled"}
             )
+            body.setdefault("quality", "lexical" if self.enhanced else "disabled")
+            body["stat_identity"] = [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
             self.store.db.execute(
                 "INSERT OR REPLACE INTO repository_files VALUES(?,?,?,?,?,?,?)",
                 (
@@ -203,6 +278,27 @@ class RepositoryIndex:
                 ),
             )
             changed.append(relative)
+            self.store.db.execute(
+                "DELETE FROM code_evidence WHERE workspace=? AND path=?", (str(self.root), relative)
+            )
+            for kind in ("symbols", "references", "calls", "imports", "inheritance"):
+                self.store.db.executemany(
+                    "INSERT INTO code_evidence VALUES(?,?,?,?,?,?,?)",
+                    [
+                        (
+                            str(self.root),
+                            relative,
+                            kind,
+                            item.get("name") or item.get("module") or item.get("text", ""),
+                            item.get("enclosing"),
+                            encode(item),
+                            (item.get("short_name") or item.get("name") or item.get("module") or "")
+                            .split(".")[-1]
+                            .split("::")[-1],
+                        )
+                        for item in body.get(kind, [])
+                    ],
+                )
         if full:
             keep = set(paths)
             for row in self.store.db.execute(
@@ -210,13 +306,19 @@ class RepositoryIndex:
             ).fetchall():
                 if row[0] not in keep:
                     self.store.db.execute(
+                        "DELETE FROM code_evidence WHERE workspace=? AND path=?",
+                        (str(self.root), row[0]),
+                    )
+                    self.store.db.execute(
                         "DELETE FROM repository_files WHERE workspace=? AND path=?",
                         (str(self.root), row[0]),
                     )
+        self.initialized = True
+        self.last_changed = changed
         return changed
 
     def entries(self):
-        self.refresh()
+        self.ensure_current()
         return [
             dict(row)
             for row in self.store.db.execute(
@@ -251,16 +353,59 @@ class RepositoryIndex:
         return {"path": path, **json.loads(row[0])}
 
     def symbol_search(self, query, *, limit=100):
-        matches = []
-        for entry in self.entries():
-            for symbol in json.loads(entry["body"])["symbols"]:
-                if query.casefold() in symbol["name"].casefold():
-                    matches.append({"path": entry["path"], **symbol})
+        return self.evidence("symbols", query, limit=limit)
+
+    def evidence(self, kind, query="", *, limit=20, owner=False):
+        self.ensure_current()
+        field = "enclosing" if owner else "name"
+        rows = self.store.db.execute(
+            f"SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND {field}=? ORDER BY path LIMIT ?",
+            (str(self.root), kind, query, min(200, limit)),
+        ).fetchall()
+        if not rows and not owner:
+            rows = self.store.db.execute(
+                "SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND short_name=? ORDER BY path LIMIT ?",
+                (str(self.root), kind, query, min(200, limit)),
+            ).fetchall()
+        if not rows:
+            rows = self.store.db.execute(
+                f"SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND {field} LIKE ? LIMIT ?",
+                (str(self.root), kind, "%" + query + "%", min(200, limit)),
+            ).fetchall()
         return {
-            "matches": matches[:limit],
-            "total": len(matches),
-            "precision": "AST for Python; lexical otherwise",
+            "matches": [
+                {
+                    "path": r["path"],
+                    **json.loads(r["body"]),
+                    "rank_reason": "exact" if r["name"] == query else "name overlap",
+                }
+                for r in rows
+            ],
+            "precision": "syntax-derived; unresolved names may be ambiguous",
         }
+
+    def definition(self, query, *, limit=20):
+        return self.evidence("symbols", query, limit=limit)
+
+    def references(self, query, *, limit=20):
+        return self.evidence("references", query, limit=limit)
+
+    def callers(self, query, *, limit=20):
+        return self.evidence("calls", query, limit=limit)
+
+    def callees(self, query, *, limit=20):
+        return self.evidence("calls", query, limit=limit, owner=True)
+
+    def context_for_symbol(self, query, *, limit=10):
+        return {
+            "definitions": self.definition(query, limit=limit),
+            "callers": self.callers(query, limit=limit),
+            "callees": self.callees(query, limit=limit),
+        }
+
+    def changed_symbols(self):
+        self.ensure_current()
+        return [{"path": p, **s} for p in self.last_changed for s in self.outline(p)["symbols"]]
 
     def search(self, query, *, regex=False, path="*", language=None, context=2, limit=100):
         pattern = re.compile(query if regex else re.escape(query))
@@ -314,24 +459,44 @@ class RepositoryIndex:
         }
 
     def dependencies(self, path):
+        self.ensure_current()
         outline = self.outline(path)
-        modules = {}
-        for row in self.entries():
-            name = str(Path(row["path"]).with_suffix("")).replace("/", ".")
-            modules[name] = row["path"]
         related = []
         for item in outline["imports"]:
             for name in [item.get("module"), *item.get("names", [])]:
                 if name:
+                    normalized = name.strip("\"'<>").replace("::", "/").replace(".", "/")
+                    stem = normalized.split("/")[-1]
                     related.extend(
-                        p
-                        for module, p in modules.items()
-                        if module == name or module.endswith("." + name)
+                        r[0]
+                        for r in self.store.db.execute(
+                            "SELECT path FROM repository_files WHERE workspace=? AND "
+                            "(path LIKE ? OR path LIKE ? OR path=?) LIMIT 30",
+                            (str(self.root), "%/" + stem + ".%", stem + ".%", name),
+                        )
                     )
         return {
             "path": path,
             "imports": outline["imports"],
             "likely_local_modules": sorted(set(related)),
+            "quality": "heuristic module resolution over syntax imports",
+        }
+
+    def dependents(self, path, *, current=True):
+        if current:
+            self.ensure_current()
+        stem = Path(path).stem
+        return {
+            "path": path,
+            "matches": [
+                dict(r)
+                for r in self.store.db.execute(
+                    "SELECT DISTINCT path FROM code_evidence WHERE workspace=? AND kind='imports' "
+                    "AND body LIKE ? LIMIT 100",
+                    (str(self.root), "%" + stem + "%"),
+                )
+            ],
+            "quality": "heuristic import overlap",
         }
 
 
