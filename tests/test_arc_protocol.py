@@ -159,11 +159,12 @@ async def test_terminal_game_rejects_queued_and_future_inference(tmp_path):
     assert gate.peak == 1 and gate.active == 0
 
 
-def test_validation_rejects_scaling_and_missing_policy(tmp_path):
+def test_fixed_policy_preserves_semantics_for_subsets_and_all_games(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(POLICY))
-    assert load_validation(path, 2, 0) == POLICY
-    for limit, seed in ((None, 0), (25, 0), (2, 1)):
+    for limit in (1, 2, 25, None):
+        assert load_validation(path, limit, 0) == POLICY
+    for limit, seed in ((0, 0), (26, 0), (2, 1)):
         with pytest.raises(NotRun):
             load_validation(path, limit, seed)
     path.write_text("{}")

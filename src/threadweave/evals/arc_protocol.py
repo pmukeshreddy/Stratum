@@ -21,8 +21,8 @@ from .schema import NotRun, accounting, digest, save, timestamp
 
 
 def load_validation(path, limit, seed):
-    if not limit or limit > 2 or seed != 0:
-        raise NotRun("Protocol validation requires --limit 1 or 2 and --seed 0")
+    if (limit is not None and not 1 <= limit <= 25) or seed != 0:
+        raise NotRun("Fixed-game policy requires --seed 0 and at most 25 games")
     policy = json.loads(Path(path).read_text())
     for key in ("instructions", "guidance", "continuation_prompt"):
         if not isinstance(policy.get(key), str) or not policy[key].strip():

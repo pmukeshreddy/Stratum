@@ -23,9 +23,11 @@ def arguments(parser):
     parser.add_argument("--games-concurrency", type=positive, default=16)
     parser.add_argument("--inference-concurrency", type=positive, default=16)
     parser.add_argument(
+        "--protocol-policy",
         "--protocol-validation",
+        dest="protocol_validation",
         type=Path,
-        help="External fixed-game policy for a 1–2 game diagnostic validation, not a scaling run",
+        help="Fixed-game policy for a matched subset or all 25 games; no inferred scaling curve",
     )
     parser.add_argument(
         "--check", action="store_true", help="Read-only setup validation; no inference"

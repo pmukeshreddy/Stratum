@@ -37,8 +37,10 @@ Each output directory must be empty. Existing artifacts are preserved. A failed
 setup or invalid execution reports its exact reason; there is no alternate benchmark.
 The full run requires exactly 25 official environments. Subset reports are labeled.
 
-For fixed-game protocol diagnostics, add `--protocol-validation /absolute/policy.json`
-and `--limit 1` or `--limit 2`, with seed zero. The policy supplies `instructions`,
+To retain the fixed-game protocol across subset checks and the full comparison,
+add `--protocol-policy /absolute/policy.json` with seed zero. Use `--limit 2` for
+the small check and omit `--limit` for all 25 games. The earlier
+`--protocol-validation` option remains an alias. The policy supplies `instructions`,
 `guidance`, `continuation_prompt`, `max_continuations`, `max_turns`, `max_tokens`,
 and `wall_seconds`. This mode exposes `observe`, `status`, and `act` through a
 local Python client, limits each game to 500 actions and each batch to 20, and
