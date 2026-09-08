@@ -1,4 +1,10 @@
-"""Fixed-game Python interface. The host owns lifecycle, action limits, and state."""
+"""Fixed-game Python interface. The host owns lifecycle, action limits, and state.
+
+Bootstrap: observe first, then submit one non-RESET action, then a second single
+non-RESET action if still ACTIVE. After bootstrap, act accepts batches of 1..20.
+The host retains this phase across Python invocations; reading this module or
+restarting Python does not reset it. Actions use {"name": "ACTION1", "data": {}}.
+"""
 
 import argparse
 import json
