@@ -587,6 +587,7 @@ class Official:
 
     def finish_profile(self):
         if self.benchmark == "arc-agi-3":
+            raw_card = self.arc.scorecard_manager.get_scorecard(self.card_id, self.arc.arc_api_key)
             card = self.arc.close_scorecard(self.card_id)
             if card is None:
                 raise RuntimeError("Official ARC toolkit returned no final scorecard")
@@ -596,6 +597,9 @@ class Official:
                 "metric": "RHAE (%)",
                 "raw": raw,
                 "scorecard_id": self.card_id,
+                "official_card": raw_card.model_dump(mode="json", exclude={"api_key"})
+                if raw_card
+                else None,
             }
         result = self.research()
         checkpoint = self.output / f"{self.profile}-world-state.json"
@@ -646,6 +650,29 @@ class Official:
             },
         }
 
+    def aggregate_arc(self, cards, task_ids):
+        """Combine disjoint official game cards, then let the SDK score the full set."""
+        from arc_agi.models import EnvironmentInfo
+        from arc_agi.scorecard import EnvironmentScorecard, Scorecard
+
+        merged = {}
+        for card in cards:
+            for game_id, game in card["cards"].items():
+                if game_id in merged:
+                    raise ValueError(f"Duplicate ARC game card: {game_id}")
+                merged[game_id] = game
+        if set(merged) != set(task_ids):
+            raise ValueError("ARC scorecard coverage does not match selected official games")
+        official = Scorecard.model_validate({"card_id": "parallel-evaluation", "cards": merged})
+        scored = EnvironmentScorecard.from_scorecard(
+            official, [EnvironmentInfo.model_validate(info) for info in self.environment_info]
+        )
+        return {
+            "primary_score": scored.score,
+            "metric": "RHAE (%)",
+            "raw": scored.model_dump(mode="json", exclude={"api_key"}),
+        }
+
 
 def main():
     global CURRENT_REQUEST_ID
@@ -665,6 +692,7 @@ def main():
                 "start_task",
                 "action",
                 "finish_profile",
+                "aggregate_arc",
             }:
                 raise ValueError(f"Unknown operation: {operation}")
             with contextlib.redirect_stdout(sys.stderr):

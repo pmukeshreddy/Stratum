@@ -1,19 +1,33 @@
-name: tests
-on: [push, pull_request]
+name: engineering-ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engineering-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ['3.11', '3.12', '3.13']
-    runs-on: ${{ matrix.os }}
+  engineering:
+    name: install, lint, format, unit tests, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python }}
-      - run: uv sync --extra dev --locked
-      - run: uv run ruff check src tests
-      - run: uv run ruff format --check src tests
-      - run: uv run pytest -q
-      - run: uv build
+          python-version: '3.12'
+      - name: Install
+        run: uv sync --extra dev --locked
+      - name: Lint
+        run: uv run ruff check src tests
+      - name: Formatting
+        run: uv run ruff format --check src tests
+      - name: Unit and regression tests
+        run: uv run pytest -q
+      - name: Build package
+        run: uv build

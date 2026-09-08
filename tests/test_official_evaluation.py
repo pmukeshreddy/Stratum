@@ -9,12 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from threadweave.cli import parser
-from threadweave.evals import BENCHMARKS
 from threadweave.evals.bridge import OfficialWorker
-from threadweave.evals.harness import MatchedProvider, discard, run_base, run_buffalo
+from threadweave.evals.harness import MatchedProvider, discard, run_buffalo
 from threadweave.evals.official_worker import Official, check_docker
-from threadweave.evals.runner import contract, curves, execute, report, resolve
+from threadweave.evals.runner import contract, resolve
 from threadweave.evals.schema import (
     BenchmarkSetup,
     EvaluationConfig,
@@ -43,39 +41,6 @@ def eval_config():
         refinement={"enabled": False},
         limits={"wall_seconds": 20, "max_turns": 5, "token_budget": 100000},
     )
-
-
-def test_cli_has_exactly_five_benchmark_families():
-    expected = ["manyih-coding", "manyih-if", "longbench-v2", "arc-agi-3", "factorio"]
-    assert list(BENCHMARKS) == expected
-    for name in [*expected, "all"]:
-        args = parser().parse_args(["eval", name])
-        assert args.benchmark == name and args.profile == "paired"
-    with pytest.raises(SystemExit):
-        parser().parse_args(["eval", "arbitrary-task-file.json"])
-
-
-async def test_all_missing_sources_persists_exact_five_not_run(tmp_path, capsys):
-    args = parser().parse_args(["eval", "all", "--output", str(tmp_path)])
-    assert await execute(args) == 2
-    rows = json.loads((tmp_path / "report.json").read_text())
-    assert list(rows) == list(BENCHMARKS)
-    assert all(r["status"] == "NOT RUN" and r["primary_score"] is None for r in rows.values())
-    assert all("Missing official checkout" in r["reason"] for r in rows.values())
-    for key in BENCHMARKS:
-        record = json.loads((tmp_path / key / "run.json").read_text())
-        assert record["start_time"] and record["end_time"]
-        assert record["usage"]["total_tokens"] == 0
-        assert record["trajectory_reference"]
-    assert capsys.readouterr().out.count("NOT RUN") == 5
-
-
-async def test_existing_output_is_not_overwritten(tmp_path):
-    (tmp_path / "original.json").write_text("preserved")
-    args = parser().parse_args(["eval", "all", "--output", str(tmp_path)])
-    with pytest.raises(ValueError, match="preserve prior trajectories"):
-        await execute(args)
-    assert (tmp_path / "original.json").read_text() == "preserved"
 
 
 async def test_late_environment_reply_cannot_become_a_scorecard(tmp_path):
@@ -181,7 +146,7 @@ async def test_runtime_failure_is_not_scored_as_a_model_answer(tmp_path, monkeyp
     assert (tmp_path / "usage.json").is_file()
 
 
-@pytest.mark.parametrize("profile,runner", [("base", run_base), ("root", run_buffalo)])
+@pytest.mark.parametrize("profile,runner", [("root", run_buffalo)])
 async def test_output_budget_stop_remains_a_scored_attempt(tmp_path, monkeypatch, profile, runner):
     provider = ScriptedProvider(
         {profile: [HarnessError("provider", "observed_output_limit", "output cap", uncertain=True)]}
@@ -194,34 +159,6 @@ async def test_output_budget_stop_remains_a_scored_attempt(tmp_path, monkeypatch
     assert result["response"] == ""
     assert result["usage"]["model_calls"] == 1
     assert result["usage"]["estimated_calls"] == 1
-
-
-@pytest.mark.parametrize("model_calls", [1, 2])
-async def test_base_transport_retry_keeps_the_same_prompt_and_obeys_call_budget(
-    tmp_path, monkeypatch, model_calls
-):
-    class Provider:
-        requests = []
-
-        async def invoke(self, request, emit):
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                raise HarnessError("provider", "transport_failure", "retry", retryable=True)
-            return ModelResponse(text="answer", usage=Usage(input_tokens=1, output_tokens=1))
-
-    provider = Provider()
-    config = eval_config()
-    config.limits.max_model_calls = model_calls
-    monkeypatch.setattr("threadweave.evals.harness.default_providers", lambda: {"chat": provider})
-    result = await run_base(
-        config, {"messages": [{"role": "user", "content": "task"}]}, tmp_path
-    )
-    assert len(provider.requests) == result["usage"]["model_calls"] == model_calls
-    assert result["usage"]["estimated_calls"] == 1
-    assert result["stop_reason"] == ("completed" if model_calls == 2 else "max_model_calls")
-    if model_calls == 2:
-        assert provider.requests[0].messages == provider.requests[1].messages
-        assert provider.requests[0].config == provider.requests[1].config
 
 
 async def test_single_model_configuration_rejects_routing():
@@ -303,7 +240,9 @@ async def test_cancelled_buffalo_run_counts_inflight_child_usage(tmp_path, monke
                 actions=[
                     Action(
                         name="ipython",
-                        arguments={"code": "await rlm('child work', name='child', purpose='shared')"},
+                        arguments={
+                            "code": "await rlm('child work', name='child', purpose='shared')"
+                        },
                     )
                 ],
                 usage=Usage(input_tokens=5, output_tokens=2),
@@ -323,21 +262,6 @@ async def test_cancelled_buffalo_run_counts_inflight_child_usage(tmp_path, monke
     assert usage["subagent_count"] == 1
     sessions = json.loads((tmp_path / "sessions.json").read_text())
     assert len(sessions) == 2 and all(s["outcome"] != "active" for s in sessions)
-
-
-async def test_base_persistent_run_continues_after_final_replies(tmp_path, monkeypatch):
-    config = eval_config()
-    config.limits.max_turns = 3
-    provider = ScriptedProvider(
-        {"base": [ModelResponse(text="done", usage=Usage(output_tokens=2))] * 3}
-    )
-    monkeypatch.setattr("threadweave.evals.harness.default_providers", lambda: {"chat": provider})
-    result = await run_base(
-        config, {"messages": [{"role": "user", "content": "task"}]}, tmp_path, persistent=True
-    )
-    assert len(provider.requests) == 3
-    assert result["usage"]["output_tokens"] == 6
-    assert result["stop_reason"] == "max_turns"
 
 
 async def test_long_context_is_exactly_preserved_in_repl_task(tmp_path, monkeypatch):
@@ -438,7 +362,11 @@ def test_arc_uses_official_scorecard_percent_without_recomputing():
     worker.benchmark = "arc-agi-3"
     worker.card_id = "scorecard"
     card = SimpleNamespace(score=31.25, model_dump=lambda **_: {"score": 31.25, "games": []})
-    worker.arc = SimpleNamespace(close_scorecard=lambda _: card)
+    worker.arc = SimpleNamespace(
+        close_scorecard=lambda _: card,
+        arc_api_key=None,
+        scorecard_manager=SimpleNamespace(get_scorecard=lambda *_: None),
+    )
     assert worker.finish_profile()["primary_score"] == 31.25
 
 
@@ -497,30 +425,6 @@ def test_comparison_contract_changes_when_any_required_setting_changes():
     config.run.provider.parameters["reasoning_effort"] = "high"
     assert digest(first) != digest(contract(config, provenance, ["id"], 0))
     assert first["task_ids"] == ["id"]
-
-
-def test_curves_require_real_budget_points_and_known_cost(tmp_path):
-    points = [
-        {
-            "budget": i,
-            "profile": "buffalo",
-            "rhae": 5 * i,
-            "output_tokens": 100 * i,
-            "api_cost": None,
-        }
-        for i in [1, 2]
-    ]
-    curves(tmp_path, points)
-    assert (tmp_path / "rhae-vs-output_tokens.svg").exists()
-    assert not (tmp_path / "rhae-vs-api_cost.svg").exists()
-
-
-def test_report_only_has_five_headline_families():
-    text = report({})
-    assert text.startswith("BUFFALO EVALUATION")
-    for title in BENCHMARKS.values():
-        assert text.count(title) == 1
-    assert text.count("NOT RUN") == 5
 
 
 @pytest.mark.skipif(

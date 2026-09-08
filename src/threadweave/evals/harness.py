@@ -1,12 +1,9 @@
-"""Same provider contract and budgets; direct chat baseline versus production Runtime."""
+"""Matched model requests and the production Buffalo Runtime; no custom BASE agent."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import signal
-import sys
 import time
 import traceback
 from pathlib import Path
@@ -27,13 +24,10 @@ class EnvironmentAction(Record):
     code: str | None = None
 
 
-class PythonAction(Record):
-    code: str
-
-
 class MatchedProvider:
-    def __init__(self, provider, config, log):
+    def __init__(self, provider, config, log, gate=None, owner=None):
         self.provider, self.config, self.log = provider, config, Path(log)
+        self.gate, self.owner = gate, owner
 
     async def resolve(self, config):
         resolved, details = await self.provider.resolve(config)
@@ -46,6 +40,19 @@ class MatchedProvider:
         return resolved, details
 
     async def invoke(self, request, emit):
+        if self.gate is None:
+            return await self._invoke(request, emit)
+        async with self.gate.permit(self.owner):
+            try:
+                result = await self._invoke(request, emit)
+            except HarnessError as exc:
+                if exc.failure.retryable and exc.failure.code != "observed_output_limit":
+                    await self.gate.outcome(unstable=True)
+                raise
+            await self.gate.outcome()
+            return result
+
+    async def _invoke(self, request, emit):
         if request.config.model_dump() != self.config.model_dump():
             raise HarnessError(
                 "provider",
@@ -147,253 +154,16 @@ async def invoke_judge(config, request, directory, usages):
     return response.text
 
 
-async def scratch(code, workspace, seconds):
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        code,
-        cwd=workspace,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-        env={
-            key: value
-            for key, value in os.environ.items()
-            if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}
-        },
-    )
-    try:
-        out, err = await asyncio.wait_for(process.communicate(), seconds)
-    except BaseException:
-        if process.returncode is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await process.wait()
-        raise
-    return {
-        "stdout": out.decode(errors="replace"),
-        "stderr": err.decode(errors="replace"),
-        "returncode": process.returncode,
-    }
-
-
-async def run_base(config, task, directory, *, action=None, persistent=False, long_context=False):
-    """Conventional full-history chat/tool loop, with fresh Python per call.
-
-    The persistent external world is shared across steps; only Buffalo has its REPL,
-    context compaction/retrieval, durable session state, and recursive agents.
-    """
-    directory = Path(directory)
-    workspace = directory / "workspace"
-    workspace.mkdir(parents=True)
-    messages = json.loads(json.dumps(task["messages"]))
-    if long_context:
-        (workspace / "task.txt").write_text(messages[-1]["content"])
-        if (
-            estimate(messages, config.provider.model) + config.provider.max_output_tokens
-            > config.context.max_tokens
-        ):
-            messages = [
-                {
-                    "role": "user",
-                    "content": "The complete official task is in task.txt. Read and reason over it with python; "
-                    "return the final answer in the task's requested format.",
-                }
-            ]
-    tools = [
-        Tool(
-            "python",
-            "Run Python in a fresh process in the task workspace. Files persist.",
-            PythonAction,
-            None,
-        ).schema()
-    ]
-    if action:
-        tools.append(
-            Tool(
-                "benchmark_action",
-                "Interact with the persistent official environment.",
-                EnvironmentAction,
-                None,
-            ).schema()
-        )
-    provider = MatchedProvider(
-        default_providers()[config.provider.name],
-        config.provider,
-        directory / "provider-calls.jsonl",
-    )
-    usages, response_text, tool_count, python_count = [], "", 0, 0
-    started, begin = timestamp(), time.monotonic()
-    reason = "max_turns"
-    try:
-        async with asyncio.timeout(config.limits.wall_seconds):
-            for turn in range(min(config.limits.max_turns, config.limits.max_model_calls)):
-                totals = accounting(usages, time.monotonic() - begin)
-                bound = estimate({"messages": messages, "tools": tools}, config.provider.model)
-                if bound + config.provider.max_output_tokens > config.context.max_tokens:
-                    reason = "context_capacity"
-                    break
-                if (
-                    totals["total_tokens"] + bound + config.provider.max_output_tokens
-                    > config.limits.token_budget
-                ):
-                    reason = "token_budget"
-                    break
-                reserve_cost = (
-                    bound * (config.provider.input_cost_per_million or 0)
-                    + config.provider.max_output_tokens
-                    * (config.provider.output_cost_per_million or 0)
-                ) / 1e6
-                if (
-                    config.limits.cost_budget is not None
-                    and (totals["api_cost"] or 0) + reserve_cost > config.limits.cost_budget
-                ):
-                    reason = "cost_budget"
-                    break
-                for attempt in range(3):
-                    attempted = accounting(usages, time.monotonic() - begin)
-                    exhausted = (
-                        "max_model_calls"
-                        if attempted["model_calls"] >= config.limits.max_model_calls
-                        else "token_budget"
-                        if attempted["total_tokens"] + bound + config.provider.max_output_tokens
-                        > config.limits.token_budget
-                        else None
-                    )
-                    if exhausted:
-                        return _base_result(
-                            directory, usages, begin, started, response_text, exhausted, messages
-                        )
-                    try:
-                        response = await provider.invoke(
-                            ModelRequest(
-                                session_id="base",
-                                root_id="base",
-                                parent_id=None,
-                                name="base",
-                                turn=turn,
-                                messages=messages,
-                                tools=tools,
-                                config=config.provider,
-                                input_token_bound=bound,
-                            ),
-                            discard,
-                        )
-                        break
-                    except BaseException as exc:
-                        usages.append(
-                            Usage(
-                                input_tokens=bound,
-                                output_tokens=config.provider.max_output_tokens,
-                                model_calls=1,
-                                estimated_calls=1,
-                                cost=None,
-                            )
-                        )
-                        retryable = (isinstance(exc, HarnessError) and exc.failure.retryable) or (
-                            isinstance(exc, PermissionError) and exc.errno == 1
-                        )
-                        if not retryable or attempt == 2:
-                            raise
-                        await asyncio.sleep(2**attempt)
-                usage = response.usage.model_copy(deep=True)
-                usage.model_calls += 1
-                usage.estimated_calls += int(not response.usage_reported)
-                usages.append(usage)
-                response_text = response.text
-                message = {"role": "assistant", "content": response.text}
-                if response.actions:
-                    message["tool_calls"] = [
-                        {
-                            "id": a.id,
-                            "type": "function",
-                            "function": {"name": a.name, "arguments": json.dumps(a.arguments)},
-                        }
-                        for a in response.actions
-                    ]
-                messages.append(message)
-                if not response.actions:
-                    if persistent:
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": "Continue advancing factory research within the remaining run budget.",
-                            }
-                        )
-                        continue
-                    reason = "completed"
-                    break
-                for call in response.actions:
-                    if tool_count >= config.limits.max_tool_calls:
-                        reason = "max_tool_calls"
-                        return _base_result(
-                            directory, usages, begin, started, response_text, reason, messages
-                        )
-                    tool_count += 1
-                    try:
-                        if call.name == "benchmark_action" and action:
-                            result = await action(
-                                **EnvironmentAction.model_validate(call.arguments).model_dump()
-                            )
-                        elif call.name == "python":
-                            if python_count >= config.limits.max_python_executions:
-                                reason = "max_python_executions"
-                                return _base_result(
-                                    directory,
-                                    usages,
-                                    begin,
-                                    started,
-                                    response_text,
-                                    reason,
-                                    messages,
-                                )
-                            python_count += 1
-                            result = await scratch(
-                                PythonAction.model_validate(call.arguments).code,
-                                workspace,
-                                config.limits.python_timeout_seconds,
-                            )
-                        else:
-                            result = {"error": "Unknown tool"}
-                    except NotRun:
-                        raise
-                    except Exception as exc:
-                        result = {"error": f"{type(exc).__name__}: {exc}"}
-                    save(directory / f"tool-{tool_count}.json", result)
-                    messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)}
-                    )
-                save(directory / "messages.json", messages)
-    except HarnessError as exc:
-        if exc.failure.code != "observed_output_limit":
-            raise
-        reason = "observed_output_limit"
-    except TimeoutError:
-        reason = "wall_seconds"
-    finally:
-        save(directory / "usage.json", accounting(usages, time.monotonic() - begin))
-    return _base_result(directory, usages, begin, started, response_text, reason, messages)
-
-
-def _base_result(directory, usages, begin, started, response, reason, messages):
-    save(directory / "messages.json", messages)
-    if not usages and reason in {"context_capacity", "token_budget", "cost_budget"}:
-        raise NotRun(f"Configured {reason} prevents even one model invocation")
-    return {
-        "response": response if reason == "completed" else "",
-        "last_response": response,
-        "stop_reason": reason,
-        "start_time": started,
-        "end_time": timestamp(),
-        "usage": accounting(usages, time.monotonic() - begin),
-        "trajectory_reference": str(directory.resolve()),
-    }
-
-
 async def run_buffalo(
-    config, task, directory, *, action=None, persistent=False, long_context=False
+    config,
+    task,
+    directory,
+    *,
+    action=None,
+    persistent=False,
+    long_context=False,
+    gate=None,
+    owner=None,
 ):
     directory = Path(directory)
     workspace = directory / "workspace"
@@ -422,6 +192,8 @@ async def run_buffalo(
         default_providers()[resolved.provider.name],
         resolved.provider,
         directory / "provider-calls.jsonl",
+        gate=gate,
+        owner=owner,
     )
     runtime = Runtime(
         directory / "state",
@@ -515,6 +287,9 @@ async def run_buffalo(
             )
             save(
                 directory / "sessions.json",
-                [s.model_dump(mode="json") for s in runtime.store.sessions(root_id=session.root_id)],
+                [
+                    s.model_dump(mode="json")
+                    for s in runtime.store.sessions(root_id=session.root_id)
+                ],
             )
         await runtime.shutdown()
