@@ -290,7 +290,7 @@ class EvidenceProvider:
             await self.gate[1].wait()
         if self.invalid:
             return ModelResponse(text="not json")
-        evidence = json.loads(request.messages[-1]["content"])
+        evidence = json.loads(request.messages[-1]["content"])["evidence"]
         return ModelResponse(
             text=json.dumps(
                 {

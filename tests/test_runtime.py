@@ -252,7 +252,8 @@ async def test_verifier_failure_is_not_a_task_failure_and_completion_gate(
     assert runtime.store.usage(root.id).retries == 1
     failure = runtime.store.events(root.id, kind="failure")[0]
     assert failure["payload"]["category"] == "verifier"
-    assert "x" * 5000 not in str(provider.requests[-1].messages)
+    assert "x" * 5000 in str(provider.requests[-1].messages)
+    assert "x" * 100000 not in str(provider.requests[-1].messages)
 
 
 async def test_refinement_applied_at_next_turn_then_skill_executes(runtime, tmp_path, config):

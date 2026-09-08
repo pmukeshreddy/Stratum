@@ -32,7 +32,7 @@ async def test_process_tool_retains_large_output_and_command_verifier(runtime, t
     assert result.outcome == Outcome.COMPLETED
     tool_event = runtime.store.events(root.id, kind="tool_result")[0]
     raw = runtime.artifacts.load(root.id, tool_event["payload"]["result"]["artifact_id"])
-    assert len(raw["stdout"]) == 4000
+    assert len(raw["stdout"]) == 65536
     full = runtime.artifacts.load(root.id, raw["stdout_artifact"])
     assert len(full) == 100001
     assert runtime.store.usage(root.id).verifier_calls == 1
@@ -74,9 +74,12 @@ async def test_artifact_retention_explicit_selection_and_tree_permissions(runtim
     root = runtime.create("Root", tmp_path)
     child = runtime.spawn(root.id, "Child")
     other = runtime.create("Unrelated", tmp_path)
-    value = {"records": list(range(10000))}
+    value = {"records": list(range(100000))}
     exposed = runtime.artifacts.expose(root.id, value)
-    assert exposed["truncated"] and len(exposed["preview"]) <= 1800
+    assert (
+        exposed["truncated"]
+        and len(exposed["preview"]) <= runtime.store.config(root.id).context.result_chars
+    )
     assert runtime.artifacts.load(child.id, exposed["artifact_id"]) == value
     assert runtime.store.session(root.id).context == []
     with pytest.raises(PermissionError):

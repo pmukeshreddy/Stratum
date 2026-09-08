@@ -373,7 +373,7 @@ async def test_executor_artifacts_env_timeout_and_process_group_cancellation(
                 "import os; assert 'OPENAI_API_KEY' not in os.environ; print('x'*100000)",
             ],
         )
-        assert result["passed"] and len(result["stdout"]) == 4000
+        assert result["passed"] and len(result["stdout"]) == 65536
         assert len(runtime.artifacts.load(session.id, result["stdout_artifact"])) == 100001
         timeout = await LocalExecutor().run(
             context, [sys.executable, "-c", "import time; time.sleep(60)"], timeout_seconds=0.1

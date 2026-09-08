@@ -46,7 +46,7 @@ class MatchedProvider:
             try:
                 result = await self._invoke(request, emit)
             except HarnessError as exc:
-                if exc.failure.retryable and exc.failure.code != "observed_output_limit":
+                if exc.failure.retryable:
                     await self.gate.outcome(unstable=True)
                 raise
             await self.gate.outcome()
@@ -81,7 +81,7 @@ class MatchedProvider:
                         "session_id": request.session_id,
                         "root_id": request.root_id,
                         "parent_id": request.parent_id,
-                        "request": request.model_dump(mode="json"),
+                        "request": request.public_dump(),
                         "response": response.model_dump(mode="json"),
                     }
                 )
@@ -266,10 +266,7 @@ async def run_buffalo(
             [s.model_dump(mode="json") for s in runtime.store.sessions(root_id=session.root_id)],
         )
         if session.outcome == "failed" and session.last_error:
-            if session.last_error.code == "observed_output_limit":
-                result["stop_reason"] = "observed_output_limit"
-            else:
-                raise NotRun(f"{session.last_error.code}: {session.last_error.message}")
+            raise NotRun(f"{session.last_error.code}: {session.last_error.message}")
         if not usage.model_calls:
             raise NotRun(f"Buffalo could not invoke the model: {session.result or session.outcome}")
         return result

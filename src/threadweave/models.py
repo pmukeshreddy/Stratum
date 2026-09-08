@@ -91,7 +91,7 @@ class ContextPolicy(Record):
     compact_at: float = Field(default=0.8, gt=0.1, lt=1)
     recent_blocks: int = Field(default=6, ge=1)
     summary_chars: int = Field(default=3000, ge=256)
-    result_chars: int = Field(default=1800, ge=128)
+    result_chars: int = Field(default=131072, ge=128)
     supplemental_chars: int = Field(default=3000, ge=0)
     embedding_model: str | None = None
     embedding_cache: str | None = None
@@ -143,7 +143,7 @@ class ExecutionConfig(Record):
     )
     environment: dict[str, str] = Field(default_factory=dict)
     command_allowlist: list[str] | None = None
-    output_chars: int = Field(default=4000, ge=256, le=16000)
+    output_chars: int = Field(default=65536, ge=256, le=65536)
     memory: str = "2g"
     cpus: float = Field(default=2, gt=0)
 
@@ -338,6 +338,7 @@ class Session(Record):
     context: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
     selected_state: list[str] = Field(default_factory=list)
+    repository_instructions: list[dict[str, Any]] = Field(default_factory=list)
     pending_turn: dict[str, Any] | None = None
     wake_at: float | None = None
     created_at: float
@@ -383,6 +384,9 @@ class ModelRequest(Record):
     input_token_bound: int
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    def public_dump(self):
+        return self.model_dump(mode="json", exclude={"messages": {"__all__": {"provider_items"}}})
+
 
 class ModelResponse(Record):
     text: str = ""
@@ -391,6 +395,8 @@ class ModelResponse(Record):
     usage_reported: bool = True
     provider_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Provider-native continuation is private persistence, never a user-facing event.
+    provider_items: list[dict[str, Any]] = Field(default_factory=list, exclude=True, repr=False)
 
 
 class Verification(Record):

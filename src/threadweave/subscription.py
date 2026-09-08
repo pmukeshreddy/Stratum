@@ -18,10 +18,15 @@ from .models import Action, HarnessError, ModelResponse, Usage
 from .native_client import CODEX_REVISION, client_path
 
 
-def responses_input(messages):
+def responses_input(messages, *, provider=None):
     instructions, items = [], []
     for message in messages:
         role, content = message["role"], message.get("content")
+        if message.get("provider_items") and (
+            provider is None or message.get("provider_identity") == provider
+        ):
+            items.extend(message["provider_items"])
+            continue
         if role == "system":
             instructions.append(content or "")
         elif role == "tool":
@@ -108,7 +113,9 @@ class SubscriptionProvider:
                 "CLIENT_NOT_INSTALLED",
                 "Run threadweave auth install-client to build the official Codex inference client",
             )
-        instructions, items = responses_input(request.messages)
+        instructions, items = responses_input(
+            request.messages, provider=[config.name, config.model]
+        )
         body = {
             "model": config.model,
             "instructions": instructions,
@@ -118,6 +125,7 @@ class SubscriptionProvider:
             "parallel_tool_calls": config.parameters.get("parallel_tool_calls", True),
             "stream": True,
             "store": False,
+            "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": request.session_id,
             "reasoning": {
                 "effort": config.parameters["reasoning_effort"],
@@ -187,17 +195,16 @@ class SubscriptionProvider:
 
     @staticmethod
     async def collect(lines, request, config, emit):
-        text, actions, summaries, limits = [], [], [], []
+        text, actions, summaries, limits, items = [], [], [], [], []
         metadata = {
             "transport": "official_codex_responses_client",
             "client_revision": CODEX_REVISION,
             "model": config.model,
             "parameters": config.parameters,
             "billing": "subscription",
-            "output_limit": "client_observed_bytes_only; server token cap unavailable",
+            "output_limit": "provider model token limit; cumulative runtime token budget",
             "auth_refreshes": 0,
         }
-        observed_bytes = 0
         allowed = {tool["function"]["name"] for tool in request.tools}
         try:
             async for line in lines:
@@ -205,14 +212,6 @@ class SubscriptionProvider:
                 kind = event.get("type")
                 if kind in ("text_delta", "tool_delta", "reasoning_summary"):
                     delta = event.get("text", event.get("delta", ""))
-                    observed_bytes += len(delta.encode("utf-8"))
-                    if observed_bytes > config.max_output_tokens * 4:
-                        raise HarnessError(
-                            "provider",
-                            "observed_output_limit",
-                            "Client-observed output byte limit reached (server token limit unavailable)",
-                            uncertain=True,
-                        )
                     if kind == "text_delta":
                         text.append(delta)
                         if config.streaming:
@@ -221,6 +220,8 @@ class SubscriptionProvider:
                         summaries.append(delta)
                 elif kind == "item":
                     item = event["item"]
+                    if item.get("type") in {"reasoning", "message", "function_call"}:
+                        items.append(item)
                     if item.get("type") == "function_call":
                         if item["name"] not in allowed:
                             raise ValueError("Unregistered tool returned by model")
@@ -277,6 +278,7 @@ class SubscriptionProvider:
                         usage=usage,
                         usage_reported=bool(raw),
                         provider_id=event.get("id"),
+                        provider_items=items,
                         metadata=metadata,
                     )
         except (ValueError, KeyError, TypeError) as exc:

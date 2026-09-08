@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -17,6 +18,18 @@ from .harness import run_buffalo
 from .inference_gate import InferenceGate
 from .runner import contract, load, resolve, source_identity
 from .schema import NotRun, accounting, digest, file_digest, save, timestamp
+
+
+def infrastructure_failure(exc):
+    if isinstance(exc, (OSError, TimeoutError)):
+        return True
+    return bool(
+        re.search(
+            r"transport|connection|http_429|http_5\d\d|os_permission_retry|worker exited|toolkit.*(?:failed|no |could not)|app-server exited|timed out|stream.*(?:interrupt|disconnect)|servererror|toomanyrequests",
+            str(exc),
+            re.IGNORECASE,
+        )
+    )
 
 
 def report(row):
@@ -154,7 +167,7 @@ async def execute_arc(args):
                 game_begin = time.monotonic()
                 try:
                     await worker.start()
-                    await worker.call("start_profile", profile=profile, seed=args.seed)
+                    card = await worker.call("start_profile", profile=profile, seed=args.seed)
                     task = await worker.call("start_task", task_id=task_id)
                     raw_hash = digest(task)
                     if task_id in initial_hashes and initial_hashes[task_id] != raw_hash:
@@ -167,6 +180,8 @@ async def execute_arc(args):
                             "input_sha256": raw_hash,
                             "comparison_contract_sha256": digest(shared),
                             "worker_pid": worker.process.pid,
+                            "scorecard_id": card["scorecard_id"],
+                            "workspace": str(directory / "workspace"),
                             "recording_directory": str(
                                 directory / "official" / profile / "recordings"
                             ),
@@ -178,28 +193,56 @@ async def execute_arc(args):
                     )
                     save(directory / "task-input.json", task)
                     action_count = 0
+                    action_lock = asyncio.Lock()
+                    last_observation = await worker.call("arc_observation")
+                    integrity_errors = []
 
                     async def action(**kwargs):
-                        nonlocal action_count
-                        action_count += 1
-                        if action_count > config.run.limits.max_tool_calls:
-                            return {"error": "Shared game action budget exhausted"}
-                        return await worker.call("action", **kwargs)
+                        nonlocal action_count, last_observation
+                        async with action_lock:
+                            # Another worker must never mutate this worker's observation.
+                            if digest(await worker.call("arc_observation")) != digest(
+                                last_observation
+                            ):
+                                integrity_errors.append(
+                                    "Worker observation changed without an action"
+                                )
+                                raise NotRun(
+                                    "Isolated worker changed without an action; comparison invalid"
+                                )
+                            if action_count >= config.run.limits.max_tool_calls:
+                                return {"error": "Shared game action budget exhausted"}
+                            action_count += 1
+                            result = await worker.call("action", **kwargs)
+                            last_observation = await worker.call("arc_observation")
+                            return result
 
                     runner = run_codex if profile == "codex" else run_buffalo
                     agent = await runner(
                         config.run, task, directory, action=action, gate=gate, owner=owner
                     )
                     result.update(agent)
+                    if integrity_errors:
+                        raise NotRun("; ".join(integrity_errors))
                     final = await worker.call("finish_profile")
                     save(directory / "official-scorecard.json", final.pop("raw"))
                     save(directory / "official-card.json", final.pop("official_card"))
-                    result.update(final, status="COMPLETED", actions=action_count)
+                    result.update(
+                        final,
+                        status="COMPLETED",
+                        actions=action_count,
+                        isolation_verified=True,
+                        input_sha256=raw_hash,
+                    )
                 except asyncio.CancelledError:
                     result.update(status="CANCELLED", reason="Evaluation stopped")
                     raise
                 except Exception as exc:
-                    result.update(status="FAILED", reason=f"{type(exc).__name__}: {exc}")
+                    result.update(
+                        status="FAILED",
+                        reason=f"{type(exc).__name__}: {exc}",
+                        infrastructure_invalidated=infrastructure_failure(exc),
+                    )
                     with contextlib.suppress(Exception):
                         save(
                             directory / "unscored-official-output.json",
@@ -246,26 +289,55 @@ async def execute_arc(args):
             asyncio.create_task(game(i, tid, p)) for i, tid in enumerate(task_ids) for p in profiles
         }
         await asyncio.gather(*jobs)
-        # Retry infrastructure-invalidated games as matched pairs, independent of scores.
-        for i, task_id in enumerate(task_ids):
-            failed = [
-                results[(task_id, p)]
-                for p in profiles
-                if results[(task_id, p)]["status"] != "COMPLETED"
-            ]
-            if not failed:
-                continue
-            row["retries"].append(
-                {"task_id": task_id, "reasons": [f.get("reason") for f in failed]}
-            )
-            previous = {p: results[(task_id, p)] for p in profiles}
-            await asyncio.gather(*(game(i, task_id, p, attempt=2) for p in profiles))
-            for p in profiles:
-                results[(task_id, p)]["prior_attempt_usage"] = previous[p]["usage"]
+        # Retry only invalid attempts, never a completed low score or a healthy counterpart.
+        for attempt in (2, 3):
+            retry_jobs = []
+            for i, task_id in enumerate(task_ids):
+                for profile in profiles:
+                    previous = results[(task_id, profile)]
+                    if previous["status"] != "FAILED" or not previous.get(
+                        "infrastructure_invalidated"
+                    ):
+                        continue
+                    row["retries"].append(
+                        {
+                            "task_id": task_id,
+                            "profile": profile,
+                            "attempt": attempt,
+                            "reason": previous.get("reason"),
+                        }
+                    )
+
+                    async def retry(
+                        i=i, task_id=task_id, profile=profile, previous=previous, attempt=attempt
+                    ):
+                        await game(i, task_id, profile, attempt=attempt)
+                        current = results[(task_id, profile)]
+                        current["failed_attempts"] = [
+                            *previous.get("failed_attempts", []),
+                            {
+                                "attempt": previous["attempt"],
+                                "reason": previous.get("reason"),
+                                "usage": previous["usage"],
+                                "trajectory_reference": previous["trajectory_reference"],
+                            },
+                        ]
+                        save(Path(current["trajectory_reference"]) / "result.json", current)
+
+                    retry_jobs.append(asyncio.create_task(retry()))
+            if not retry_jobs:
+                break
+            jobs = set(retry_jobs)
+            await asyncio.gather(*jobs)
         for profile in profiles:
             selected = [results[(tid, profile)] for tid in task_ids]
             failures = [s for s in selected if s["status"] != "COMPLETED"]
-            usage = accounting([s["usage"] for s in selected], time.monotonic() - begin)
+            from datetime import datetime
+
+            elapsed = max(
+                datetime.fromisoformat(s["end_time"]).timestamp() for s in selected
+            ) - min(datetime.fromisoformat(s["start_time"]).timestamp() for s in selected)
+            usage = accounting([s["usage"] for s in selected], elapsed)
             value = {
                 "status": "FAILED" if failures else "COMPLETED",
                 "task_count": len(selected) - len(failures),
@@ -283,11 +355,15 @@ async def execute_arc(args):
                 raw = root / profile / "official-scorecard.json"
                 save(raw, summary.pop("raw"))
                 value.update(summary, raw_evaluator_output=str(raw))
-            overhead = [s["prior_attempt_usage"] for s in selected if "prior_attempt_usage" in s]
+            overhead = [
+                attempt["usage"] for s in selected for attempt in s.get("failed_attempts", [])
+            ]
             if overhead:
-                value["prior_attempt_usage"] = accounting(
+                value["failed_attempt_usage"] = accounting(
                     overhead, sum(u["wall_seconds"] for u in overhead)
                 )
+            value["all_attempt_usage"] = accounting([usage, *overhead], elapsed)
+            value["summed_game_wall_seconds"] = sum(s["usage"]["wall_seconds"] for s in selected)
             row["profiles"][profile] = value
         row["status"] = (
             "COMPLETED"
@@ -301,11 +377,21 @@ async def execute_arc(args):
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         raise
+    except Exception as exc:
+        row.update(status="FAILED", reason=f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         await gate.close()
         await probe.close()
         row.update(end_time=timestamp(), concurrency=gate.summary())
-        row["usage"] = accounting([v["usage"] for v in results.values()], time.monotonic() - begin)
+        row["usage"] = accounting(
+            [
+                u
+                for v in results.values()
+                for u in [v["usage"], *[a["usage"] for a in v.get("failed_attempts", [])]]
+            ],
+            time.monotonic() - begin,
+        )
         save(root / "run.json", row)
         (root / "report.txt").write_text(report(row))
         print(report(row), flush=True)

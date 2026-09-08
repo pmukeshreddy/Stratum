@@ -57,7 +57,7 @@ def chat_config(workspace, explicit=None):
     else:
         config = RunConfig(
             task={"adapter": "workspace"},
-            context={"max_tokens": 96000, "result_chars": 2400, "summary_chars": 6000},
+            context={"max_tokens": 96000, "result_chars": 131072, "summary_chars": 6000},
             limits={"token_budget": 3_000_000, "wall_seconds": 7200},
             permissions=[
                 "workspace.read",

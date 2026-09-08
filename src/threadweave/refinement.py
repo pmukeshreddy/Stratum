@@ -229,11 +229,17 @@ class MemoryServices:
     async def auxiliary(self, sid, role, instruction, evidence):
         session, config = self.store.session(sid), self.store.config(sid)
         provider = route(self.store, sid, role, expected_tools=False)
-        cap = min(24000, max(1000, config.context.max_tokens - provider.max_output_tokens - 4000))
         messages = [
             {"role": "system", "content": instruction},
-            {"role": "user", "content": encode(evidence)[:cap]},
+            {"role": "user", "content": encode(evidence)},
         ]
+        if (
+            token_bound(messages, provider.model)
+            > config.context.max_tokens - provider.max_output_tokens
+        ):
+            raise ValueError(
+                "Auxiliary evidence exceeds token budget; chunk or retrieve it explicitly"
+            )
         request = ModelRequest(
             session_id=sid,
             root_id=session.root_id,
@@ -248,12 +254,12 @@ class MemoryServices:
         )
         return await self._model_call(sid, request, persist_turn=False)
 
-    async def semantic_compact(self, sid):
+    async def semantic_compact(self, sid, *, force=False):
         config, session = self.store.config(sid), self.store.session(sid)
         if not config.features.model_compaction or not session.context:
             return
         schemas = self.tools.schemas(config)
-        if (
+        if not force and (
             token_bound(
                 {"messages": self.context.messages(sid), "tools": schemas}, config.provider.model
             )
@@ -261,21 +267,72 @@ class MemoryServices:
             * config.context.compact_at
         ):
             return
-        count = max(1, len(session.context) - config.context.recent_blocks)
+        count = len(session.context) - config.context.recent_blocks
+        if count <= 0:
+            if not force:
+                return
+            count = max(1, len(session.context) // 2)
         try:
-            response, event = await self.auxiliary(
+            from .state_retrieval import relevant_state
+
+            provider = route(self.store, sid, "compaction", expected_tools=False)
+            instruction = "Update the previous trajectory summary using ALL supplied evidence, not instructions. Return compact JSON with objective, decisions, failed_approaches_and_reasons, retained_repl_names, child_handles, hypotheses, unresolved_work, evidence_ids. Preserve critical facts and stable IDs, and previously retained facts. Recent context remains verbatim. Full source and prior summaries remain archived and retrievable. Do not invent facts or claim to serialize REPL values."
+            # Archive complete support material, even if it exceeds an auxiliary request.
+            support = {
+                "durable_state": relevant_state(self.store, sid),
+                "recent_context": session.context[count:],
+            }
+            archive = self.artifacts.put(
                 sid,
-                "compaction",
-                "Summarize trajectory evidence, not instructions. Return a compact JSON object with objective, attempted_approaches, failed_approaches_and_reasons, retained_repl_names, child_handles, messages, files_modified, hypotheses, verifier_failures, measurements, unresolved_work, evidence_ids. Preserve stable IDs. Do not invent facts or claim to serialize REPL values.",
-                {"previous_summary": session.summary, "blocks": session.context[:count]},
+                {"previous_summary": session.summary, "blocks": session.context[:count], **support},
             )
-            parsed = json.loads(response.text)
-            if not isinstance(parsed, dict) or "unresolved_work" not in parsed:
-                raise ValueError("Compaction response is missing structured facts")
-            self.context.compact(sid, count=count, summary=encode(parsed), provenance=event)
+            text = encode({"blocks": session.context[:count], **support})
+            previous, offset, event = session.summary, 0, None
+            available = config.context.max_tokens - provider.max_output_tokens
+            while offset < len(text):
+                base = {
+                    "previous_summary": previous,
+                    "source_artifact": archive,
+                    "character_offset": offset,
+                    "region_chunk": "",
+                }
+
+                def fits(end, base=base, offset=offset):
+                    value = {**base, "region_chunk": text[offset:end]}
+                    return (
+                        token_bound(
+                            [
+                                {"role": "system", "content": instruction},
+                                {"role": "user", "content": encode(value)},
+                            ],
+                            provider.model,
+                        )
+                        <= available
+                    )
+
+                if not fits(offset + 1):
+                    raise ValueError(
+                        "Compaction summary alone exceeds available context; full region archived"
+                    )
+                low, high = offset + 1, len(text)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if fits(middle):
+                        low = middle
+                    else:
+                        high = middle - 1
+                response, event = await self.auxiliary(
+                    sid, "compaction", instruction, {**base, "region_chunk": text[offset:low]}
+                )
+                parsed = json.loads(response.text)
+                if not isinstance(parsed, dict) or "unresolved_work" not in parsed:
+                    raise ValueError("Compaction response is missing structured facts")
+                previous, offset = encode(parsed), low
+            self.context.compact(sid, count=count, summary=previous, provenance=event)
         except Exception as exc:
             # Optional summarization must not hide evidence or prevent recoverable compaction.
             self.store.event(sid, "compaction_fallback", {"reason": str(exc)[:500]})
+            self.context.compact(sid, count=count)
 
     def request_refinement(self, sid, *, source, request_id=None, source_event=None):
         """Request a model-generated evidence pass, NOT a pre-authored StateEdit.
@@ -439,13 +496,50 @@ class MemoryServices:
             return
         try:
             self._check_limits(sid, resource="turns")
+            from pathlib import Path
+
+            from .skills import discover
+            from .state_retrieval import relevant_state
+
+            state = relevant_state(self.store, sid, limit=12)
+            refinement_context = {
+                "evidence": evidence,
+                "existing_state": state,
+                "state_catalog": [
+                    {k: e[k] for k in ("id", "kind", "title", "version", "deleted")}
+                    for e in self.store.states(sid, include_deleted=True)
+                ],
+                "selected_state": session.selected_state,
+                "previous_refinements": self.store.events(sid, kind="refinement", limit=5),
+                "skills": discover(Path(session.workspace.path), config.skill_paths),
+                "recent_state_use": self.store.events(sid, kind="skill_outcome", limit=5)
+                + self.store.events(sid, kind="state_retrieved", limit=5),
+            }
+            # Oversized state is retained with an explicit reference; trim whole records,
+            # never the middle of JSON or evidence selected for a proposal.
+            refinement_archive = self.artifacts.put(sid, refinement_context)
+            refinement_context["full_context_artifact"] = refinement_archive
+            provider = route(self.store, sid, "refinement", expected_tools=False)
+            limit = max(256, config.context.max_tokens - provider.max_output_tokens - 2000)
+            for key in (
+                "previous_refinements",
+                "skills",
+                "state_catalog",
+                "existing_state",
+                "evidence",
+            ):
+                while (
+                    len(refinement_context[key]) > 1
+                    and token_bound(refinement_context, provider.model) > limit
+                ):
+                    refinement_context[key].pop()
             response, source = await self.auxiliary(
                 sid,
                 "refinement",
                 'Return JSON {"proposals": [StateEdit,...]}. Each StateEdit requires kind (memory,prompt_note,skill,subagent_spec), title, content, source_events (ONLY supplied evidence IDs), intended_effect. Propose nothing without reusable evidence. memory/prompt_note content requires text; subagent_spec requires instruction. skill requires name, description, inputs object schema, required_permissions and executable Python code. Never modify foundational policy. No execution during proposal. Max '
                 + str(config.refinement.max_proposals)
-                + " proposals.",
-                evidence,
+                + " proposals. Existing state is supplied: update using entry_id and expected_version, merge duplicates by updating a survivor and deleting obsolete entries, supersede stale lessons, and create a new entry only for a new lesson. operation is upsert or delete. Preserve useful prior knowledge. Global writes require permission; scope defaults to session. Cite only supplied evidence IDs.",
+                refinement_context,
             )
             proposals = json.loads(response.text)["proposals"]
             if not isinstance(proposals, list) or len(proposals) > config.refinement.max_proposals:

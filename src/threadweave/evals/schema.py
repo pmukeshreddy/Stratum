@@ -67,6 +67,8 @@ def accounting(usages, wall_seconds):
             "reasoning_output_tokens",
             "estimated_calls",
             "model_calls",
+            "tool_calls",
+            "python_executions",
             "subagent_count",
         )
     }

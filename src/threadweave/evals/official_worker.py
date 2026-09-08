@@ -693,6 +693,7 @@ def main():
                 "action",
                 "finish_profile",
                 "aggregate_arc",
+                "arc_observation",
             }:
                 raise ValueError(f"Unknown operation: {operation}")
             with contextlib.redirect_stdout(sys.stderr):

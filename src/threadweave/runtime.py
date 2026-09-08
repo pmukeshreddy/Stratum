@@ -162,6 +162,8 @@ class Runtime(MemoryServices):
             session = self.store.create(
                 instruction, Workspace(path=str(path)), config, name=name, mode=mode
             )
+            self.load_repository_instructions(session.id)
+            session = self.store.session(session.id)
             self.store.event(
                 session.id,
                 "task_admitted",
@@ -267,6 +269,7 @@ class Runtime(MemoryServices):
             name=name or f"child-{usage.subagent_count + 1}",
             mode="autonomous" if config.control_plane == "python" else "goal",
         )
+        self.load_repository_instructions(session.id)
         self.store.event(
             session.id,
             "child_purpose",
@@ -997,18 +1000,24 @@ class Runtime(MemoryServices):
             with self.store.transaction():
                 pending = self.store.session(sid).pending_turn
                 if not pending.get("context_committed"):
-                    messages = [{"role": "assistant", "content": response.text or None}]
+                    messages = [
+                        {
+                            "role": "assistant",
+                            "content": response.text or None,
+                            "provider_response_event": response_event,
+                        }
+                    ]
                     if response.actions:
                         messages[0]["tool_calls"] = [
                             {
-                                "id": aid,
+                                "id": a.id,
                                 "type": "function",
                                 "function": {"name": a.name, "arguments": encode(a.arguments)},
                             }
-                            for a, aid in zip(response.actions, pending["action_ids"], strict=True)
+                            for a in response.actions
                         ]
                         for aid, result in zip(
-                            pending["action_ids"], pending["results"], strict=True
+                            [a.id for a in response.actions], pending["results"], strict=True
                         ):
                             messages.append(
                                 {"role": "tool", "tool_call_id": aid, "content": encode(result)}
@@ -1199,6 +1208,18 @@ class Runtime(MemoryServices):
     async def _prepare(self, sid):
         await self.environment.prepare(sid)
 
+    def load_repository_instructions(self, sid):
+        from .repository_instructions import discover_instructions
+
+        files = discover_instructions(Path(self.store.session(sid).workspace.path))
+        self.store.update(sid, repository_instructions=files)
+        if files:
+            self.store.event(
+                sid,
+                "repository_instructions_loaded",
+                {"files": [{k: v for k, v in item.items() if k != "content"} for item in files]},
+            )
+
     async def _invoke(self, sid):
         config = self.store.config(sid)
         await self.semantic_compact(sid)
@@ -1245,7 +1266,41 @@ class Runtime(MemoryServices):
             config=route(self.store, sid, session.role, context_size=size),
             input_token_bound=size,
         )
-        return await self._model_call(sid, request)
+        for recovery in range(config.retry.attempts):
+            try:
+                return await self._model_call(sid, request)
+            except HarnessError as exc:
+                if exc.failure.code not in {
+                    "context_overflow",
+                    "context_length_exceeded",
+                    "context_capacity",
+                }:
+                    raise
+                if recovery + 1 >= config.retry.attempts or not self.store.session(sid).context:
+                    raise
+                await self.semantic_compact(sid, force=True)
+                messages, smaller = self.context.assemble(sid, schemas)
+                if smaller >= size:
+                    self.context.compact(sid)
+                    messages, smaller = self.context.assemble(sid, schemas)
+                if smaller >= size:
+                    raise
+                self.store.charge(sid, Usage(retries=1))
+                self.store.event(
+                    sid,
+                    "context_overflow_recovery",
+                    {
+                        "turn": request.turn,
+                        "before_tokens": size,
+                        "after_tokens": smaller,
+                        "failure": exc.failure.code,
+                    },
+                )
+                size = smaller
+                request = request.model_copy(
+                    update={"messages": messages, "input_token_bound": size}
+                )
+        raise AssertionError("Unreachable context recovery loop")
 
     async def _model_call(self, sid, request, *, persist_turn=True):
         config = self.store.config(sid)
@@ -1263,7 +1318,7 @@ class Runtime(MemoryServices):
                     "model": provider.model,
                     "parameters": provider.parameters,
                     "billing": "subscription",
-                    "output_limit_enforcement": "client_observed_bytes; server token cap unavailable",
+                    "output_limit_enforcement": "provider model token limit; cumulative runtime token budget",
                 },
             )
         for attempt in range(config.retry.attempts):
@@ -1273,7 +1328,7 @@ class Runtime(MemoryServices):
                         self._check_limits(
                             sid, resource="model_calls", input_bound=size, provider=provider
                         )
-                        request_artifact = self.artifacts.put(sid, request.model_dump(mode="json"))
+                        request_artifact = self.artifacts.put(sid, request.public_dump())
                         eid = self.store.event(
                             sid,
                             "model_invocation_started",
@@ -1349,6 +1404,16 @@ class Runtime(MemoryServices):
                     response_event = self.store.event(
                         sid, "model_response", response.model_dump(mode="json"), parent=eid
                     )
+                    if response.provider_items:
+                        self.store.db.execute(
+                            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
+                            (
+                                response_event,
+                                provider.name,
+                                provider.model,
+                                encode(response.provider_items),
+                            ),
+                        )
                     if persist_turn:
                         self.store.update(
                             sid,
@@ -1403,7 +1468,12 @@ class Runtime(MemoryServices):
                     )
                     self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
                     self.store.event(sid, "failure", failure.model_dump(), parent=eid)
-                if not failure.retryable or attempt + 1 >= config.retry.attempts:
+                if (
+                    failure.code
+                    in {"context_overflow", "context_length_exceeded", "context_capacity"}
+                    or not failure.retryable
+                    or attempt + 1 >= config.retry.attempts
+                ):
                     raise HarnessError(
                         failure.category,
                         failure.code,
@@ -1830,6 +1900,7 @@ class Runtime(MemoryServices):
                 branch.id,
                 context=source.context,
                 summary=source.summary,
+                repository_instructions=source.repository_instructions,
                 selected_state=[],
                 turns=turn_index,
             )

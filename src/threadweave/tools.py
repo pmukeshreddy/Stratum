@@ -210,7 +210,7 @@ class ProcessArgs(Record):
 class ArtifactArgs(Record):
     artifact_id: str
     offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=16000, ge=1, le=64000)
+    limit: int = Field(default=16000, ge=1, le=65536)
 
 
 class ArtifactLoadArgs(Record):

@@ -131,7 +131,7 @@ class Artifacts:
         path = self.store.directory / meta["path"]
         with path.open("rb") as stream:
             stream.seek(offset)
-            data = stream.read(min(limit, 64000))
+            data = stream.read(min(limit, 65536))
         return {
             "artifact_id": aid,
             "offset": offset,
@@ -157,6 +157,20 @@ class Artifacts:
         aid = self.put(sid, value, source_event=source_event)
         serialized = encode(value)
         cap = self.store.config(sid).context.result_chars
+        from .tokenization import estimate
+
+        config = self.store.config(sid)
+        available = max(
+            128, int((config.context.max_tokens - config.provider.max_output_tokens) * 0.65)
+        )
+        low, high = 0, min(cap, len(serialized))
+        while low < high:
+            middle = (low + high + 1) // 2
+            if estimate(serialized[:middle], config.provider.model) <= available:
+                low = middle
+            else:
+                high = middle - 1
+        cap = low
         result = {
             "artifact_id": aid,
             "preview": serialized[:cap],
@@ -167,4 +181,10 @@ class Artifacts:
             result["inspection"] = (
                 f"Full result: artifacts.load({aid!r}). Prefer selecting fields from your retained Python variable. Do not repeat an unchanged read to recover truncated output."
             )
+            result["retrieval"] = {
+                "artifact_id": aid,
+                "offset": 0,
+                "limit": 65536,
+                "path": str(self.store.directory / self.metadata(sid, aid)["path"]),
+            }
         return result

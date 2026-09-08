@@ -34,6 +34,7 @@ class InferenceGate:
         self.adjustments = []
         self.games = {}
         self.sequence = 0
+        self.last_reduction = float("-inf")
 
     def journal(self, **event):
         with (self.directory / "inference-events.jsonl").open("a") as stream:
@@ -72,9 +73,10 @@ class InferenceGate:
         async with self.condition:
             self.recent.append(unstable)
             # A 429 reduces immediately; transport bursts use this same explicit event.
-            if unstable and self.capacity > 1:
+            if unstable and self.capacity > 1 and time.monotonic() - self.last_reduction >= 2:
                 previous = self.capacity
                 self.capacity -= 1
+                self.last_reduction = time.monotonic()
                 change = {
                     "from": previous,
                     "to": self.capacity,
@@ -94,6 +96,10 @@ class InferenceGate:
             "closed": False,
             "errors": [],
             "inflight": 0,
+            "reserved_tokens": 0,
+            "tasks": set(),
+            "tool_calls": 0,
+            "stop_reason": None,
         }
         return f"{self.url}/{owner}"
 
@@ -116,12 +122,21 @@ class InferenceGate:
         return self
 
     async def close(self):
-        for game in self.games.values():
-            game["closed"] = True
+        for owner in self.games:
+            await self.close_owner(owner)
         if hasattr(self, "server"):
             await self.server.cleanup()
             await self.client.close()
         save(self.directory / "concurrency.json", self.summary())
+
+    async def close_owner(self, owner):
+        game = self.games[owner]
+        game["closed"] = True
+        tasks = list(game["tasks"])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def summary(self):
         return {
@@ -144,7 +159,7 @@ class InferenceGate:
         payload = json.loads(body) if inference else {}
         if inference and (
             payload.get("model") != config.provider.model
-            or payload.get("reasoning", {}).get("effort") != "xhigh"
+            or (path == "responses" and payload.get("reasoning", {}).get("effort") != "xhigh")
         ):
             game["errors"].append("Codex requested a different model or reasoning level")
             return web.json_response(
@@ -179,6 +194,8 @@ class InferenceGate:
         response_id = None
         status = None
         sent = False
+        outgoing = None
+        tool_calls = 0
         async with self.permit(owner) as ticket:
             totals = self.usage(owner)
             if (
@@ -186,10 +203,14 @@ class InferenceGate:
                 or time.monotonic() - game["started"] >= config.limits.wall_seconds
                 or totals["model_calls"] + game["inflight"] >= config.limits.max_model_calls
                 or totals["total_tokens"]
-                + (game["inflight"] + 1) * (bound + config.provider.max_output_tokens)
+                + game["reserved_tokens"]
+                + bound
+                + config.provider.max_output_tokens
                 > config.limits.token_budget
+                or game["tool_calls"] >= config.limits.max_tool_calls
             ):
                 game["closed"] = True
+                game["stop_reason"] = "resource_budget"
                 return web.json_response(
                     {
                         "error": {
@@ -200,6 +221,9 @@ class InferenceGate:
                     status=400,
                 )
             game["inflight"] += 1
+            game["reserved_tokens"] += bound + config.provider.max_output_tokens
+            current = asyncio.current_task()
+            game["tasks"].add(current)
             try:
                 async with self.client.request(
                     request.method, upstream, data=body, headers=headers
@@ -207,6 +231,7 @@ class InferenceGate:
                     status = response.status
                     if status == 429 or status >= 500:
                         await self.outcome(unstable=True)
+                        game["errors"].append(f"http_{status}")
                     outgoing = web.StreamResponse(
                         status=status,
                         headers={
@@ -234,11 +259,23 @@ class InferenceGate:
                                     response_id = data.get("id") or response_id
                                     if data.get("usage"):
                                         usage = data["usage"]
+                                    if event.get(
+                                        "type"
+                                    ) == "response.output_item.done" and event.get("item", {}).get(
+                                        "type"
+                                    ) in {"function_call", "custom_tool_call"}:
+                                        game["tool_calls"] += 1
+                                        tool_calls += 1
                         await outgoing.write(chunk)
                     await outgoing.write_eof()
                     await self.outcome()
                     return outgoing
             except (aiohttp.ClientError, TimeoutError) as exc:
+                if isinstance(exc, (ConnectionResetError, aiohttp.ClientConnectionResetError)) and (
+                    usage or game["closed"]
+                ):
+                    # Codex may close SSE after response.completed; this is not throttling.
+                    return outgoing if outgoing is not None else web.Response(status=499)
                 game["errors"].append(type(exc).__name__)
                 await self.outcome(unstable=True)
                 if not sent:
@@ -248,6 +285,8 @@ class InferenceGate:
                 raise
             finally:
                 game["inflight"] -= 1
+                game["reserved_tokens"] -= bound + config.provider.max_output_tokens
+                game["tasks"].discard(current)
                 measured = {
                     "input_tokens": usage["input_tokens"] if usage else bound,
                     "output_tokens": usage["output_tokens"]
@@ -261,6 +300,7 @@ class InferenceGate:
                     .get("reasoning_tokens", 0),
                     "estimated_calls": int(usage is None),
                     "model_calls": 1,
+                    "tool_calls": tool_calls,
                     "api_cost": None,
                     "wall_seconds": time.monotonic() - begin,
                 }
@@ -270,6 +310,9 @@ class InferenceGate:
                     ticket=ticket,
                     owner=owner,
                     status=status,
+                    path=path,
+                    model=payload.get("model"),
+                    reasoning=payload.get("reasoning", {}).get("effort", "native_compaction"),
                     response_id=response_id,
                     usage=measured,
                 )

@@ -24,6 +24,7 @@ class CodexAgent:
         self.handlers = set()
         self.thread_ids = set()
         self.native_usage = {}
+        self.tool_calls = 0
 
     async def send(self, payload):
         self.process.stdin.write((json.dumps(payload) + "\n").encode())
@@ -62,6 +63,19 @@ class CodexAgent:
                         if event.get("method") == "thread/tokenUsage/updated":
                             self.native_usage[params["threadId"]] = params["tokenUsage"]
                             save(self.directory / "codex-native-usage.json", self.native_usage)
+                        if event.get("method") == "item/started" and params.get("item", {}).get(
+                            "type"
+                        ) in {
+                            "commandExecution",
+                            "fileChange",
+                            "mcpToolCall",
+                            "dynamicToolCall",
+                            "collabAgentToolCall",
+                            "webSearch",
+                            "imageView",
+                            "imageGeneration",
+                        }:
+                            self.tool_calls += 1
                         await self.notifications.put(event)
         finally:
             for future in self.pending.values():
@@ -255,6 +269,9 @@ async def run_codex(config, task, directory, *, action, gate, owner):
             except TimeoutError:
                 continue
             params = event.get("params", {})
+            if agent.tool_calls >= config.limits.max_tool_calls:
+                reason = "tool_budget"
+                break
             if event.get("method") == "server/exited":
                 raise NotRun("Actual Codex app-server exited during the game")
             if (
@@ -262,7 +279,7 @@ async def run_codex(config, task, directory, *, action, gate, owner):
                 and params.get("turn", {}).get("id") == turn_id
             ):
                 status = params["turn"]["status"]
-                if status == "failed":
+                if status == "failed" and not gate.games[owner]["closed"]:
                     raise NotRun(f"Actual Codex turn failed: {params['turn'].get('error')}")
                 reason = status
                 break
@@ -271,18 +288,16 @@ async def run_codex(config, task, directory, *, action, gate, owner):
             await agent.call("turn/interrupt", threadId=agent.thread_id, turnId=turn_id)
     finally:
         await agent.close()
-        gate.games[owner]["closed"] = True
-        # Allow the proxy to settle disconnected streams before accounting.
-        for _ in range(30):
-            if not gate.games[owner]["inflight"]:
-                break
-            await asyncio.sleep(0.1)
+        await gate.close_owner(owner)
         usage = gate.usage(owner)
+        usage["tool_calls"] = max(agent.tool_calls, gate.games[owner]["tool_calls"])
         usage["subagent_count"] = max(0, len(agent.thread_ids) - 1)
         usage["wall_seconds"] = time.monotonic() - begin
         save(directory / "usage.json", usage)
     if not usage["model_calls"]:
         raise NotRun("Actual Codex made no model requests")
+    if any("different model" in error for error in gate.games[owner]["errors"]):
+        raise NotRun("Codex requested a different model or reasoning level; comparison invalid")
     return {
         "response": answer,
         "stop_reason": reason,
@@ -291,5 +306,6 @@ async def run_codex(config, task, directory, *, action, gate, owner):
         "usage": usage,
         "baseline": "actual Codex app-server",
         "thread_ids": sorted(agent.thread_ids),
+        "transport_errors": gate.games[owner]["errors"],
         "trajectory_reference": str(directory.resolve()),
     }

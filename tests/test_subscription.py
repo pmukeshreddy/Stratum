@@ -201,9 +201,9 @@ async def test_incomplete_malformed_and_unregistered_calls():
             )
 
 
-async def test_output_guard_and_unreported_usage():
+async def test_incomplete_output_and_unreported_usage():
     request = model_request()
-    with pytest.raises(HarnessError, match="byte limit"):
+    with pytest.raises(HarnessError, match="ended before completion"):
         await SubscriptionProvider.collect(
             stream(
                 [{"type": "text_delta", "text": "x" * (request.config.max_output_tokens * 4 + 1)}]

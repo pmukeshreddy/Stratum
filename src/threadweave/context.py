@@ -116,8 +116,12 @@ class Context:
 
     def supplemental(self, sid: str) -> str:
         session, config = self.store.session(sid), self.store.config(sid)
-        entries, remaining = [], config.context.supplemental_chars
-        for entry_id in session.selected_state:
+        entries, remaining, used = [], config.context.supplemental_chars, []
+        from .state_retrieval import relevant_state
+
+        for entry_id in dict.fromkeys(
+            [*session.selected_state, *[e["id"] for e in relevant_state(self.store, sid)]]
+        ):
             try:
                 entry = self.store.state(sid, entry_id)
             except KeyError:
@@ -136,6 +140,12 @@ class Context:
             if len(text) <= remaining:
                 entries.append(text)
                 remaining -= len(text)
+                used.append({"id": entry_id, "version": entry["version"]})
+        previous = self.store.events(sid, kind="state_retrieved", limit=1)
+        if used and (not previous or previous[0]["payload"]["entries"] != used):
+            self.store.event(
+                sid, "state_retrieved", {"entries": used, "selection": "explicit or task relevance"}
+            )
         return "\n".join(entries)
 
     def messages(self, sid: str) -> list[dict]:
@@ -211,6 +221,16 @@ class Context:
                 },
             )
         messages.extend(self.store.config(sid).task.instruction_messages)
+        for instruction in session.repository_instructions:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Repository instructions from {instruction['path']} (scope {instruction['scope']}):\n"
+                        + instruction["content"]
+                    ),
+                }
+            )
         supplemental = self.supplemental(sid)
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking
@@ -251,7 +271,21 @@ class Context:
                 }
             )
         for block in session.context:
-            messages.extend(block["messages"])
+            for source in block["messages"]:
+                message = dict(source)
+                event = message.get("provider_response_event")
+                if event:
+                    row = self.store.db.execute(
+                        "SELECT * FROM provider_continuations WHERE event_id=?", (event,)
+                    ).fetchone()
+                    config = self.store.config(sid)
+                    if row and any(
+                        p.name == row["provider"] and p.model == row["model"]
+                        for p in [config.provider, *config.models.values()]
+                    ):
+                        message["provider_items"] = json.loads(row["items"])
+                        message["provider_identity"] = [row["provider"], row["model"]]
+                messages.append(message)
         from .retrieval import coding_focus
 
         focus = coding_focus(self.store, sid, index_provider=self.index_provider)
@@ -266,6 +300,16 @@ class Context:
                 return None
             count = count or max(1, len(session.context) - policy.recent_blocks)
             removed = session.context[:count]
+            from .artifacts import Artifacts
+
+            archive = Artifacts(self.store).put(
+                sid,
+                {
+                    "previous_summary": session.summary,
+                    "blocks": removed,
+                    "selected_state": session.selected_state,
+                },
+            )
             excerpts = []
             for block in removed:
                 pieces = []
@@ -298,12 +342,17 @@ class Context:
                 if summary
                 else (prior + "\n" + additions[-(cap - len(prior) - 1) :]).strip()
             )
+            reference = (
+                f"\nComplete compacted history and prior digest: artifacts.load({archive!r})"
+            )
+            summary = summary[: max(0, cap - len(reference))] + reference
             source_events = [b["event_id"] for b in removed]
             eid = self.store.event(
                 sid,
                 "context_compaction",
                 {
                     "source_events": source_events,
+                    "archive_artifact": archive,
                     "summary": summary,
                     "method": "model_structured" if provenance else "bounded_extractive",
                     "model_response_event": provenance,
@@ -341,6 +390,11 @@ class Context:
         size = token_bound({"messages": messages, "tools": tools}, config.provider.model)
         threshold = int(available * config.context.compact_at)
         while size > threshold and self.store.session(sid).context:
+            if (
+                len(self.store.session(sid).context) <= config.context.recent_blocks
+                and size <= available
+            ):
+                break  # Keep the recent region verbatim when it fits the actual input budget.
             self.compact(sid)
             messages = self.messages(sid)
             size = token_bound({"messages": messages, "tools": tools}, config.provider.model)

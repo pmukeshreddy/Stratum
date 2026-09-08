@@ -166,11 +166,10 @@ for runtime APIs and remaining limits.
 
 ## Evaluation
 
-Buffalo evaluates exactly five benchmark families: ManyIH Coding, ManyIH
-Instruction Following, LongBench v2, ARC-AGI-3, and Factorio. Run `buffalo eval all`
-or select a family with `buffalo eval manyih-coding`, `manyih-if`, `longbench-v2`,
-`arc-agi-3`, or `factorio`. Official evaluators determine the primary results.
-Missing dependencies produce `NOT RUN` with the exact blocker.
+The current evaluation phase runs ARC-AGI-3 only: actual installed Codex app-server
+versus Buffalo, both using `gpt-6-astra` with `xhigh` reasoning. Run
+`buffalo eval arc-agi-3 --config /absolute/evaluation.json` for the isolated parallel
+25-game comparison. The other four official benchmark families are paused.
 
 See [evaluation setup, paired runs, and reproducibility](docs/evaluation.md).
 

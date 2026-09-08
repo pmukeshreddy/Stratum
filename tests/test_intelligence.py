@@ -26,7 +26,7 @@ async def test_automatic_refinement_uses_evidence_routing_and_versioned_validati
         async def invoke(self, request, emit):
             assert request.metadata["purpose"] == "refinement"
             assert request.config.model == "fast-test"
-            evidence = json.loads(request.messages[-1]["content"])
+            evidence = json.loads(request.messages[-1]["content"])["evidence"]
             proposal = {
                 "kind": "memory",
                 "title": "Arithmetic failure",
@@ -95,7 +95,7 @@ async def test_model_compaction_records_provenance_and_preserves_full_events(
         )
         assert "run tests" in runtime.store.session(session.id).summary
         assert all(runtime.store.event_by_id(i) for i in ids)
-        assert runtime.store.usage(session.id).model_calls == 1
+        assert runtime.store.usage(session.id).model_calls == 2
         assert runtime.store.session(session.id).pending_turn is None
     finally:
         await runtime.shutdown()

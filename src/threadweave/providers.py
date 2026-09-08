@@ -50,7 +50,14 @@ class ChatProvider:
         body = {
             **params,
             "model": config.model,
-            "messages": request.messages,
+            "messages": [
+                {
+                    k: v
+                    for k, v in message.items()
+                    if k not in {"provider_items", "provider_response_event", "provider_identity"}
+                }
+                for message in request.messages
+            ],
             "max_completion_tokens": config.max_output_tokens,
             "stream": config.streaming,
             "n": 1,
@@ -121,6 +128,14 @@ class ChatProvider:
     @staticmethod
     def _check(response):
         if response.is_error:
+            try:
+                code = response.json().get("error", {}).get("code")
+            except (ValueError, AttributeError):
+                code = None
+            if code in {"context_length_exceeded", "context_window_exceeded", "context_overflow"}:
+                raise HarnessError(
+                    "provider", "context_overflow", "Provider context capacity reached"
+                )
             # Never persist request headers or credentials in provider failures.
             raise HarnessError(
                 "provider",

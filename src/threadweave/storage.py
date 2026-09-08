@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS compactions(
  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
  source_events TEXT NOT NULL, summary TEXT NOT NULL, created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS provider_continuations(
+ event_id TEXT PRIMARY KEY REFERENCES events(id), provider TEXT NOT NULL, model TEXT NOT NULL,
+ items TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS state_entries(
  id TEXT PRIMARY KEY, owner_id TEXT REFERENCES sessions(id), kind TEXT NOT NULL,
  current_version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0

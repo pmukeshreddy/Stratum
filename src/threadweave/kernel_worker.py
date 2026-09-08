@@ -414,7 +414,7 @@ class Worker:
             os.close(saved_err)
         for key, path in (("stdout", stdout), ("stderr", stderr)):
             with path.open() as stream:
-                result[key] = stream.read(4000)
+                result[key] = stream.read(65536)
             result[f"{key}_bytes"] = path.stat().st_size
         result["variables"] = sorted(n for n in self.values if not n.startswith("__"))[:100]
         result["process_effects"] = self.family.observation()

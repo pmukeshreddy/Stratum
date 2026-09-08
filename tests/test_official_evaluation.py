@@ -146,21 +146,6 @@ async def test_runtime_failure_is_not_scored_as_a_model_answer(tmp_path, monkeyp
     assert (tmp_path / "usage.json").is_file()
 
 
-@pytest.mark.parametrize("profile,runner", [("root", run_buffalo)])
-async def test_output_budget_stop_remains_a_scored_attempt(tmp_path, monkeypatch, profile, runner):
-    provider = ScriptedProvider(
-        {profile: [HarnessError("provider", "observed_output_limit", "output cap", uncertain=True)]}
-    )
-    monkeypatch.setattr("threadweave.evals.harness.default_providers", lambda: {"chat": provider})
-    result = await runner(
-        eval_config(), {"messages": [{"role": "user", "content": "task"}]}, tmp_path
-    )
-    assert result["stop_reason"] == "observed_output_limit"
-    assert result["response"] == ""
-    assert result["usage"]["model_calls"] == 1
-    assert result["usage"]["estimated_calls"] == 1
-
-
 async def test_single_model_configuration_rejects_routing():
     cfg = EvaluationConfig(run=eval_config())
     cfg.run.models["other"] = cfg.run.provider.model_copy()
