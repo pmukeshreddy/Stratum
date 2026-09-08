@@ -347,54 +347,6 @@ async def test_remaining_budget_compaction_keeps_policy_and_durable_evidence(tmp
         await runtime.shutdown()
 
 
-async def test_frozen_comparison_and_tamper_detection(tmp_path, repository, coding_config):
-    import sys
-
-    from threadweave.evaluation import profile_config
-    from threadweave.frozen_eval import compare, freeze, validate
-    from threadweave.models import ModelResponse
-
-    from .conftest import response
-    from .fakes import ScriptedProvider
-
-    tasks = tmp_path / "tasks.json"
-    tasks.write_text(
-        json.dumps(
-            [
-                {
-                    "id": "component-fixture",
-                    "adapter": "repository_issue",
-                    "repository": str(repository),
-                    "objective": "Fix addition",
-                    "test_commands": [
-                        [sys.executable, "-c", "from mathops import add; assert add(2,3)==5"]
-                    ],
-                }
-            ]
-        )
-    )
-    coding_config.control_plane = "python"
-    coding_config.features.model_compaction = False
-    bundle = tmp_path / "frozen"
-    freeze(tasks, coding_config, bundle)
-    provider = ScriptedProvider(
-        {
-            "root": [
-                response(
-                    "ipython", code="Path('mathops.py').write_text('def add(a,b): return a+b\\n')"
-                ),
-                ModelResponse(text="done"),
-            ]
-        }
-    )
-    result = await compare(bundle, tmp_path / "runs", providers={"test": provider})
-    assert all(r["solved"] == 1 for r in result["profiles"].values())
-    assert profile_config(coding_config, "base").limits == coding_config.limits
-    (bundle / "tasks.json").write_text("[]")
-    with pytest.raises(ValueError, match="Frozen input changed"):
-        validate(bundle)
-
-
 async def test_background_recovery_marks_lost_without_replaying(
     tmp_path, repository, coding_config
 ):
@@ -408,31 +360,6 @@ async def test_background_recovery_marks_lost_without_replaying(
         assert service.status(context, "lost")["state"] == "lost"
         assert not service.tasks
         assert runtime.store.events(session.id, kind="process_recovery")
-    finally:
-        await runtime.shutdown()
-
-
-async def test_external_adapter_large_response_retains_logs(tmp_path, repository, coding_config):
-    import sys
-
-    from threadweave.evaluation import run_external
-
-    runtime, session, _ = await setup_runtime(tmp_path, repository, coding_config)
-    try:
-        with pytest.raises(ValueError, match="exceeds 4 MB"):
-            await run_external(
-                runtime,
-                session,
-                "Response-size boundary",
-                coding_config,
-                [sys.executable, "-c", "import sys; sys.stdin.read(); print('x'*4_000_001)"],
-            )
-        assert (
-            runtime.store.db.execute(
-                "SELECT count(*) FROM artifacts WHERE session_id=? AND size>4000000", (session.id,)
-            ).fetchone()[0]
-            == 1
-        )
     finally:
         await runtime.shutdown()
 
@@ -453,15 +380,6 @@ async def test_native_array_snapshot_restores_and_isolated_resource_failure(tmp_
         assert "10000 9999.0" in result["stdout"]
     finally:
         await kernel.close()
-
-
-def test_trajectory_errors_are_read_from_structured_tool_result():
-    from threadweave.trajectory_analysis import analyze_events
-
-    result = analyze_events(
-        [{"id": "failed", "type": "tool_result", "payload": {"result": {"error": "denied"}}}]
-    )
-    assert result["failed_actions"] == [{"event_id": "failed", "error": "denied"}]
 
 
 def test_distribution_and_failed_correctness_cannot_claim_improvement():

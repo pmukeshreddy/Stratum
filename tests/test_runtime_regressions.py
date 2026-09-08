@@ -526,7 +526,6 @@ async def test_python_context_surfaces_focus_and_keeps_negative_evidence(
     tmp_path, repository, coding_config
 ):
     from threadweave.context import python_instructions
-    from threadweave.evaluation import profile_config
 
     from .test_coding import setup_runtime
 
@@ -579,7 +578,10 @@ async def test_python_context_surfaces_focus_and_keeps_negative_evidence(
         assert "expected 5, got -1" in focused
         assert "external-full-evidence" in focused
         assert "UNNEEDED_RAW_STACK" not in focused
-        base = python_instructions(profile_config(coding_config, "base"))
+        basic = coding_config.model_copy(deep=True)
+        basic.features.subagents = False
+        basic.features.enhanced_code_index = False
+        base = python_instructions(basic)
         assert "await edit(" not in base and "await rlm(" not in base
         assert "Path.read_text()/write_text()" in base
         readonly = coding_config.model_copy(deep=True)

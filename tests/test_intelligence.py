@@ -1,17 +1,14 @@
 import json
-import sys
 
 import pytest
 
 from threadweave.configuration import doctor, load_config
-from threadweave.evaluation import Instance, analyze, evaluate, prepare_instance
 from threadweave.models import ModelResponse, RunConfig, StateEdit, Usage, new_id
 from threadweave.refinement import run_skill
 from threadweave.runtime import Runtime
 
-from .conftest import response
 from .fakes import ScriptedProvider
-from .test_coding import FIX, setup_runtime
+from .test_coding import setup_runtime
 
 
 async def test_automatic_refinement_uses_evidence_routing_and_versioned_validation(
@@ -180,63 +177,6 @@ async def test_ablation_flags_disable_capabilities_and_persistent_working_values
         await runtime.shutdown()
 
 
-async def test_real_external_issue_evaluation_and_machine_readable_analysis(
-    tmp_path, repository, coding_config
-):
-    tasks, output = tmp_path / "tasks.jsonl", tmp_path / "results.jsonl"
-    tasks.write_text(
-        json.dumps(
-            {
-                "id": "arithmetic-issue",
-                "adapter": "repository_issue",
-                "repository": str(repository),
-                "objective": "Correct addition",
-                "test_commands": [[sys.executable, "-m", "pytest", "-q"]],
-            }
-        )
-        + "\n"
-    )
-    providers = {
-        "test": ScriptedProvider(
-            {"root": [response("apply_patch", patch=FIX), response("finish", result="Fixed")]}
-        )
-    }
-    result = await evaluate(
-        tasks, coding_config, tmp_path / "eval", output=output, providers=providers
-    )
-    assert result["solved"] == 1
-    row = json.loads(output.read_text())
-    assert row["metrics"]["tests_runs"] >= 2 and row["verifier_score"] == 1
-    assert row["config_id"] and row["resolved_config"]["features"]["experiments"]
-    assert row["metrics"]["final_diff_size"] > 0
-    assert "a - b" in (repository / "mathops.py").read_text()  # Source instance was not modified.
-    summary = analyze(output)
-    assert summary["success_rate"] == 1 and summary["cost_per_solved"] == 0
-    assert summary["totals"]["tool_calls"] > 0
-
-
-def test_external_long_context_and_kernel_configuration_errors(tmp_path, repository, coding_config):
-    bundle = tmp_path / "task.txt"
-    bundle.write_text("Behavioral constraint: preserve signed arithmetic")
-    instance = Instance(
-        id="context",
-        adapter="long_context",
-        repository=str(repository),
-        objective="Read task context",
-        context_bundle=[str(bundle)],
-        test_commands=[[sys.executable, "-m", "pytest"]],
-    )
-    workspace, instruction, config = prepare_instance(
-        instance, tmp_path / "external", coding_config, base_directory=tmp_path
-    )
-    assert "Additional task context" in instruction
-    assert (workspace / ".task_context/0-task.txt").exists()
-    assert not config.task.require_clean_baseline
-    missing = Instance(id="gpu", adapter="kernel", repository=str(repository), objective="Optimize")
-    with pytest.raises(ValueError, match="Kernel instances require"):
-        prepare_instance(missing, tmp_path / "gpu", coding_config, base_directory=tmp_path)
-
-
 async def test_production_rejects_missing_model_and_demo_provider(tmp_path, repository):
     runtime = Runtime(tmp_path / "state")
     try:
@@ -288,43 +228,3 @@ async def test_explicit_refinement_request_runs_at_boundary_without_periodic_pol
         )
     finally:
         await runtime.shutdown()
-
-
-@pytest.mark.parametrize("unknown", [{"metrics": {"cost": None}}, {"metrics": {}}, {}])
-@pytest.mark.parametrize("known", [[], [{"solved": True, "metrics": {"cost": 3}}]])
-@pytest.mark.parametrize("solved", [False, True])
-def test_analyze_unknown_cost(tmp_path, unknown, known, solved):
-    path = tmp_path / "results.jsonl"
-    rows = known + [{"solved": solved, **unknown}]
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    summary = analyze(path)
-    assert summary["totals"]["cost"] is None
-    assert summary["cost_per_solved"] is None
-    assert summary["runs"] == len(rows)
-    assert summary["solved"] == sum(row["solved"] for row in rows)
-
-
-@pytest.mark.parametrize("costs", [[0, 0, 0], [1.5, 2.5, 4]])
-@pytest.mark.parametrize("solved", [False, True])
-def test_analyze_known_costs(tmp_path, costs, solved):
-    path = tmp_path / "results.jsonl"
-    rows = [
-        {"solved": solved and i < 2, "metrics": {"cost": cost, "turns": 2}}
-        for i, cost in enumerate(costs)
-    ]
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    summary = analyze(path)
-    assert summary["totals"]["cost"] == sum(costs)
-    assert summary["cost_per_solved"] == (sum(costs) / 2 if solved else None)
-    assert summary["totals"]["turns"] == 6
-
-
-@pytest.mark.parametrize("content", ["", "\n  \n"])
-def test_analyze_empty_file(tmp_path, content):
-    path = tmp_path / "results.jsonl"
-    path.write_text(content)
-    summary = analyze(path)
-    assert summary["runs"] == summary["solved"] == 0
-    assert summary["success_rate"] is None
-    assert summary["cost_per_solved"] is None
-    assert all(total == 0 for total in summary["totals"].values())

@@ -28,8 +28,6 @@ CREATE TABLE skill_outcomes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERE
  entry_id TEXT NOT NULL, version INTEGER NOT NULL, passed INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE TABLE candidates(child_id TEXT PRIMARY KEY REFERENCES sessions(id), parent_id TEXT NOT NULL,
  checkpoint_id TEXT NOT NULL, body TEXT NOT NULL);
-CREATE TABLE eval_runs(id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id),
- created_at REAL NOT NULL, body TEXT NOT NULL);
 CREATE VIRTUAL TABLE history_fts USING fts5(id UNINDEXED, session_id UNINDEXED, root_id UNINDEXED,
  kind UNINDEXED, text, tokenize='unicode61');
 INSERT INTO history_fts(id,session_id,root_id,kind,text)

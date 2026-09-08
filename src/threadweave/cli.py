@@ -158,26 +158,9 @@ async def execute(args):
         show(result)
         return 0 if result["ok"] else 1
     if command == "eval":
-        from .evaluation import evaluate
+        from .evals.runner import execute as evaluate
 
-        show(
-            await evaluate(
-                args.tasks,
-                await resolved_config(load_config(args.config)),
-                directory,
-                repetitions=args.repetitions,
-                seed=args.seed,
-                output=args.output,
-                profile=args.profile,
-                external_command=args.external_command,
-            )
-        )
-        return 0
-    if command == "analyze":
-        from .evaluation import analyze
-
-        show(analyze(args.results))
-        return 0
+        return await evaluate(args)
     if command == "run":
         config = await resolved_config(load_config(args.config, model_override=args.model))
         await ensure_daemon(directory)
@@ -383,20 +366,10 @@ def parser():
     artifact.add_argument("--limit", type=int, default=16000)
     diagnostics = sub.add_parser("doctor", help="Check provider, credentials, tools and storage")
     diagnostics.add_argument("--config", type=Path)
-    evaluation = sub.add_parser("eval", help="Run externally supplied real coding tasks")
-    evaluation.add_argument("tasks", type=Path)
-    evaluation.add_argument("--config", type=Path, required=True)
-    evaluation.add_argument("--output", type=Path, required=True)
-    evaluation.add_argument("--repetitions", type=int, default=1)
-    evaluation.add_argument("--seed", type=int, default=0)
-    evaluation.add_argument("--profile", choices=["base", "buffalo", "external"], default="buffalo")
-    evaluation.add_argument(
-        "--external-command",
-        nargs="+",
-        help="Explicit external harness JSON-stdin/JSON-stdout adapter",
-    )
-    analysis = sub.add_parser("analyze", help="Aggregate measured evaluation results")
-    analysis.add_argument("results", type=Path)
+    from .evals.runner import arguments
+
+    evaluation = sub.add_parser("eval", help="Run the five official Buffalo capability benchmarks")
+    arguments(evaluation)
     return p
 
 
@@ -428,8 +401,12 @@ def main():
     try:
         code = asyncio.run(execute(args))
     except KeyboardInterrupt:
-        print("Detached. The daemon and session continue running.", file=sys.stderr)
-        code = 0
+        if args.command == "eval":
+            print("Evaluation interrupted. Partial artifacts are preserved.", file=sys.stderr)
+            code = 130
+        else:
+            print("Detached. The daemon and session continue running.", file=sys.stderr)
+            code = 0
     except (OSError, ValueError, RuntimeError, KeyError, HarnessError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         code = 1

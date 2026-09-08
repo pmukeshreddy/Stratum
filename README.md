@@ -161,15 +161,18 @@ Repository definitions/calls/references use persistent Tree-sitter syntax eviden
 for Python, Rust, Go, C/C++/CUDA and JavaScript/TypeScript. Results identify evidence
 quality; unresolved names are not compiler-semantic references. Native filesystem
 events drive warm mutation/index updates, with full reconciliation after recovery
-and at verification boundaries. See the [hardening ledger](docs/hardening-ledger.md)
-for APIs, measured costs and remaining limits.
+and at verification boundaries. See the [architecture documentation](docs/architecture.md)
+for runtime APIs and remaining limits.
 
-## Frozen coding comparisons
+## Evaluation
 
-The evaluation runner compares a basic filesystem/shell profile of this runtime
-with its full configured capabilities, holding model, task revision and resource
-limits fixed. It also accepts an external harness adapter. This is not a claim of
-superiority or a bundled public benchmark. [Reproduction and result definitions](docs/hardening-evaluation.md).
+Buffalo evaluates exactly five benchmark families: ManyIH Coding, ManyIH
+Instruction Following, LongBench v2, ARC-AGI-3, and Factorio. Run `buffalo eval all`
+or select a family with `buffalo eval manyih-coding`, `manyih-if`, `longbench-v2`,
+`arc-agi-3`, or `factorio`. Official evaluators determine the primary results.
+Missing dependencies produce `NOT RUN` with the exact blocker.
+
+See [evaluation setup, paired runs, and reproducibility](docs/evaluation.md).
 
 ## Long-horizon sessions
 

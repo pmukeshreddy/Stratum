@@ -97,7 +97,10 @@ class ChatProvider:
                     input_tokens * (config.input_cost_per_million or 0)
                     + output_tokens * (config.output_cost_per_million or 0)
                 )
-                / 1_000_000,
+                / 1_000_000
+                if config.input_cost_per_million is not None
+                and config.output_cost_per_million is not None
+                else None,
             )
             return ModelResponse(
                 text=message.get("content") or "",

@@ -165,11 +165,10 @@ This is not a distributed container lease service.
 ```text
 DATA/
   history.sqlite3    durable sessions, history, queues, state versions, indexes,
-                     checkpoints, experiments, routing, verification and eval rows
+                     checkpoints, experiments, routing and verification
   artifacts/         exact private values, patches, files, logs and measurements
   kernels/           per-session snapshots, receipts and logs
   workspaces/        isolated candidates and verification copies
-  evaluations/       independent workloads, state and final patches
   daemon.log         structured event IDs/types and startup diagnostics
   daemon.lock / runtime.lock
 ```

@@ -189,6 +189,8 @@ class ResourceLimits(Record):
 
 class TaskConfig(Record):
     adapter: str = "workspace"
+    # Verbatim role-bearing task instructions survive trajectory compaction.
+    instruction_messages: list[dict[str, Any]] = Field(default_factory=list)
     specification: dict[str, Any] = Field(default_factory=dict)
     verifier: str = Field(default="none", min_length=1)
     verifier_options: dict[str, Any] = Field(default_factory=dict)

@@ -112,30 +112,3 @@ misclassified as agent source edits.
 `tests/test_python_environment.py` exercises real Git repositories, persistent
 workers, a local MCP server, subprocesses, kernel termination and abrupt daemon
 process exit. It uses test-only providers and makes no live model calls.
-
-Run the diagnostic measurement (not an agent or coding-task benchmark):
-
-```sh
-uv run python -m tests.perf_mutation_observation --output results/hardening-step1/mutation-overhead.json
-```
-
-Measured on macOS 26.3 arm64, Python 3.12.12; seven warm repetitions per case,
-4 KiB files. Cold kernel startup and initial coding preparation/hash capture are
-excluded. Observation time includes its begin/end boundaries, persistence and
-invalidation. Total cell time also includes existing action/guardrail/index work
-and Python checkpointing; those unrelated systems were not optimized in this step.
-
-The original Step 1 output remains in `results/hardening-step1/mutation-overhead.json`.
-The same seven-sample workload was rerun after hardening in
-`results/hardening/mutation-comparable-final.json`:
-
-| Files | Edit | Before observation | After observation | After whole cell | Content hashed per cell |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 100 | No-op | 32.47 ms | 22.62 ms | 27.33 ms | 0 B |
-| 100 | One file | 36.62 ms | 19.69 ms | 27.71 ms | 4,096 B |
-| 100 | Ten files | 36.54 ms | 21.99 ms | 28.74 ms | 40,960 B |
-| 10,000 | No-op | 457.36 ms | 22.24 ms | 27.66 ms | 0 B |
-| 10,000 | One file | 470.59 ms | 36.63 ms | 40.74 ms | 4,096 B |
-
-Raw samples and maximum times are in the output JSON. These are local measurements,
-not portable latency guarantees or model-performance claims.

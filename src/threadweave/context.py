@@ -210,6 +210,7 @@ class Context:
                     ),
                 },
             )
+        messages.extend(self.store.config(sid).task.instruction_messages)
         supplemental = self.supplemental(sid)
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking

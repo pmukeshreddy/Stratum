@@ -25,7 +25,7 @@ async def cell(runtime, sid, code):
 
 def test_default_schema_has_one_control_plane():
     schema = builtins().schemas(RunConfig())
-    snapshot = Path(__file__).resolve().parents[1] / "results/parity/tool-schema-after.json"
+    snapshot = Path(__file__).resolve().parent / "fixtures/ipython-schema.json"
     assert schema == json.loads(snapshot.read_text())
     assert [s["function"]["name"] for s in schema] == ["ipython"]
     assert schema[0]["function"]["parameters"]["required"] == ["code"]

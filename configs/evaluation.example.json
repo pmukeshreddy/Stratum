@@ -1,0 +1,74 @@
+{
+  "run": {
+    "provider": {
+      "name": "chat",
+      "model": "${BUFFALO_EVAL_MODEL}",
+      "parameters": {
+        "reasoning_effort": "high"
+      },
+      "max_output_tokens": 4096
+    },
+    "control_plane": "python",
+    "limits": {
+      "token_budget": 500000,
+      "wall_seconds": 3600,
+      "max_turns": 100,
+      "max_model_calls": 300,
+      "max_tool_calls": 1000,
+      "max_python_executions": 500,
+      "max_subagents": 20,
+      "max_depth": 5,
+      "concurrency": 4
+    }
+  },
+  "benchmarks": {
+    "manyih-coding": {
+      "source": null,
+      "commit": null,
+      "python": "python3",
+      "task_ids": []
+    },
+    "manyih-if": {
+      "source": null,
+      "commit": null,
+      "python": "python3",
+      "task_ids": []
+    },
+    "longbench-v2": {
+      "source": null,
+      "commit": null,
+      "python": "python3",
+      "task_ids": [],
+      "dataset": null,
+      "dataset_revision": null,
+      "dataset_sha256": null
+    },
+    "arc-agi-3": {
+      "source": null,
+      "commit": null,
+      "python": "python3",
+      "task_ids": [],
+      "options": {
+        "operation_mode": "OFFLINE",
+        "environments_dir": null
+      }
+    },
+    "factorio": {
+      "source": null,
+      "commit": null,
+      "python": "python3",
+      "task_ids": [],
+      "options": {
+        "container": null,
+        "world_save": null,
+        "container_save_path": "/factorio/saves/buffalo-start.zip",
+        "world_id": null,
+        "factorio_version": null,
+        "factorio_binary": "/opt/factorio/bin/x64/factorio",
+        "address": "localhost",
+        "tcp_port": 27000,
+        "inventory": {}
+      }
+    }
+  }
+}

@@ -22,25 +22,16 @@ archive, not files shipped in Threadweave. No reference code/package was vendore
 | `prime-agent-runtime/src/rlm/mcp.py`, `mcp_base.py:307` | Lazy stdio/streamable HTTP discovery/calls/lifecycle; structured content preferred | Official Python MCP SDK in `mcp_client`, kernel normalization |
 | `packages/coding-agent/src/core/prompts/rlm.ts:79` | Normal final answer ends work; conversation log accessible by path | Normal-text completion/yield, readable history projection |
 
-Before this change, at Threadweave commit
-`62ba2524a82b7b2a8228cf23484a6b45564c077a`, `_invoke` supplied all 63 permitted
-tool schemas from `builtins().schemas(configs/session.json)`. The exact capture is
-[tool-schema-before.json](../results/parity/tool-schema-before.json).
-
-After: `_invoke` still uses the same production provider interface, but supplies
-only [ipython](../results/parity/tool-schema-after.json), with one required string
-argument `code`. The live test captures the actual stored provider request artifact
-for **every** invocation and checks this list, not just a registry mock. A model
-attempting a direct `workspace_write` action is rejected as `tool_not_exposed`.
+The production `_invoke` interface exposes only `ipython`, with one required string
+argument `code`. The [runtime schema fixture](../tests/fixtures/ipython-schema.json)
+and provider integration tests verify the control-plane contract. A model attempting
+a direct `workspace_write` action is rejected as `tool_not_exposed`.
 
 ```text
-BEFORE                              AFTER (default)
-MODEL                               MODEL
- ├─ coding tools                     ↓ ipython(code)
- ├─ orchestration/state tools        persistent IPython kernel
- ├─ finish                           ↓ programmatic capabilities
- └─ python                          Environment / daemon / continual state
+MODEL → ipython(code) → persistent IPython kernel
+                     → Environment / daemon / persistent state
 ```
+
 
 The old direct tools remain behind explicit `control_plane: direct`. They are
 also available from `tools.call` under Python when their permissions allow it.
@@ -234,6 +225,5 @@ byte-for-byte API equivalence to every reference extension. Important limits:
 - Container-only configurations cannot run a host Python control plane. Choose a
   separately isolated host/VM for untrusted Python; do not call local execution sandboxed.
 
-These differences remain explicit; the default no longer has two parallel model
-control planes. [Acceptance evidence](../results/parity/REPORT.md) separates actual
-live results from deterministic/component tests.
+The default exposes one model control plane. Runtime correctness is verified by
+unit and integration tests; capability evaluation is documented in [evaluation](evaluation.md).

@@ -32,6 +32,22 @@ async def discard(delta):
     pass
 
 
+@pytest.mark.parametrize("reported_cost", [None, 0, 0.5])
+async def test_unknown_api_cost_is_not_reported_as_free(reported_cost):
+    usage = {"prompt_tokens": 30, "completion_tokens": 10}
+    if reported_cost is not None:
+        usage["cost"] = reported_cost
+    provider = ChatProvider(
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, json={"choices": [{"message": {"content": "answer"}}], "usage": usage}
+            )
+        )
+    )
+    result = await provider.invoke(request_config(streaming=False), discard)
+    assert result.usage.cost == reported_cost
+
+
 async def test_chat_nonstream_tool_calls_and_usage():
     def handler(request):
         body = json.loads(request.content)
