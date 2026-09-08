@@ -1,4 +1,4 @@
-"""Matched model requests and the production Buffalo Runtime; no custom BASE agent."""
+"""Matched model requests and the production Buffalo Runtime."""
 
 from __future__ import annotations
 

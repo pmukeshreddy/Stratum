@@ -1,9 +1,21 @@
-# Buffalo evaluation runs
+# Buffalo evaluation results
 
-Each execution writes a local run directory here containing the ARC Codex-vs-Buffalo report,
-official evaluator output, trajectories, complete resource accounting, and pinned
-source and dataset/environment identities. Run directories are excluded from Git
-because they contain large datasets, game recordings, persistent worlds, and local
-provider journals. Completed report summaries may be published separately.
+The supported comparison holds Astra XHigh fixed:
+
+| Harness | Model | Reported score |
+| --- | --- | ---: |
+| ARC Standard harness | Astra XHigh | ≈ 59% |
+| Buffalo harness | Astra XHigh | ≈ 81% |
+
+**59 → 81: approximately +22 percentage points.** Buffalo improves the same
+underlying model by replacing the ARC Standard harness.
+
+These are reported, rounded results supplied by the project owner; their underlying
+score artifacts and the ARC Standard runner are not included in this checkout.
+
+Fresh Buffalo executions write separate `arc-buffalo-*` directories containing
+actual measured scores, official evaluator output, trajectories, resource accounting,
+and pinned source/environment identities. Those large local directories are ignored
+by Git.
 
 [Setup and reproduction instructions](../../docs/evaluation.md).

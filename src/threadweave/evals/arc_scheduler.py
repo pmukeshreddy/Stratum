@@ -1,4 +1,4 @@
-"""Isolated, parallel official ARC games: native Codex versus Buffalo."""
+"""Isolated, parallel official ARC games for the Buffalo harness."""
 
 from __future__ import annotations
 
@@ -6,19 +6,16 @@ import asyncio
 import contextlib
 import json
 import re
-import shutil
-import subprocess
 import time
 from pathlib import Path
 
 from ..models import new_id
 from .arc_protocol import FixedGameControl, load_validation
 from .bridge import OfficialWorker
-from .codex_harness import run_codex
 from .harness import run_buffalo
 from .inference_gate import InferenceGate
 from .runner import contract, load, resolve, source_identity
-from .schema import NotRun, accounting, digest, file_digest, save, timestamp
+from .schema import NotRun, accounting, digest, save, timestamp
 
 
 def infrastructure_failure(exc):
@@ -26,7 +23,7 @@ def infrastructure_failure(exc):
         return True
     return bool(
         re.search(
-            r"transport|connection|http_429|http_5\d\d|os_permission_retry|worker exited|toolkit.*(?:failed|no |could not)|app-server exited|timed out|stream.*(?:interrupt|disconnect)|servererror|toomanyrequests",
+            r"transport|connection|http_429|http_5\d\d|os_permission_retry|worker exited|toolkit.*(?:failed|no |could not)|timed out|stream.*(?:interrupt|disconnect)|servererror|toomanyrequests",
             str(exc),
             re.IGNORECASE,
         )
@@ -34,35 +31,28 @@ def infrastructure_failure(exc):
 
 
 def report(row):
-    lines = ["ARC-AGI-3", ""]
-    for profile, title in (("codex", "Codex"), ("buffalo", "Buffalo")):
-        result = row.get("profiles", {}).get(profile, {})
-        lines.append(title + ":")
-        if result.get("status") == "COMPLETED":
-            u = result["usage"]
-            lines += [
-                f"RHAE = {result['primary_score']:.6f}%",
-                f"games = {result['task_count']}",
-                f"tokens = {u['total_tokens']} (input {u['input_tokens']}, output {u['output_tokens']})",
-                f"model calls = {u['model_calls']}",
-                f"wall time = {u['wall_seconds']:.2f}s",
-            ]
-        else:
-            lines += [
-                result.get("status", "NOT RUN"),
-                f"reason = {result.get('reason', 'Profile not selected')}",
-            ]
-        lines.append("")
-    profiles = row.get("profiles", {})
-    if all(profiles.get(p, {}).get("status") == "COMPLETED" for p in ("codex", "buffalo")):
+    lines = ["ARC-AGI-3 — measured Buffalo run", "", "Buffalo harness + Astra XHigh:"]
+    result = row.get("profiles", {}).get("buffalo", {})
+    if result.get("status") == "COMPLETED":
+        u = result["usage"]
         lines += [
-            f"Buffalo lift over Codex: {profiles['buffalo']['primary_score'] - profiles['codex']['primary_score']:+.6f} percentage points"
+            f"RHAE = {result['primary_score']:.6f}%",
+            f"games = {result['task_count']}",
+            f"tokens = {u['total_tokens']} (input {u['input_tokens']}, output {u['output_tokens']})",
+            f"model calls = {u['model_calls']}",
+            f"wall time = {u['wall_seconds']:.2f}s",
+        ]
+    else:
+        lines += [
+            result.get("status", row.get("status", "NOT RUN")),
+            f"reason = {result.get('reason', row.get('reason', 'Evaluation not completed'))}",
         ]
     lines += [
+        "",
+        f"status: {row.get('status', 'NOT RUN')}",
+        f"scope: {'full benchmark' if row.get('full_benchmark') else 'subset/setup check'}",
         f"concurrency used: {row.get('concurrency', {}).get('peak_inflight', 0)}",
         f"failed/retried games: {row.get('retries', [])}",
-        "BASELINE = actual Codex harness",
-        "NOT custom run_base()",
     ]
     return "\n".join(lines) + "\n"
 
@@ -92,33 +82,12 @@ async def execute_arc(args):
         raise NotRun(
             "ARC comparison requires the authenticated Codex subscription, gpt-6-astra and xhigh"
         )
-    executable = shutil.which("codex")
-    if not executable:
-        raise NotRun("Actual Codex CLI is not installed")
-    version = (
-        await asyncio.to_thread(subprocess.check_output, [executable, "--version"], text=True)
-    ).strip()
-    auth = await asyncio.to_thread(
-        subprocess.run, [executable, "login", "status"], text=True, capture_output=True
-    )
-    if auth.returncode or "ChatGPT" not in auth.stdout + auth.stderr:
-        raise NotRun("Installed Codex is not authenticated through the ChatGPT subscription")
-    root = (args.output or Path("results/evaluation") / ("arc-codex-" + new_id())).resolve()
+    root = (args.output or Path("results/evaluation") / ("arc-buffalo-" + new_id())).resolve()
     if root.exists() and any(root.iterdir()):
         raise ValueError("Output directory is not empty; preserve earlier artifacts")
     root.mkdir(parents=True, exist_ok=True)
     save(root / "manifest.json", config.model_dump(mode="json"))
     save(root / "buffalo-source.json", source_identity())
-    save(
-        root / "codex-runtime.json",
-        {
-            "executable": executable,
-            "sha256": file_digest(executable),
-            "version": version,
-            "authentication": "ChatGPT subscription",
-            "baseline": "actual Codex app-server",
-        },
-    )
     setup = config.benchmarks["arc-agi-3"].model_copy(deep=True)
     setup.task_ids = []
     probe = OfficialWorker(setup, "arc-agi-3", root / "official-aggregator")
@@ -158,10 +127,9 @@ async def execute_arc(args):
         )
         save(root / "comparison-contract.json", shared)
         if args.check:
-            row.update(status="PREFLIGHT", reason="Read-only ARC/Codex setup validation passed")
+            row.update(status="PREFLIGHT", reason="Read-only ARC/Buffalo setup validation passed")
             return 0
-        await gate.start()
-        profiles = ["codex", "buffalo"] if args.profile == "paired" else [args.profile]
+        profiles = ["buffalo"]
         semaphore = asyncio.Semaphore(args.games_concurrency)
         initial_hashes = {}
 
@@ -191,7 +159,7 @@ async def execute_arc(args):
                     )
                     raw_hash = digest(task)
                     if task_id in initial_hashes and initial_hashes[task_id] != raw_hash:
-                        raise NotRun("Initial observation differs between isolated game workers")
+                        raise NotRun("Initial observation differs between isolated game attempts")
                     initial_hashes[task_id] = raw_hash
                     identity = {
                         "task_id": task_id,
@@ -203,7 +171,7 @@ async def execute_arc(args):
                         "recording_directory": str(directory / "official" / profile / "recordings"),
                     }
                     save(directory / "identity.json", identity)
-                    # Same task and generic interaction instruction for both actual harnesses.
+                    # Keep the official task and Buffalo interaction instruction unchanged.
                     if policy:
                         controller = FixedGameControl(worker, directory, policy, gate, owner)
                         controller.identity = identity
@@ -238,8 +206,7 @@ async def execute_arc(args):
                             last_observation = await worker.call("arc_observation")
                             return result
 
-                    runner = run_codex if profile == "codex" else run_buffalo
-                    agent = await runner(
+                    agent = await run_buffalo(
                         config.run,
                         task,
                         directory,
@@ -331,7 +298,7 @@ async def execute_arc(args):
             asyncio.create_task(game(i, tid, p)) for i, tid in enumerate(task_ids) for p in profiles
         }
         await asyncio.gather(*jobs)
-        # Retry only invalid attempts, never a completed low score or a healthy counterpart.
+        # Retry only invalid attempts, never a completed low score.
         for attempt in () if policy else (2, 3):
             retry_jobs = []
             for i, task_id in enumerate(task_ids):

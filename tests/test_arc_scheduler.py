@@ -1,8 +1,6 @@
-"""Scheduler and native transport regressions, with no capability evaluation/inference."""
+"""Scheduler and inference admission regressions, with no capability evaluation/inference."""
 
 import asyncio
-import json
-from contextlib import asynccontextmanager
 
 import pytest
 
@@ -60,98 +58,6 @@ async def test_gate_maximum_16_and_throttle_step_down(tmp_path):
     assert gate.capacity == 15
     await gate.outcome(unstable=True)
     assert gate.capacity == 15  # One transport burst is not sixteen capacity decisions.
-
-
-async def test_native_proxy_preserves_payload_usage_and_releases_admission(tmp_path, config):
-    import aiohttp
-    from aiohttp import web
-
-    config.provider.model = "gpt-6-astra"
-    config.provider.parameters = {"reasoning_effort": "xhigh"}
-    received = []
-
-    class Response:
-        status = 200
-        headers = {"Content-Type": "text/event-stream"}
-
-        def __init__(self):
-            self.content = self
-
-        async def iter_any(self):
-            yield b'data: {"type":"response.completed","response":{"id":"resp-test","usage":{"input_tokens":123,"output_tokens":45}}}\n\n'
-
-    gate = await InferenceGate(tmp_path, 2).start()
-    try:
-        url = gate.register("native", config, tmp_path)
-
-        @asynccontextmanager
-        async def upstream(method, url, *, data, headers):
-            received.append(data)
-            yield Response()
-
-        gate.client.request = upstream
-        payload = {
-            "model": "gpt-6-astra",
-            "reasoning": {"effort": "xhigh"},
-            "input": [{"role": "user", "content": "protocol test"}],
-        }
-        async with aiohttp.ClientSession() as client:
-            async with client.post(url + "/responses", data=json.dumps(payload)) as response:
-                assert response.status == web.HTTPOk.status_code
-                assert "response.completed" in await response.text()
-        assert json.loads(received[0]) == payload
-        assert gate.usage("native")["total_tokens"] == 168
-        assert gate.usage("native")["model_calls"] == 1
-        assert gate.games["native"]["reserved_tokens"] == gate.active == 0
-        assert len(gate.games["native"]["primary_usages"]) == 1
-
-        class CompactResponse(Response):
-            headers = {"Content-Type": "application/json"}
-
-            async def iter_any(self):
-                yield b'{"id":"compact-test","usage":{"input_tokens":80,"output_tokens":30}}'
-
-        @asynccontextmanager
-        async def compact(method, url, *, data, headers):
-            received.append(data)
-            yield CompactResponse()
-
-        gate.client.request = compact
-        async with aiohttp.ClientSession() as client:
-            async with client.post(
-                url + "/responses/compact", data=json.dumps(payload)
-            ) as response:
-                assert response.status == 200
-                await response.read()
-        assert gate.usage("native")["total_tokens"] == 278
-        assert gate.usage("native")["model_calls"] == 2
-        assert len(gate.games["native"]["primary_usages"]) == 1
-
-        class FailedResponse(Response):
-            async def iter_any(self):
-                yield b'data: {"type":"response.failed","response":{"id":"failed-test","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
-
-        @asynccontextmanager
-        async def failed(method, url, *, data, headers):
-            received.append(data)
-            yield FailedResponse()
-
-        gate.client.request = failed
-        async with aiohttp.ClientSession() as client:
-            async with client.post(url + "/responses", data=json.dumps(payload)) as response:
-                await response.read()
-        assert gate.usage("native")["total_tokens"] == 293
-        assert gate.usage("native")["model_calls"] == 3
-        assert len(gate.games["native"]["primary_usages"]) == 1
-        config.limits.output_token_budget = 160
-        async with aiohttp.ClientSession() as client:
-            async with client.post(url + "/responses", data=json.dumps(payload)) as response:
-                assert response.status == 400
-                assert "budget exhausted" in await response.text()
-        assert len(received) == 3  # Rejected before another upstream model request.
-        assert gate.usage("native")["model_calls"] == 3
-    finally:
-        await gate.close()
 
 
 def test_only_infrastructure_failures_can_retry():

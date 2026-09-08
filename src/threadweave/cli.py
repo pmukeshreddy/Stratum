@@ -368,7 +368,7 @@ def parser():
     diagnostics.add_argument("--config", type=Path)
     from .evals.runner import arguments
 
-    evaluation = sub.add_parser("eval", help="Run the five official Buffalo capability benchmarks")
+    evaluation = sub.add_parser("eval", help="Run Buffalo on the official ARC-AGI-3 environments")
     arguments(evaluation)
     return p
 

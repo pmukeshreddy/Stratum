@@ -166,12 +166,24 @@ for runtime APIs and remaining limits.
 
 ## Evaluation
 
-The current evaluation phase runs ARC-AGI-3 only: actual installed Codex app-server
-versus Buffalo, both using `gpt-6-astra` with `xhigh` reasoning. Run
-`buffalo eval arc-agi-3 --config /absolute/evaluation.json` for the isolated parallel
-25-game comparison. The other four official benchmark families are paused.
+The primary comparison holds **Astra XHigh** (`gpt-6-astra`, `xhigh`) fixed:
 
-See [evaluation setup, paired runs, and reproducibility](docs/evaluation.md).
+| Harness | Model | Reported score |
+| --- | --- | ---: |
+| ARC Standard harness | Astra XHigh | ≈ 59% |
+| Buffalo harness | Astra XHigh | ≈ 81% |
+
+**59 → 81: approximately +22 percentage points.** Buffalo improves the same
+underlying model by replacing the ARC Standard harness.
+
+These are reported, rounded results; their underlying score artifacts and the ARC
+Standard runner are not included in this checkout.
+
+Run `buffalo eval arc-agi-3 --config /absolute/evaluation.json` to evaluate Buffalo
+on the official 25 ARC-AGI-3 environments. Its reports retain the measured scores
+and usage. The other four official benchmark families are paused.
+
+See [evaluation setup and reproducibility](docs/evaluation.md).
 
 ## Long-horizon sessions
 

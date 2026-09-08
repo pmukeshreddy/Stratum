@@ -15,7 +15,6 @@ def arguments(parser):
     parser.add_argument("benchmark", choices=["arc-agi-3"], nargs="?", default="arc-agi-3")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--profile", choices=["codex", "buffalo", "paired"], default="paired")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--limit", type=positive, help="Explicit ARC validation subset; omit for all 25 games"
