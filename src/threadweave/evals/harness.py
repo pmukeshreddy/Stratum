@@ -28,6 +28,7 @@ class MatchedProvider:
     def __init__(self, provider, config, log, gate=None, owner=None):
         self.provider, self.config, self.log = provider, config, Path(log)
         self.gate, self.owner = gate, owner
+        self.primary_usages = []
 
     async def resolve(self, config):
         resolved, details = await self.provider.resolve(config)
@@ -87,6 +88,11 @@ class MatchedProvider:
                 )
                 + "\n"
             )
+        if request.parent_id is None and request.metadata.get("purpose", "agent") == "agent":
+            measured = response.usage.model_copy(deep=True)
+            measured.model_calls += 1
+            measured.estimated_calls += int(not response.usage_reported)
+            self.primary_usages.append(measured)
         return response
 
 
@@ -164,22 +170,27 @@ async def run_buffalo(
     long_context=False,
     gate=None,
     owner=None,
+    controller=None,
 ):
     directory = Path(directory)
     workspace = directory / "workspace"
-    workspace.mkdir(parents=True)
+    workspace.mkdir(parents=True, exist_ok=True)
     resolved = config.model_copy(deep=True)
     resolved.control_plane = "python"
     instruction = (
         task["messages"][-1]["content"]
-        if long_context
+        if long_context or controller
         else "Complete the supplied official task and return its requested final answer."
     )
     resolved.task = TaskConfig(
         verify_each_turn=False,
         wait_for_children=True,
-        instruction_messages=[] if long_context else task["messages"],
+        instruction_messages=[] if long_context or controller else task["messages"],
     )
+    if controller:
+        resolved.task.adapter = "interactive_evaluation"
+        resolved.task.verifier = "terminal"
+        resolved.task.require_verifier = True
     if long_context:
         (workspace / "task.txt").write_text(instruction)
     if action:
@@ -199,6 +210,7 @@ async def run_buffalo(
         directory / "state",
         providers={resolved.provider.name: provider},
         concurrency=resolved.limits.concurrency,
+        adapters={"interactive_evaluation": controller} if controller else None,
     )
     if action:
 
@@ -217,9 +229,31 @@ async def run_buffalo(
             resolved.tool_allowlist.append("benchmark_action")
     save(directory / "buffalo-config.json", resolved.model_dump(mode="json"))
     session = None
+    terminal_watcher = None
     begin, started = time.monotonic(), timestamp()
     try:
         session = runtime.create(instruction, workspace, config=resolved)
+        if controller:
+            controller.identity["session_id"] = session.id
+
+            def identity():
+                kernel = runtime.kernels.get(session.id)
+                process = getattr(kernel, "process", None)
+                return {**controller.identity, "python_pid": getattr(process, "pid", None)}
+
+            controller.identity_reader = identity
+            controller.usage_reader = lambda: accounting(
+                [runtime.store.usage(session.id, tree=True)], time.monotonic() - begin
+            )
+            controller.primary_usage_reader = lambda: accounting(
+                provider.primary_usages, time.monotonic() - begin
+            )
+
+            async def stop_terminal():
+                await controller.done.wait()
+                await runtime.stop(session.id, tree=True)
+
+            terminal_watcher = asyncio.create_task(stop_terminal())
         await runtime.start()
         while True:
             remaining = config.limits.wall_seconds - (time.monotonic() - begin)
@@ -265,12 +299,21 @@ async def run_buffalo(
             directory / "sessions.json",
             [s.model_dump(mode="json") for s in runtime.store.sessions(root_id=session.root_id)],
         )
-        if session.outcome == "failed" and session.last_error:
+        if controller:
+            result.update(await controller.finish())
+        if (
+            session.outcome == "failed"
+            and session.last_error
+            and not (controller and controller.done.is_set() and not controller.error)
+        ):
             raise NotRun(f"{session.last_error.code}: {session.last_error.message}")
         if not usage.model_calls:
             raise NotRun(f"Buffalo could not invoke the model: {session.result or session.outcome}")
         return result
     finally:
+        if terminal_watcher:
+            terminal_watcher.cancel()
+            await asyncio.gather(terminal_watcher, return_exceptions=True)
         if session:
             pending = list(runtime.tasks.values())
             for member in runtime.store.sessions(root_id=session.root_id):

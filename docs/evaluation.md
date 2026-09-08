@@ -37,6 +37,24 @@ Each output directory must be empty. Existing artifacts are preserved. A failed
 setup or invalid execution reports its exact reason; there is no alternate benchmark.
 The full run requires exactly 25 official environments. Subset reports are labeled.
 
+For fixed-game protocol diagnostics, add `--protocol-validation /absolute/policy.json`
+and `--limit 1` or `--limit 2`, with seed zero. The policy supplies `instructions`,
+`guidance`, `continuation_prompt`, `max_continuations`, `max_turns`, `max_tokens`,
+and `wall_seconds`. This mode exposes `observe`, `status`, and `act` through a
+local Python client, limits each game to 500 actions and each batch to 20, and
+disables delegation. Every continuation retains the same environment, workspace,
+and native Codex thread or Buffalo session. Terminal observations stop further
+inference admission. Infrastructure failures remain failed attempts without
+automatic fresh-game retries.
+
+Diagnostic snapshots retain official scores and actual cumulative usage at action,
+continuation, and final boundaries. They neither impose output-token thresholds nor
+claim to reproduce a published scaling curve. The continuation counter uses
+successful root assistant responses and noncached input plus output tokens; the
+separate resource ledger includes all calls, including auxiliary inference.
+Codex's named permission profile allows only the assigned local game socket, with
+an empty network-domain allowlist. Its normal agent and tools execute the task.
+
 ## Isolation, matching, and budgets
 
 Every game attempt owns an official worker process, Arcade/environment instance,

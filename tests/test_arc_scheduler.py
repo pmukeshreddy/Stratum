@@ -40,6 +40,8 @@ async def test_global_gate_covers_root_descendant_and_auxiliary_calls(tmp_path, 
         assert gate.peak == provider.peak_active == 2 and gate.active == 0
         assert runtime.store.usage(root.id, tree=True).model_calls == 7
         assert sum(r.parent_id is not None for r in provider.requests) == 4
+        assert len(matched.primary_usages) == 1
+        assert matched.primary_usages[0].model_calls == 1
     finally:
         await runtime.shutdown()
         await gate.close()
@@ -101,13 +103,36 @@ async def test_native_proxy_preserves_payload_usage_and_releases_admission(tmp_p
         assert gate.usage("native")["total_tokens"] == 168
         assert gate.usage("native")["model_calls"] == 1
         assert gate.games["native"]["reserved_tokens"] == gate.active == 0
+        assert len(gate.games["native"]["primary_usages"]) == 1
+
+        class CompactResponse(Response):
+            headers = {"Content-Type": "application/json"}
+
+            async def iter_any(self):
+                yield b'{"id":"compact-test","usage":{"input_tokens":80,"output_tokens":30}}'
+
+        @asynccontextmanager
+        async def compact(method, url, *, data, headers):
+            received.append(data)
+            yield CompactResponse()
+
+        gate.client.request = compact
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                url + "/responses/compact", data=json.dumps(payload)
+            ) as response:
+                assert response.status == 200
+                await response.read()
+        assert gate.usage("native")["total_tokens"] == 278
+        assert gate.usage("native")["model_calls"] == 2
+        assert len(gate.games["native"]["primary_usages"]) == 1
         config.limits.output_token_budget = 160
         async with aiohttp.ClientSession() as client:
             async with client.post(url + "/responses", data=json.dumps(payload)) as response:
                 assert response.status == 400
                 assert "budget exhausted" in await response.text()
-        assert len(received) == 1  # Rejected before another upstream model request.
-        assert gate.usage("native")["model_calls"] == 1
+        assert len(received) == 2  # Rejected before another upstream model request.
+        assert gate.usage("native")["model_calls"] == 2
     finally:
         await gate.close()
 

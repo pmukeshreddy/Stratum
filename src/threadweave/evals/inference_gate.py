@@ -18,6 +18,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
+from ..models import HarnessError
 from ..tokenization import estimate
 from .schema import accounting, save, timestamp
 
@@ -35,6 +36,16 @@ class InferenceGate:
         self.games = {}
         self.sequence = 0
         self.last_reduction = float("-inf")
+        self.stopped = set()
+
+    async def stop_admission(self, owner):
+        """Block new calls after a terminal observation without interrupting a response."""
+        async with self.condition:
+            self.stopped.add(owner)
+            if owner in self.games:
+                self.games[owner]["closed"] = True
+                self.games[owner]["stop_reason"] = "environment_terminal"
+            self.condition.notify_all()
 
     def journal(self, **event):
         with (self.directory / "inference-events.jsonl").open("a") as stream:
@@ -43,7 +54,11 @@ class InferenceGate:
     @asynccontextmanager
     async def permit(self, owner):
         async with self.condition:
-            await self.condition.wait_for(lambda: self.active < self.capacity)
+            await self.condition.wait_for(
+                lambda: owner in self.stopped or self.active < self.capacity
+            )
+            if owner in self.stopped:
+                raise HarnessError("environment", "environment_terminal", "Game already ended")
             self.active += 1
             self.peak = max(self.peak, self.active)
             self.sequence += 1
@@ -92,6 +107,7 @@ class InferenceGate:
             "config": config,
             "directory": Path(directory),
             "usages": [],
+            "primary_usages": [],
             "started": time.monotonic(),
             "closed": False,
             "errors": [],
@@ -113,7 +129,17 @@ class InferenceGate:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180),
             auto_decompress=False,
         )
-        app = web.Application(client_max_size=128 * 1024 * 1024)
+
+        @web.middleware
+        async def terminal_response(request, handler):
+            try:
+                return await handler(request)
+            except HarnessError as exc:
+                if exc.failure.code != "environment_terminal":
+                    raise
+                return web.json_response({"error": {"message": "Game already ended"}}, status=400)
+
+        app = web.Application(client_max_size=128 * 1024 * 1024, middlewares=[terminal_response])
         app.router.add_route("*", "/{owner}/{path:.*}", self.forward)
         self.server = web.AppRunner(app, access_log=None)
         await self.server.setup()
@@ -197,6 +223,7 @@ class InferenceGate:
         sent = False
         outgoing = None
         tool_calls = 0
+        json_parts = []
         async with self.permit(owner) as ticket:
             # Match Runtime's BudgetBusy semantics: another descendant's reservation
             # can be released without ending this logical game.
@@ -276,6 +303,8 @@ class InferenceGate:
                     await outgoing.prepare(request)
                     sent = True
                     async for chunk in response.content.iter_any():
+                        if "application/json" in response.headers.get("Content-Type", ""):
+                            json_parts.append(chunk)
                         partial += chunk
                         while b"\n" in partial:
                             line, partial = partial.split(b"\n", 1)
@@ -294,6 +323,11 @@ class InferenceGate:
                                         game["tool_calls"] += 1
                                         tool_calls += 1
                         await outgoing.write(chunk)
+                    if json_parts:
+                        with contextlib.suppress(ValueError, TypeError):
+                            data = json.loads(b"".join(json_parts))
+                            usage = data.get("usage") or usage
+                            response_id = data.get("id") or response_id
                     await outgoing.write_eof()
                     await self.outcome()
                     return outgoing
@@ -333,6 +367,8 @@ class InferenceGate:
                     "wall_seconds": time.monotonic() - begin,
                 }
                 game["usages"].append(measured)
+                if path == "responses" and usage and status == 200:
+                    game["primary_usages"].append(measured)
                 self.journal(
                     event="codex_request_finished",
                     ticket=ticket,

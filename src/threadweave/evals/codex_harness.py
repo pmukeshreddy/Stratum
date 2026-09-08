@@ -11,7 +11,7 @@ import signal
 import time
 from pathlib import Path
 
-from .schema import NotRun, save, timestamp
+from .schema import NotRun, accounting, save, timestamp
 
 
 class CodexAgent:
@@ -120,7 +120,7 @@ class CodexAgent:
         if executable is None:
             raise NotRun("The actual Codex executable is not installed")
         workspace = (self.directory / "workspace").resolve()
-        workspace.mkdir(parents=True)
+        workspace.mkdir(parents=True, exist_ok=True)
         options = {
             "model": config.provider.model,
             "model_reasoning_effort": "xhigh",
@@ -140,15 +140,47 @@ class CodexAgent:
             "model_context_window": config.context.max_tokens,
             "agents.default_subagent_model": config.provider.model,
             "agents.default_subagent_reasoning_effort": "xhigh",
-            "agents.max_concurrent_threads_per_session": config.limits.max_subagents,
             "features.enable_request_compression": False,
             "features.memories": False,
         }
+        if config.limits.max_subagents:
+            options["agents.max_concurrent_threads_per_session"] = config.limits.max_subagents
+        else:
+            options.update(
+                {
+                    "agents.enabled": False,
+                    "features.multi_agent": False,
+                    "features.multi_agent_v2": False,
+                }
+            )
+
+        connection = workspace / ".game-connection.json"
+        if self.action is None and connection.exists():
+            socket_path = json.loads(connection.read_text())["socket"]
+            options.pop("sandbox_mode")
+            options["default_permissions"] = "arc_game"
+            options["permissions.arc_game"] = {
+                "filesystem": {
+                    ":root": "read",
+                    str(workspace): "write",
+                    ":slash_tmp": "write",
+                    ":tmpdir": "write",
+                },
+                "network": {
+                    "enabled": True,
+                    "proxy_url": "http://127.0.0.1:0",
+                    "enable_socks5": False,
+                    "unix_sockets": {socket_path: "allow"},
+                    "domains": {},
+                },
+            }
 
         # TOML accepts JSON strings, scalars, and arrays; inline tables need TOML syntax.
         def toml(value):
             if isinstance(value, dict):
-                return "{" + ", ".join(f"{k} = {toml(v)}" for k, v in value.items()) + "}"
+                return (
+                    "{" + ", ".join(f"{json.dumps(k)} = {toml(v)}" for k, v in value.items()) + "}"
+                )
             return json.dumps(value)
 
         command = [executable, "app-server"]
@@ -189,7 +221,7 @@ class CodexAgent:
             modelProvider="arc_subscription_transport",
             cwd=str(workspace),
             approvalPolicy="never",
-            sandbox="workspace-write",
+            **({"sandbox": "workspace-write"} if "sandbox_mode" in options else {}),
             ephemeral=False,
             allowProviderModelFallback=False,
             dynamicTools=[
@@ -204,7 +236,9 @@ class CodexAgent:
                         "additionalProperties": False,
                     },
                 }
-            ],
+            ]
+            if self.action
+            else [],
         )
         self.thread_id = thread["thread"]["id"]
         self.thread_ids.add(self.thread_id)
@@ -238,7 +272,7 @@ class CodexAgent:
             self.stderr.close()
 
 
-async def run_codex(config, task, directory, *, action, gate, owner):
+async def run_codex(config, task, directory, *, action, gate, owner, controller=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     agent = CodexAgent(directory, action)
@@ -249,6 +283,12 @@ async def run_codex(config, task, directory, *, action, gate, owner):
         await agent.start(config, url)
         begin, started = time.monotonic(), timestamp()
         gate.games[owner]["started"] = begin
+        if controller:
+            controller.identity["thread_id"] = agent.thread_id
+            controller.usage_reader = lambda: gate.usage(owner)
+            controller.primary_usage_reader = lambda: accounting(
+                gate.games[owner]["primary_usages"], time.monotonic() - begin
+            )
         turn = await agent.call(
             "turn/start",
             threadId=agent.thread_id,
@@ -260,6 +300,7 @@ async def run_codex(config, task, directory, *, action, gate, owner):
         while (
             time.monotonic() - begin < config.limits.wall_seconds
             and not gate.games[owner]["closed"]
+            and not (controller and controller.done.is_set())
         ):
             try:
                 event = await asyncio.wait_for(
@@ -281,8 +322,22 @@ async def run_codex(config, task, directory, *, action, gate, owner):
                 status = params["turn"]["status"]
                 if status == "failed" and not gate.games[owner]["closed"]:
                     raise NotRun(f"Actual Codex turn failed: {params['turn'].get('error')}")
+                if status == "completed" and controller and await controller.boundary():
+                    turn = await agent.call(
+                        "turn/start",
+                        threadId=agent.thread_id,
+                        model=config.provider.model,
+                        effort="xhigh",
+                        input=[{"type": "text", "text": controller.policy["continuation_prompt"]}],
+                    )
+                    turn_id = turn["turn"]["id"]
+                    continue
                 reason = status
                 break
+        if controller and controller.stop_reason:
+            reason = controller.stop_reason
+        elif gate.games[owner]["stop_reason"]:
+            reason = gate.games[owner]["stop_reason"]
         gate.games[owner]["closed"] = True
         with contextlib.suppress(Exception):
             await agent.call("turn/interrupt", threadId=agent.thread_id, turnId=turn_id)
@@ -298,7 +353,9 @@ async def run_codex(config, task, directory, *, action, gate, owner):
         raise NotRun("Actual Codex made no model requests")
     if any("different model" in error for error in gate.games[owner]["errors"]):
         raise NotRun("Codex requested a different model or reasoning level; comparison invalid")
+    protocol_result = await controller.finish() if controller else {}
     return {
+        **protocol_result,
         "response": answer,
         "stop_reason": reason,
         "start_time": started,

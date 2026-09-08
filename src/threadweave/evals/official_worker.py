@@ -79,6 +79,68 @@ def check_docker():
     return result.stdout.strip()
 
 
+class FixedArcGame:
+    """Count committed actions on one retained official environment."""
+
+    max_actions = 500
+    max_batch = 20
+
+    def __init__(self, env, game_id, action_type):
+        self.env, self.game_id = env, game_id
+        self.action_type = action_type
+        self.actions = 0
+        self.terminal = "ACTIVE"
+        self.last = env.reset()
+
+    def observe(self):
+        return {
+            "game_id": self.game_id,
+            "state": self.last.state.name,
+            "levels_completed": self.last.levels_completed,
+            "available_actions": list(self.last.available_actions),
+            "frame": [f.tolist() if hasattr(f, "tolist") else f for f in self.last.frame],
+            "actions_taken": self.actions,
+            "actions_remaining": max(0, self.max_actions - self.actions),
+            "terminal": self.terminal,
+        }
+
+    def act(self, actions):
+        if not isinstance(actions, list) or not 1 <= len(actions) <= self.max_batch:
+            raise ValueError("act takes 1..20 actions")
+        if self.terminal != "ACTIVE":
+            return self.observe()
+        before = self.last.levels_completed
+        for action in actions:
+            name, data = action.get("name"), action.get("data") or {}
+            if name not in {"RESET", *[f"ACTION{i}" for i in range(1, 8)]}:
+                raise ValueError(f"Bad action: {name}")
+            if name == "ACTION6":
+                if not all(isinstance(data.get(k), int) and 0 <= data[k] <= 63 for k in ("x", "y")):
+                    raise ValueError("ACTION6 needs integer x,y in 0..63")
+                self.last = self.env.step(
+                    self.action_type[name], data={"x": data["x"], "y": data["y"]}
+                )
+            elif name == "RESET":
+                self.last = self.env.reset()
+            else:
+                self.last = self.env.step(self.action_type[name])
+            if self.last is None:
+                raise RuntimeError("Official environment returned no observation after action")
+            self.actions += 1
+            if self.last.state.name == "GAME_OVER" and self.actions < self.max_actions:
+                self.last = self.env.reset()
+                self.actions += 1
+                break
+            if self.last.state.name == "WIN":
+                self.terminal = "WIN"
+                break
+            if self.last.levels_completed != before or self.actions >= self.max_actions:
+                break
+        if self.actions >= self.max_actions and self.terminal == "ACTIVE":
+            self.terminal = "ACTION_CAP"
+        return self.observe()
+
+
 class Judge:
     def generate(self, query, max_tokens=40960, temperature=0.0):
         emit(
@@ -454,13 +516,20 @@ class Official:
             return {"scorecard_id": self.card_id}
         return {}
 
-    def start_task(self, task_id):
+    def start_task(self, task_id, fixed_game=False):
         if self.benchmark == "arc-agi-3":
             self.env = self.arc.make(
-                task_id, seed=self.seed, scorecard_id=self.card_id, save_recording=True
+                task_id,
+                seed=self.seed,
+                scorecard_id=self.card_id,
+                save_recording=True,
+                **({"include_frame_data": True} if fixed_game else {}),
             )
             if self.env is None or self.env.observation_space is None:
                 raise RuntimeError(f"ARC toolkit could not initialize {task_id}")
+            if fixed_game:
+                self.fixed_game = FixedArcGame(self.env, task_id, self.GameAction)
+                return {"observation": self.fixed_game.observe()}
             return {
                 "messages": [
                     {
@@ -545,6 +614,33 @@ class Official:
         # Transport session GUIDs differ after a fresh reset; game state and frames do not.
         observation.pop("guid", None)
         return {"observation": observation, "actions": [a.name for a in self.env.action_space]}
+
+    def game_query(self, op, actions=None):
+        if op in {"observe", "status"}:
+            return self.fixed_game.observe()
+        if op == "act":
+            return self.fixed_game.act(actions)
+        raise ValueError(f"Unknown fixed-game operation: {op}")
+
+    def snapshot_arc(self):
+        """Read-only official scoring; never close/reset a live environment."""
+        from arc_agi.models import EnvironmentInfo
+        from arc_agi.scorecard import EnvironmentScorecard
+
+        card = self.arc.scorecard_manager.get_scorecard(self.card_id, self.arc.arc_api_key)
+        if card is None:
+            raise RuntimeError("Live official scorecard unavailable")
+        frozen = card.model_copy(deep=True)
+        score = EnvironmentScorecard.from_scorecard(
+            frozen, [EnvironmentInfo.model_validate(info) for info in self.environment_info]
+        )
+        return {
+            "scorecard_id": self.card_id,
+            "primary_score": score.score,
+            "metric": "RHAE (%)",
+            "raw": score.model_dump(mode="json", exclude={"api_key"}),
+            "official_card": frozen.model_dump(mode="json", exclude={"api_key"}),
+        }
 
     def action(self, action=None, data=None, code=None):
         if self.benchmark == "arc-agi-3":
@@ -694,6 +790,8 @@ def main():
                 "finish_profile",
                 "aggregate_arc",
                 "arc_observation",
+                "game_query",
+                "snapshot_arc",
             }:
                 raise ValueError(f"Unknown operation: {operation}")
             with contextlib.redirect_stdout(sys.stderr):

@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from ..models import new_id
+from .arc_protocol import FixedGameControl, load_validation
 from .bridge import OfficialWorker
 from .codex_harness import run_codex
 from .harness import run_buffalo
@@ -74,6 +75,14 @@ async def execute_arc(args):
     config, error = load(args.config)
     if error:
         raise NotRun(error)
+    validation_path = getattr(args, "protocol_validation", None)
+    policy = load_validation(validation_path, args.limit, args.seed) if validation_path else None
+    if policy:
+        if config.benchmarks["arc-agi-3"].options.get("operation_mode", "OFFLINE") != "OFFLINE":
+            raise NotRun("Fixed-game validation requires the pinned local OFFLINE environments")
+        config.run.limits.max_subagents = 0
+        config.run.limits.max_depth = 0
+        config.run.permissions = [p for p in config.run.permissions if p != "agents"]
     config = await resolve(config)
     if (
         config.run.provider.name != "codex_subscription"
@@ -131,6 +140,14 @@ async def execute_arc(args):
         if not args.limit and len(task_ids) != 25:
             raise NotRun(f"Expected the pinned 25 official environments, found {len(task_ids)}")
         shared = contract(config, provenance, task_ids, args.seed)
+        if policy:
+            shared["protocol_validation"] = {
+                "policy_sha256": digest(policy),
+                "action_limit": 500,
+                "batch_limit": 20,
+                "whole_game_retries": 0,
+                "snapshots": "diagnostic action/continuation boundaries; no inferred scaling thresholds",
+            }
         row.update(
             provenance,
             task_ids=task_ids,
@@ -165,36 +182,40 @@ async def execute_arc(args):
                     "trajectory_reference": str(directory),
                 }
                 game_begin = time.monotonic()
+                controller = None
                 try:
                     await worker.start()
                     card = await worker.call("start_profile", profile=profile, seed=args.seed)
-                    task = await worker.call("start_task", task_id=task_id)
+                    task = await worker.call(
+                        "start_task", task_id=task_id, **({"fixed_game": True} if policy else {})
+                    )
                     raw_hash = digest(task)
                     if task_id in initial_hashes and initial_hashes[task_id] != raw_hash:
                         raise NotRun("Initial observation differs between isolated game workers")
                     initial_hashes[task_id] = raw_hash
-                    save(
-                        directory / "identity.json",
-                        {
-                            "task_id": task_id,
-                            "input_sha256": raw_hash,
-                            "comparison_contract_sha256": digest(shared),
-                            "worker_pid": worker.process.pid,
-                            "scorecard_id": card["scorecard_id"],
-                            "workspace": str(directory / "workspace"),
-                            "recording_directory": str(
-                                directory / "official" / profile / "recordings"
-                            ),
-                        },
-                    )
+                    identity = {
+                        "task_id": task_id,
+                        "input_sha256": raw_hash,
+                        "comparison_contract_sha256": digest(shared),
+                        "worker_pid": worker.process.pid,
+                        "scorecard_id": card["scorecard_id"],
+                        "workspace": str(directory / "workspace"),
+                        "recording_directory": str(directory / "official" / profile / "recordings"),
+                    }
+                    save(directory / "identity.json", identity)
                     # Same task and generic interaction instruction for both actual harnesses.
-                    task["messages"][-1]["content"] += (
-                        "\nKeep interacting autonomously until the game is won or your run budget expires. Use only observations to infer rules; do not inspect environment implementation files or known solutions. Any delegated agents must use gpt-6-astra with xhigh reasoning."
-                    )
+                    if policy:
+                        controller = FixedGameControl(worker, directory, policy, gate, owner)
+                        controller.identity = identity
+                        task = await controller.start()
+                    else:
+                        task["messages"][-1]["content"] += (
+                            "\nKeep interacting autonomously until the game is won or your run budget expires. Use only observations to infer rules; do not inspect environment implementation files or known solutions. Any delegated agents must use gpt-6-astra with xhigh reasoning."
+                        )
                     save(directory / "task-input.json", task)
                     action_count = 0
                     action_lock = asyncio.Lock()
-                    last_observation = await worker.call("arc_observation")
+                    last_observation = None if policy else await worker.call("arc_observation")
                     integrity_errors = []
 
                     async def action(**kwargs):
@@ -219,7 +240,13 @@ async def execute_arc(args):
 
                     runner = run_codex if profile == "codex" else run_buffalo
                     agent = await runner(
-                        config.run, task, directory, action=action, gate=gate, owner=owner
+                        config.run,
+                        task,
+                        directory,
+                        action=None if controller else action,
+                        gate=gate,
+                        owner=owner,
+                        **({"controller": controller} if controller else {}),
                     )
                     result.update(agent)
                     output_budget = config.run.limits.output_token_budget
@@ -241,7 +268,9 @@ async def execute_arc(args):
                     result.update(
                         final,
                         status="COMPLETED",
-                        actions=action_count,
+                        actions=agent["game_state"]["actions_taken"]
+                        if controller
+                        else action_count,
                         isolation_verified=True,
                         input_sha256=raw_hash,
                     )
@@ -260,6 +289,8 @@ async def execute_arc(args):
                             await worker.call("finish_profile"),
                         )
                 finally:
+                    if controller:
+                        await controller.close()
                     await worker.close()
                     usage_file = directory / "usage.json"
                     result["usage"] = (
@@ -301,7 +332,7 @@ async def execute_arc(args):
         }
         await asyncio.gather(*jobs)
         # Retry only invalid attempts, never a completed low score or a healthy counterpart.
-        for attempt in (2, 3):
+        for attempt in () if policy else (2, 3):
             retry_jobs = []
             for i, task_id in enumerate(task_ids):
                 for profile in profiles:
