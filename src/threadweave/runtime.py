@@ -699,6 +699,25 @@ class Runtime(MemoryServices):
         tokens = usage.input_tokens + usage.output_tokens + reserved_tokens
         if usage.input_tokens + usage.output_tokens >= limits.token_budget:
             raise LimitReached("Root token budget exhausted")
+        if limits.output_token_budget is not None:
+            if usage.output_tokens >= limits.output_token_budget:
+                raise LimitReached("Root output token budget exhausted")
+            if resource == "model_calls":
+                reserved_output = self.store.db.execute(
+                    "SELECT COALESCE(SUM(r.output_tokens),0) FROM reservations r "
+                    "JOIN sessions s ON s.id=r.session_id WHERE s.root_id=?",
+                    (root.id,),
+                ).fetchone()[0]
+                output = (provider or self.store.config(sid).provider).max_output_tokens
+                if usage.output_tokens + reserved_output + output > limits.output_token_budget:
+                    if (
+                        reserved_output
+                        and usage.output_tokens + output <= limits.output_token_budget
+                    ):
+                        raise BudgetBusy()
+                    raise LimitReached(
+                        "Insufficient root output tokens to reserve the next invocation"
+                    )
         if limits.cost_budget is not None and usage.cost >= limits.cost_budget:
             raise LimitReached("Root cost budget exhausted")
         if resource == "turns" and usage.turns >= limits.max_turns:

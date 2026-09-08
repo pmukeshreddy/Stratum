@@ -222,6 +222,17 @@ async def execute_arc(args):
                         config.run, task, directory, action=action, gate=gate, owner=owner
                     )
                     result.update(agent)
+                    output_budget = config.run.limits.output_token_budget
+                    if (
+                        output_budget is not None
+                        and agent["usage"]["output_tokens"] > output_budget
+                    ):
+                        raise NotRun(
+                            "Output budget exceeded by provider response: "
+                            f"{agent['usage']['output_tokens']} > {output_budget}; "
+                            "the subscription endpoint has no supported hard output limit. "
+                            "Usage retained; this comparison is invalid."
+                        )
                     if integrity_errors:
                         raise NotRun("; ".join(integrity_errors))
                     final = await worker.call("finish_profile")

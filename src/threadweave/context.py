@@ -116,31 +116,48 @@ class Context:
 
     def supplemental(self, sid: str) -> str:
         session, config = self.store.session(sid), self.store.config(sid)
-        entries, remaining, used = [], config.context.supplemental_chars, []
+        from .context_budget import policy_tokens, state_excerpt
         from .state_retrieval import relevant_state
 
-        for entry_id in dict.fromkeys(
-            [*session.selected_state, *[e["id"] for e in relevant_state(self.store, sid)]]
-        ):
+        model = config.provider.model
+        selected, automatic = [], []
+        for entry_id in dict.fromkeys(session.selected_state):
             try:
                 entry = self.store.state(sid, entry_id)
             except KeyError:
                 continue
-            if entry["deleted"]:
-                continue
-            text = encode(
-                {
-                    "id": entry_id,
-                    "kind": entry["kind"],
-                    "version": entry["version"],
-                    "title": entry["title"],
-                    "content": entry["content"],
-                }
+            if not entry["deleted"]:
+                selected.append(entry)
+        selected_ids = {e["id"] for e in selected}
+        automatic = [e for e in relevant_state(self.store, sid) if e["id"] not in selected_ids]
+        budget = policy_tokens(config.context, "supplemental", model)
+        # Explicit selections receive equal minimum semantic allocations before incidental state.
+        minimum = 320 if model.startswith(("gpt-", "o1", "o3", "o4", "codex")) else 1100
+        budget = max(budget, len(selected) * minimum)
+        ceiling = config.context.max_tokens - config.provider.max_output_tokens
+        if budget > ceiling and selected:
+            raise HarnessError(
+                "runtime",
+                "selected_state_capacity",
+                "Selected state needs more context; no selected body was silently omitted",
             )
-            if len(text) <= remaining:
-                entries.append(text)
-                remaining -= len(text)
-                used.append({"id": entry_id, "version": entry["version"]})
+        records, used, remaining = [], [], min(budget, ceiling)
+        for index, entry in enumerate([*selected, *automatic]):
+            explicit = index < len(selected)
+            allocation = remaining // (len(selected) - index) if explicit else remaining
+            record = state_excerpt(entry, allocation, model, explicit=explicit)
+            if record is None:
+                if explicit:
+                    raise HarnessError(
+                        "runtime",
+                        "selected_state_capacity",
+                        "Selected state metadata leaves no room for useful content",
+                    )
+                continue
+            records.append(record)
+            remaining -= token_bound(record, model)
+            used.append({"id": entry["id"], "version": entry["version"]})
+        entries = [encode(record) for record in records]
         previous = self.store.events(sid, kind="state_retrieved", limit=1)
         if used and (not previous or previous[0]["payload"]["entries"] != used):
             self.store.event(
@@ -310,42 +327,23 @@ class Context:
                     "selected_state": session.selected_state,
                 },
             )
-            excerpts = []
-            for block in removed:
-                pieces = []
-                for message in block["messages"]:
-                    content = message.get("content") or encode(message.get("tool_calls", []))
-                    pieces.append(f"{message['role']}: {content[:400]}")
-                excerpts.append(f"event={block['event_id']} " + " | ".join(pieces))
-            # Keep unresolved negative evidence before less consequential excerpts.
-            critical = [
-                e
-                for e in excerpts
-                if any(
-                    word in e.lower()
-                    for word in (
-                        "failed",
-                        "error",
-                        "constraint",
-                        "hypothesis",
-                        "regression",
-                        "must not",
-                    )
-                )
-            ]
-            additions = "\n".join(excerpts)
-            cap = policy.summary_chars
-            # Preserve part of the prior digest and the most recent observations.
-            prior = (session.summary[: cap // 4] + "\n" + "\n".join(critical)[-cap // 3 :]).strip()
-            summary = (
-                ("Critical evidence:\n" + "\n".join(critical)[-cap // 3 :] + "\n" + summary)[:cap]
-                if summary
-                else (prior + "\n" + additions[-(cap - len(prior) - 1) :]).strip()
+            from .context_budget import extractive_summary, policy_tokens, summary_budget
+
+            model = self.store.config(sid).provider.model
+            try:
+                parsed = json.loads(summary) if isinstance(summary, str) else summary
+            except ValueError:
+                parsed = None
+            if not isinstance(parsed, dict):
+                parsed = extractive_summary(session.summary, removed)
+                if summary:
+                    parsed["established_facts"].append(summary)
+            summary = summary_budget(
+                parsed,
+                budget=policy_tokens(policy, "summary", model),
+                model=model,
+                reference=f"Complete compacted history and prior digest: artifacts.load({archive!r})",
             )
-            reference = (
-                f"\nComplete compacted history and prior digest: artifacts.load({archive!r})"
-            )
-            summary = summary[: max(0, cap - len(reference))] + reference
             source_events = [b["event_id"] for b in removed]
             eid = self.store.event(
                 sid,

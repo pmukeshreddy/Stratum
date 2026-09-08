@@ -97,6 +97,7 @@ class InferenceGate:
             "errors": [],
             "inflight": 0,
             "reserved_tokens": 0,
+            "reserved_output_tokens": 0,
             "tasks": set(),
             "tool_calls": 0,
             "stop_reason": None,
@@ -197,6 +198,24 @@ class InferenceGate:
         outgoing = None
         tool_calls = 0
         async with self.permit(owner) as ticket:
+            # Match Runtime's BudgetBusy semantics: another descendant's reservation
+            # can be released without ending this logical game.
+            while not game["closed"] and game["inflight"]:
+                totals = self.usage(owner)
+                output = config.provider.max_output_tokens
+                output_busy = config.limits.output_token_budget is not None and (
+                    totals["output_tokens"] + output
+                    <= config.limits.output_token_budget
+                    < totals["output_tokens"] + game["reserved_output_tokens"] + output
+                )
+                total_busy = (
+                    totals["total_tokens"] + bound + output
+                    <= config.limits.token_budget
+                    < totals["total_tokens"] + game["reserved_tokens"] + bound + output
+                )
+                if not (output_busy or total_busy):
+                    break
+                await asyncio.sleep(0.01)
             totals = self.usage(owner)
             if (
                 game["closed"]
@@ -207,6 +226,13 @@ class InferenceGate:
                 + bound
                 + config.provider.max_output_tokens
                 > config.limits.token_budget
+                or (
+                    config.limits.output_token_budget is not None
+                    and totals["output_tokens"]
+                    + game["reserved_output_tokens"]
+                    + config.provider.max_output_tokens
+                    > config.limits.output_token_budget
+                )
                 or game["tool_calls"] >= config.limits.max_tool_calls
             ):
                 game["closed"] = True
@@ -222,6 +248,7 @@ class InferenceGate:
                 )
             game["inflight"] += 1
             game["reserved_tokens"] += bound + config.provider.max_output_tokens
+            game["reserved_output_tokens"] += config.provider.max_output_tokens
             current = asyncio.current_task()
             game["tasks"].add(current)
             try:
@@ -286,6 +313,7 @@ class InferenceGate:
             finally:
                 game["inflight"] -= 1
                 game["reserved_tokens"] -= bound + config.provider.max_output_tokens
+                game["reserved_output_tokens"] -= config.provider.max_output_tokens
                 game["tasks"].discard(current)
                 measured = {
                     "input_tokens": usage["input_tokens"] if usage else bound,

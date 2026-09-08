@@ -121,6 +121,7 @@ def contract(config, provenance, task_ids, seed):
             "reasoning_effort", config.run.provider.parameters.get("reasoning", "provider default")
         ),
         "budget": config.run.limits.model_dump(mode="json"),
+        "output_budget_policy": "Reserve provider.max_output_tokens for each root/descendant/auxiliary request; stop admission when remaining output cannot cover it. Include reasoning tokens in provider-reported output. Invalidate measured overshoot; do not truncate or hide usage.",
         "context_max_tokens": config.run.context.max_tokens,
         "benchmark_version": provenance["benchmark_version"],
         "dataset_environment_version": provenance["dataset_environment_version"],

@@ -91,8 +91,10 @@ class ContextPolicy(Record):
     compact_at: float = Field(default=0.8, gt=0.1, lt=1)
     recent_blocks: int = Field(default=6, ge=1)
     summary_chars: int = Field(default=3000, ge=256)
+    summary_tokens: int | None = Field(default=None, ge=256)
     result_chars: int = Field(default=131072, ge=128)
     supplemental_chars: int = Field(default=3000, ge=0)
+    supplemental_tokens: int | None = Field(default=None, ge=0)
     embedding_model: str | None = None
     embedding_cache: str | None = None
 
@@ -175,6 +177,7 @@ class LoopPolicy(Record):
 class ResourceLimits(Record):
     max_turns: int = Field(default=100, ge=1)
     token_budget: int = Field(default=500000, ge=1)
+    output_token_budget: int | None = Field(default=None, ge=1)
     wall_seconds: float = Field(default=3600, gt=0)
     cost_budget: float | None = Field(default=None, gt=0)
     max_tool_calls: int = Field(default=1000, ge=1)

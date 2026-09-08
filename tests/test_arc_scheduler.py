@@ -4,6 +4,8 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 
+import pytest
+
 from threadweave.evals.arc_scheduler import infrastructure_failure
 from threadweave.evals.harness import MatchedProvider
 from threadweave.evals.inference_gate import InferenceGate
@@ -99,6 +101,13 @@ async def test_native_proxy_preserves_payload_usage_and_releases_admission(tmp_p
         assert gate.usage("native")["total_tokens"] == 168
         assert gate.usage("native")["model_calls"] == 1
         assert gate.games["native"]["reserved_tokens"] == gate.active == 0
+        config.limits.output_token_budget = 160
+        async with aiohttp.ClientSession() as client:
+            async with client.post(url + "/responses", data=json.dumps(payload)) as response:
+                assert response.status == 400
+                assert "budget exhausted" in await response.text()
+        assert len(received) == 1  # Rejected before another upstream model request.
+        assert gate.usage("native")["model_calls"] == 1
     finally:
         await gate.close()
 
@@ -120,3 +129,24 @@ def test_only_infrastructure_failures_can_retry():
         "incorrect game strategy",
     ):
         assert not infrastructure_failure(NotRun(message))
+
+
+async def test_output_budget_reserves_all_buffalo_descendant_calls(tmp_path, config):
+    from threadweave.runtime import BudgetBusy, LimitReached
+
+    config.limits.output_token_budget = 200
+    runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
+    root = runtime.create("Shared output budget", tmp_path, config=config)
+    child = runtime.spawn(root.id, "Child", isolate=False)
+    try:
+        runtime.store.db.execute(
+            "INSERT INTO reservations VALUES(?,?,?,?,?)", ("call", child.id, 10, 128, 0)
+        )
+        with pytest.raises(BudgetBusy):
+            runtime._check_limits(root.id, resource="model_calls")
+        runtime.store.db.execute("DELETE FROM reservations")
+        runtime.store.charge(child.id, Usage(output_tokens=100))
+        with pytest.raises(LimitReached, match="output tokens"):
+            runtime._check_limits(root.id, resource="model_calls")
+    finally:
+        await runtime.shutdown()
