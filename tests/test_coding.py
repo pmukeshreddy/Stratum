@@ -56,10 +56,15 @@ def test_incremental_index_ast_navigation_and_fallback(repository, tmp_path, mon
     assert index.search("return", language="python", context=1, limit=1)["total"] == 3
     monkeypatch.setattr("threadweave.repository.shutil.which", lambda _: None)
     assert index.search("add", path="mathops.py")["engine"] == "python"
+    index.close()
     store.close()
     reopened = Store(tmp_path / "db")
-    assert RepositoryIndex(reopened, repository).refresh() == []
-    reopened.close()
+    restored_index = RepositoryIndex(reopened, repository)
+    try:
+        assert restored_index.refresh() == []
+    finally:
+        restored_index.close()
+        reopened.close()
 
 
 @pytest.mark.parametrize(
