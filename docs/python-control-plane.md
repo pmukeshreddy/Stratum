@@ -1,26 +1,24 @@
 # Python execution semantics
 
-## Source trace and changed request boundary
+## Request boundary and implementation
 
-The reference was the attached source archive `prime-agent-main.zip`, archive
-commit `d74a75fea3411136fdd2ba95c7f723ddefdadf05`. The following source paths were
-traced, not inferred from its README. Paths in this table are relative to that
-archive, not files shipped in Threadweave. No reference code/package was vendored.
+The following table maps Python execution behavior to its production implementation.
+External reference investigation evidence is kept outside the repository.
 
-| Reference source | Executed behavior | Threadweave implementation |
-| --- | --- | --- |
-| `packages/coding-agent/src/core/tools/index.ts:47`, `sdk.ts:238`, `agent-session.ts:9292` | Default active tool is ipython only | `ToolRegistry.schemas`, `_execute_action` provider-origin enforcement |
-| `packages/coding-agent/src/core/tools/ipython.ts:35` | Session bootstrap with async recursion, shell, MCP, Python skill modules | `kernel_api.bootstrap`, `kernel_worker.Worker` |
-| `prime-agent-runtime/src/rlm/__init__.py:92`, `agent-session.ts:10565` | Async child admission returns stable handle before detached execution | `Recursive.run`, `host_api.dispatch`, `Runtime.spawn` |
-| `agent-session.ts:9590` | Child inherits cwd/environment, not parent Python variables | Shared workspace + independent kernel/session, optional isolation separate |
-| `packages/coding-agent/skills/agent-message/src/agent_message/__init__.py` | Role/name-addressed persistent messages; explicit child answers | `Messaging`, daemon-mediated durable queue |
-| `packages/coding-agent/skills/agent-observe/src/agent_observe/__init__.py` | Bounded session and message inspection | `Observation`, scoped host dispatch |
-| `prime-agent-runtime/src/rlm/bash.py` | Immediate process handle, await/poll/output/kill, background lifetime | `Bash`, `BashHandle`, `BackgroundProcesses` |
-| `packages/coding-agent/skills/edit/src/edit/__init__.py:8` | Unique exact text replacement relative to kernel cwd | `Edit.run`, host path validation and existing Editor journal |
-| `packages/coding-agent/src/core/skills.ts`, `tools/ipython.ts` | SKILL.md discovery and src-layout Python modules, callable if run exists | `skills.discover/load_module`, bootstrap and explicit skills API |
-| `prime-agent-runtime/src/rlm/harness.py`, `core/refinement/refinement.ts:429` | Immediate local/global durable CRUD, compact supplemental menu | `Harness`, validated versioned state, explicit content selection |
-| `prime-agent-runtime/src/rlm/mcp.py`, `mcp_base.py:307` | Lazy stdio/streamable HTTP discovery/calls/lifecycle; structured content preferred | Official Python MCP SDK in `mcp_client`, kernel normalization |
-| `packages/coding-agent/src/core/prompts/rlm.ts:79` | Normal final answer ends work; conversation log accessible by path | Normal-text completion/yield, readable history projection |
+| Executed behavior | Threadweave implementation |
+| --- | --- |
+| Default active tool is ipython only | `ToolRegistry.schemas`, `_execute_action` provider-origin enforcement |
+| Session bootstrap with async recursion, shell, MCP, Python skill modules | `kernel_api.bootstrap`, `kernel_worker.Worker` |
+| Async child admission returns stable handle before detached execution | `Recursive.run`, `host_api.dispatch`, `Runtime.spawn` |
+| Child inherits cwd/environment, not parent Python variables | Shared workspace + independent kernel/session, optional isolation separate |
+| Role/name-addressed persistent messages; explicit child answers | `Messaging`, daemon-mediated durable queue |
+| Bounded session and message inspection | `Observation`, scoped host dispatch |
+| Immediate process handle, await/poll/output/kill, background lifetime | `Bash`, `BashHandle`, `BackgroundProcesses` |
+| Unique exact text replacement relative to kernel cwd | `Edit.run`, host path validation and existing Editor journal |
+| SKILL.md discovery and src-layout Python modules, callable if run exists | `skills.discover/load_module`, bootstrap and explicit skills API |
+| Immediate local/global durable CRUD, compact supplemental menu | `Harness`, validated versioned state, explicit content selection |
+| Lazy stdio/streamable HTTP discovery/calls/lifecycle; structured content preferred | Official Python MCP SDK in `mcp_client`, kernel normalization |
+| Normal final answer ends work; conversation log accessible by path | Normal-text completion/yield, readable history projection |
 
 The production `_invoke` interface exposes only `ipython`, with one required string
 argument `code`. The [runtime schema fixture](../tests/fixtures/ipython-schema.json)
