@@ -18,6 +18,23 @@ class Provider(Protocol):
         ...
 
 
+def chat_messages(messages):
+    return [
+        {
+            k: v
+            for k, v in message.items()
+            if k
+            not in {
+                "provider_items",
+                "provider_response_event",
+                "provider_identity",
+                "context_status",
+            }
+        }
+        for message in messages
+    ]
+
+
 class ChatProvider:
     """Chat-completions wire protocol, usable with hosted or compatible local endpoints."""
 
@@ -50,14 +67,7 @@ class ChatProvider:
         body = {
             **params,
             "model": config.model,
-            "messages": [
-                {
-                    k: v
-                    for k, v in message.items()
-                    if k not in {"provider_items", "provider_response_event", "provider_identity"}
-                }
-                for message in request.messages
-            ],
+            "messages": chat_messages(request.messages),
             "max_completion_tokens": config.max_output_tokens,
             "stream": config.streaming,
             "n": 1,

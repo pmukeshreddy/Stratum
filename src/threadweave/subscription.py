@@ -52,6 +52,16 @@ def responses_input(messages, *, provider=None):
     return "\n\n".join(instructions), items
 
 
+def responses_payload(messages, tools, config):
+    """The same logical input is used for transmission and context estimation."""
+    instructions, items = responses_input(messages, provider=[config.name, config.model])
+    return {
+        "instructions": instructions,
+        "input": items,
+        "tools": [{"type": "function", **tool["function"]} for tool in tools],
+    }
+
+
 class SubscriptionProvider:
     def __init__(self, *, control_factory=CodexControl, executable=None):
         self.control_factory = control_factory
@@ -113,14 +123,9 @@ class SubscriptionProvider:
                 "CLIENT_NOT_INSTALLED",
                 "Run threadweave auth install-client to build the official Codex inference client",
             )
-        instructions, items = responses_input(
-            request.messages, provider=[config.name, config.model]
-        )
         body = {
             "model": config.model,
-            "instructions": instructions,
-            "input": items,
-            "tools": [{"type": "function", **tool["function"]} for tool in request.tools],
+            **responses_payload(request.messages, request.tools, config),
             "tool_choice": "auto",
             "parallel_tool_calls": config.parameters.get("parallel_tool_calls", True),
             "stream": True,

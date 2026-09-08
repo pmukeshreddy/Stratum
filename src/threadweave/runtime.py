@@ -1434,6 +1434,9 @@ class Runtime(MemoryServices):
                             ),
                         )
                     if persist_turn:
+                        from .request_context import record_usage
+
+                        record_usage(self.store, sid, request, response, response_event)
                         self.store.update(
                             sid,
                             pending_turn={

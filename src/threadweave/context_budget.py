@@ -1,5 +1,6 @@
 """Token-aware structured context selection; never clip an unresolved requirement."""
 
+import hashlib
 import json
 import re
 
@@ -66,6 +67,79 @@ def structured(value):
     return result
 
 
+def pending_ledger(value):
+    """Stable identifiers let the host preserve work omitted by a later summary."""
+    result = []
+    for field, items in structured(value).items():
+        if field not in PROTECTED or field == "objective":
+            continue
+        for item in items:
+            identifier = item.get("id") if isinstance(item, dict) else None
+            result.append(
+                {
+                    "id": identifier
+                    or hashlib.sha256(encode([field, item]).encode()).hexdigest()[:20],
+                    "field": field,
+                    "content": item,
+                }
+            )
+    return result
+
+
+def merge_summary(previous, update, *, source_events=()):
+    """An omitted pending item is unchanged, never implicitly resolved."""
+    if isinstance(update, str):
+        update = json.loads(update)
+    controls = {"resolved_items", "pending_updates"}
+    incoming = structured({k: v for k, v in update.items() if k not in controls})
+    old = structured(previous)
+    allowed = set(source_events)
+    ledger = pending_ledger(previous)
+
+    def supported(change):
+        return (
+            isinstance(change, dict)
+            and isinstance(change.get("source_events"), list)
+            and bool(change["source_events"])
+            and all(isinstance(e, str) and e in allowed for e in change["source_events"])
+            and isinstance(change.get("reason"), str)
+            and bool(change["reason"].strip())
+        )
+
+    resolved = {c.get("id") for c in update.get("resolved_items", []) if supported(c)}
+    changes = {
+        c.get("id"): c
+        for c in update.get("pending_updates", [])
+        if supported(c) and isinstance(c.get("text"), str) and c["text"].strip()
+    }
+    for item in ledger:
+        if item["id"] in resolved:
+            old[item["field"]].remove(item["content"])
+        elif item["id"] in changes:
+            index = old[item["field"]].index(item["content"])
+            old[item["field"]][index] = {"id": item["id"], "text": changes[item["id"]]["text"]}
+    for field in PROTECTED:
+        if field == "objective":
+            incoming[field] = incoming[field] or old[field]
+        else:
+            incoming[field] = old[field] + [
+                item for item in incoming[field] if item not in old[field]
+            ]
+    return incoming
+
+
+def concise_reference(item, model):
+    if isinstance(item, dict):
+        if set(item) - {"id", "reference", "purpose", "retrieve", "path"}:
+            return False
+        if not all(isinstance(v, str) for v in item.values()):
+            return False
+    elif not isinstance(item, str):
+        return False
+    # Never clip arbitrary strings; oversized detail is covered by the full archive.
+    return estimate(item, model) <= (192 if encoder(model) else 768)
+
+
 def summary_budget(value, *, budget, model, reference):
     source = structured(value)
     result = {key: source[key] if key in PROTECTED else [] for key in FIELDS}
@@ -84,6 +158,8 @@ def summary_budget(value, *, budget, model, reference):
     # Reserved fields are already allocated. Admit whole lower-priority facts in stable order.
     for key in ("decisions", "established_facts", "important_references", "completed_work"):
         for item in source[key]:
+            if key == "important_references" and not concise_reference(item, model):
+                continue
             if item in result[key]:
                 continue
             result[key].append(item)

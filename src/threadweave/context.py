@@ -178,8 +178,6 @@ class Context:
             "name": session.name,
             "role": session.role,
             "workspace": session.workspace.path,
-            "turn": session.turns,
-            "goal": self.store.goal(sid),
             "features": self.store.config(sid).features.model_dump(),
             "execution_backend": self.store.config(sid).execution.backend,
             "permissions": self.store.config(sid).permissions,
@@ -188,7 +186,8 @@ class Context:
         }
         usage = self.store.usage(session.root_id, tree=True)
         limits = self.store.config(session.root_id).limits
-        metadata["resources_remaining"] = {
+        status = {"turn": session.turns, "goal": self.store.goal(sid)}
+        status["resources_remaining"] = {
             "tokens": max(0, limits.token_budget - usage.input_tokens - usage.output_tokens),
             "root_turns": max(0, limits.max_turns - usage.turns),
             "session_turns": max(0, limits.max_turns - session.turns),
@@ -200,8 +199,8 @@ class Context:
         if self.store.config(sid).control_plane == "python":
             metadata["conversation_log"] = str(self.history_file(sid))
         # A long goal is still available in L3, and must not defeat context bounds.
-        if metadata["goal"]:
-            metadata["goal"]["objective"] = metadata["goal"]["objective"][:cap]
+        if status["goal"]:
+            status["goal"]["objective"] = status["goal"]["objective"][:cap]
         messages = [
             {
                 "role": "system",
@@ -308,7 +307,25 @@ class Context:
         focus = coding_focus(self.store, sid, index_provider=self.index_provider)
         if focus:
             messages.append({"role": "user", "content": "Current coding evidence: " + focus})
+        messages.append(
+            {
+                "role": "developer",
+                "content": "Current runtime status (accounting metadata): " + encode(status),
+                "context_status": True,
+            }
+        )
         return messages
+
+    def request_estimate(self, sid, messages, tools, provider=None):
+        from .request_context import request_estimate
+
+        if provider is None:
+            config, session = self.store.config(sid), self.store.session(sid)
+            alias = config.routing.default
+            if config.routing.policy == "role_based" and session.role in config.routing.roles:
+                alias = config.routing.roles[session.role]
+            provider = config.models[alias] if alias else config.provider
+        return request_estimate(self.store, sid, messages, tools, provider)
 
     def compact(self, sid: str, *, count: int | None = None, summary=None, provenance=None):
         with self.store.transaction():
@@ -325,9 +342,15 @@ class Context:
                     "previous_summary": session.summary,
                     "blocks": removed,
                     "selected_state": session.selected_state,
+                    "proposed_summary": summary,
                 },
             )
-            from .context_budget import extractive_summary, policy_tokens, summary_budget
+            from .context_budget import (
+                extractive_summary,
+                merge_summary,
+                policy_tokens,
+                summary_budget,
+            )
 
             model = self.store.config(sid).provider.model
             try:
@@ -338,6 +361,11 @@ class Context:
                 parsed = extractive_summary(session.summary, removed)
                 if summary:
                     parsed["established_facts"].append(summary)
+            parsed = merge_summary(
+                session.summary,
+                parsed,
+                source_events=[b["event_id"] for b in session.context],
+            )
             summary = summary_budget(
                 parsed,
                 budget=policy_tokens(policy, "summary", model),
@@ -385,7 +413,7 @@ class Context:
         if input_budget is not None:
             available = min(available, input_budget)
         messages = self.messages(sid)
-        size = token_bound({"messages": messages, "tools": tools}, config.provider.model)
+        size, estimation = self.request_estimate(sid, messages, tools)
         threshold = int(available * config.context.compact_at)
         while size > threshold and self.store.session(sid).context:
             if (
@@ -395,7 +423,7 @@ class Context:
                 break  # Keep the recent region verbatim when it fits the actual input budget.
             self.compact(sid)
             messages = self.messages(sid)
-            size = token_bound({"messages": messages, "tools": tools}, config.provider.model)
+            size, estimation = self.request_estimate(sid, messages, tools)
         if size > available:
             raise HarnessError(
                 "runtime",
@@ -409,6 +437,7 @@ class Context:
             {
                 "estimated_pre_call_tokens": size,
                 **method(config.provider.model),
+                **estimation,
                 "summary_tokens": estimate(self.store.session(sid).summary, config.provider.model),
                 "evidence_tokens": sum(
                     estimate(m, config.provider.model)
