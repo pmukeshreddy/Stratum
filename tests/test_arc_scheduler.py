@@ -126,13 +126,30 @@ async def test_native_proxy_preserves_payload_usage_and_releases_admission(tmp_p
         assert gate.usage("native")["total_tokens"] == 278
         assert gate.usage("native")["model_calls"] == 2
         assert len(gate.games["native"]["primary_usages"]) == 1
+
+        class FailedResponse(Response):
+            async def iter_any(self):
+                yield b'data: {"type":"response.failed","response":{"id":"failed-test","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
+
+        @asynccontextmanager
+        async def failed(method, url, *, data, headers):
+            received.append(data)
+            yield FailedResponse()
+
+        gate.client.request = failed
+        async with aiohttp.ClientSession() as client:
+            async with client.post(url + "/responses", data=json.dumps(payload)) as response:
+                await response.read()
+        assert gate.usage("native")["total_tokens"] == 293
+        assert gate.usage("native")["model_calls"] == 3
+        assert len(gate.games["native"]["primary_usages"]) == 1
         config.limits.output_token_budget = 160
         async with aiohttp.ClientSession() as client:
             async with client.post(url + "/responses", data=json.dumps(payload)) as response:
                 assert response.status == 400
                 assert "budget exhausted" in await response.text()
-        assert len(received) == 2  # Rejected before another upstream model request.
-        assert gate.usage("native")["model_calls"] == 2
+        assert len(received) == 3  # Rejected before another upstream model request.
+        assert gate.usage("native")["model_calls"] == 3
     finally:
         await gate.close()
 

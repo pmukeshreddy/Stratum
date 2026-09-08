@@ -276,3 +276,54 @@ async def test_codex_continuation_reuses_actual_thread_contract(tmp_path, config
     finally:
         await control.close()
         await gate.close()
+
+
+async def test_native_fixed_game_profile_enables_socket_enforcement(tmp_path, config, monkeypatch):
+    import tomllib
+
+    import threadweave.evals.codex_harness as native
+
+    config.limits.max_subagents = 0
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    socket_path = str(tmp_path / "assigned.sock")
+    (workspace / ".game-connection.json").write_text(json.dumps({"socket": socket_path}))
+    commands, rpc = [], []
+
+    async def process(*args, **kwargs):
+        commands.append(args)
+        return SimpleNamespace(returncode=0)
+
+    async def read(self):
+        await asyncio.Event().wait()
+
+    async def call(self, method, **params):
+        rpc.append((method, params))
+        return {"thread": {"id": "profile-test"}}
+
+    async def send(self, payload):
+        pass
+
+    monkeypatch.setattr(native.shutil, "which", lambda _: "/test/codex")
+    monkeypatch.setattr(native.asyncio, "create_subprocess_exec", process)
+    monkeypatch.setattr(native.CodexAgent, "read", read)
+    monkeypatch.setattr(native.CodexAgent, "call", call)
+    monkeypatch.setattr(native.CodexAgent, "send", send)
+    agent = native.CodexAgent(tmp_path, None)
+    try:
+        await agent.start(config, "http://127.0.0.1:1234/native")
+        options = {}
+        for argument in commands[0][3::2]:
+            key, value = argument.split("=", 1)
+            options[key] = tomllib.loads("value=" + value)["value"]
+        assert options["features.network_proxy"] is True
+        assert options["default_permissions"] == "arc_game"
+        network = options["permissions.arc_game"]["network"]
+        assert network["unix_sockets"] == {socket_path: "allow"}
+        assert network["domains"] == {}
+        thread = next(params for method, params in rpc if method == "thread/start")
+        assert "sandbox" not in thread  # Do not overwrite the named permission profile.
+        assert thread["dynamicTools"] == []
+        assert options["agents.enabled"] is False
+    finally:
+        await agent.close()

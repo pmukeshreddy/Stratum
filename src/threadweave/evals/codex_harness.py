@@ -158,6 +158,7 @@ class CodexAgent:
         if self.action is None and connection.exists():
             socket_path = json.loads(connection.read_text())["socket"]
             options.pop("sandbox_mode")
+            options["features.network_proxy"] = True
             options["default_permissions"] = "arc_game"
             options["permissions.arc_game"] = {
                 "filesystem": {

@@ -220,6 +220,7 @@ class InferenceGate:
         partial = b""
         response_id = None
         status = None
+        completed = False
         sent = False
         outgoing = None
         tool_calls = 0
@@ -311,6 +312,7 @@ class InferenceGate:
                             if line.startswith(b"data: "):
                                 with contextlib.suppress(ValueError, TypeError):
                                     event = json.loads(line[6:])
+                                    completed |= event.get("type") == "response.completed"
                                     data = event.get("response", {})
                                     response_id = data.get("id") or response_id
                                     if data.get("usage"):
@@ -367,7 +369,7 @@ class InferenceGate:
                     "wall_seconds": time.monotonic() - begin,
                 }
                 game["usages"].append(measured)
-                if path == "responses" and usage and status == 200:
+                if path == "responses" and usage and status == 200 and completed:
                     game["primary_usages"].append(measured)
                 self.journal(
                     event="codex_request_finished",
