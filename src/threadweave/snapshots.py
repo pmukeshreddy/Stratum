@@ -56,10 +56,53 @@ class SnapshotBlobs:
         self.directory = directory / "values"
         self.directory.mkdir(exist_ok=True, mode=0o700)
         self.cache = {}
+        self.shadows = {}
+        self.array_shadows = {}
         self.stats = {}
 
     def encode(self, name, value, pack):
         immutable = type(value) in {str, bytes, int, float, bool, type(None)}
+        scalars = {str, bytes, int, float, bool, type(None)}
+        flat = type(value) in {list, dict} and all(
+            type(item) in scalars
+            for item in (value if type(value) is list else (*value.keys(), *value.values()))
+        )
+        shadow = self.shadows.get(name)
+        array = (
+            type(value).__module__ == "numpy"
+            and type(value).__name__ == "ndarray"
+            and not value.dtype.hasobject
+            and value.flags.c_contiguous
+            and value.nbytes <= 16 * 1024 * 1024
+        )
+        saved_array = self.array_shadows.get(name)
+        if array and saved_array:
+            import numpy as np
+
+            prior = saved_array[0]
+            if (
+                value.dtype == prior.dtype
+                and value.shape == prior.shape
+                and np.array_equal(value.view(np.uint8), prior.view(np.uint8))
+            ):
+                self.stats["mutable_cache_hits"] += 1
+                return saved_array[1], saved_array[2]
+
+        def identical(a, b):
+            # Python equality deliberately conflates True/1/1.0. Check types
+            # too: recovery must reproduce the actual scalar values/types.
+            if len(a) != len(b) or a != b:
+                return False
+            if type(a) is list:
+                return all(type(x) is type(y) for x, y in zip(a, b, strict=True))
+            return all(
+                type(key) is type(other_key) and type(value) is type(other_value)
+                for (key, value), (other_key, other_value) in zip(a.items(), b.items(), strict=True)
+            )
+
+        if flat and shadow and type(value) is type(shadow[0]) and identical(value, shadow[0]):
+            self.stats["mutable_cache_hits"] += 1
+            return shadow[1], shadow[2]
         cached = self.cache.get(name)
         if immutable and cached and cached[0] is value:
             self.stats["cache_hits"] += 1
@@ -92,6 +135,16 @@ class SnapshotBlobs:
             encoded = ["blob", {"sha256": digest, "codec": codec, "bytes": len(data)}]
         if immutable:
             self.cache[name] = (value, encoded, len(data))
+        if flat:
+            # Exact scalar-container equality, not mutable identity or a hash.
+            # Nested/opaque mutations deliberately take the full codec path.
+            self.shadows[name] = (value.copy(), encoded, len(data))
+        else:
+            self.shadows.pop(name, None)
+        if array:
+            self.array_shadows[name] = (value.copy(), encoded, len(data))
+        else:
+            self.array_shadows.pop(name, None)
         return encoded, len(data)
 
     def decode(self, record, unpack):
@@ -111,5 +164,10 @@ class SnapshotBlobs:
         raise ValueError("Unknown snapshot blob codec")
 
     def begin(self):
-        self.stats = {"serialized_bytes": 0, "written_bytes": 0, "cache_hits": 0}
+        self.stats = {
+            "serialized_bytes": 0,
+            "written_bytes": 0,
+            "cache_hits": 0,
+            "mutable_cache_hits": 0,
+        }
         return time.monotonic()

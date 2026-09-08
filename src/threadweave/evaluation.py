@@ -33,6 +33,7 @@ class Instance(Record):
     typecheck_commands: list[list[str]] = Field(default_factory=list)
     verifier_commands: list[list[str]] = Field(default_factory=list)
     test_patch: str | None = None
+    verifier_files: dict[str, str] = Field(default_factory=dict)
     context_bundle: list[str] = Field(default_factory=list)
     benchmark: BenchmarkConfig | None = None
     required_package: str | None = None
@@ -117,6 +118,11 @@ async def external_verify(runtime, sid, instance, base_directory):
     workspace = GitWorkspace(context)
     checkpoint = workspace.snapshot_tree("external-evaluation-input")
     isolated = workspace.isolate(checkpoint)
+    for relative, supplied in instance.verifier_files.items():
+        source = (base_directory / supplied).resolve()
+        if not source.is_file():
+            raise ValueError(f"Missing immutable evaluator input: {source}")
+        atomic_write(confined(isolated, relative), source.read_bytes())
     if instance.test_patch:
         file = (base_directory / instance.test_patch).resolve()
         if not file.is_file():
@@ -410,9 +416,11 @@ def source_identity():
         if p.suffix in {".py", ".rs"}
     }
     for name in ("pyproject.toml", "uv.lock"):
-        path = root.parent.parent / name
-        if path.is_file():
-            files["dependencies/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        for directory in (root.parent, root.parent.parent):
+            path = directory / name
+            if path.is_file():
+                files["dependencies/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+                break
     return {
         "sha256": hashlib.sha256(encode(files).encode()).hexdigest(),
         "files": files,

@@ -22,6 +22,16 @@ class Record(dict):
             raise AttributeError(name) from exc
 
 
+class CapabilityResult(Record):
+    """Already-completed mapping; optional await never repeats the host action."""
+
+    def __await__(self):
+        async def completed():
+            return self
+
+        return completed().__await__()
+
+
 @dataclass(frozen=True)
 class AgentHandle:
     session_id: str
@@ -101,8 +111,18 @@ class Recursive:
     def __init__(self, host):
         self.host, self.harness = host, Harness(host)
 
-    async def __call__(self, prompt, *, name=None, model=None, thinking=None, purpose="shared"):
+    async def __call__(
+        self, prompt=None, *args, name=None, model=None, thinking=None, purpose="shared"
+    ):
+        if not isinstance(prompt, str) or not prompt.strip() or args:
+            raise ValueError(self.help())
         return await self.run(prompt, name=name, model=model, thinking=thinking, purpose=purpose)
+
+    def help(self):
+        return 'await rlm("Trace cause", name="review", purpose="research"|"candidate"|"shared") returns a HANDLE, not an answer.\nawait agents.wait(seconds=30) defers your next model turn until a message or timeout; do not spend model turns polling.\nawait agent_message.send("findings", receiver_role="parent"); await agent_message.receive().\nawait agent_observe.get(handle.session_id); await agents.candidate(handle, accept=False) inspects, accept=True applies.'
+
+    def __repr__(self):
+        return self.help()
 
     async def run(self, prompt, *, name=None, model=None, thinking=None, purpose="shared"):
         result = await self.host.acall(
@@ -118,6 +138,9 @@ class Recursive:
     async def list_subagents(self):
         return [Record(s) for s in await self.host.acall("rlm.list_subagents")]
 
+    async def wait(self, seconds=30):
+        return await self.host.bridge.acall("agent_wait", seconds=seconds)
+
     async def find_models(self, query="", limit=8):
         return await self.host.acall("rlm.find_models", query=query, limit=limit)
 
@@ -131,6 +154,12 @@ class Recursive:
 class Messaging:
     def __init__(self, host):
         self.host = host
+
+    def help(self):
+        return 'await agent_message.send("findings", receiver_role="parent")\nFor child/sibling: receiver_role="child"|"sibling", receiver_name="name".\nawait agent_message.receive(); await agent_message.list_agents()'
+
+    def __repr__(self):
+        return self.help()
 
     async def list_agents(self):
         return await self.host.acall("agent_message.list_agents")
@@ -190,6 +219,11 @@ class Observation:
 
     async def get_agent(self, target):
         return await self.host.acall("agent_observe.get", target=target)
+
+    get = get_agent
+
+    def help(self):
+        return "await agent_observe.get(session_id); await agent_observe.list_agents(); await agent_observe.recent_messages(session_id, limit=8)"
 
     async def recent_messages(self, target, limit=8, max_chars=800):
         return await self.host.acall(
@@ -253,10 +287,31 @@ class Capability:
     def __init__(self, bridge, methods):
         self.bridge, self.methods = bridge, methods
 
+    def __repr__(self):
+        return self.help()
+
+    def __dir__(self):
+        return sorted({*self.methods, "help"})
+
+    def help(self, name=None):
+        if name:
+            return getattr(self, name).__doc__
+        primary = next(iter(self.methods))
+        if "search" in self.methods:
+            primary = "search"
+        return (
+            f"{primary}{inspect.signature(getattr(self, primary))}\n"
+            + "Methods: "
+            + ", ".join(self.methods)
+            + '\nhelp("method") shows exact arguments. Keep results in Python; print selected evidence.'
+        )
+
     def __getattr__(self, name):
         if name not in self.methods:
             raise AttributeError(name)
         tool, positional = self.methods[name]
+        schema = getattr(self.bridge, "argument_schemas", {}).get(tool)
+        properties = schema.get("properties", {}) if schema else {}
 
         def call(*args, **kwargs):
             if len(args) > len(positional):
@@ -265,9 +320,95 @@ class Capability:
                 if key in kwargs:
                     raise TypeError(f"Duplicate argument {key}")
                 kwargs[key] = value
-            return self.bridge.call(tool, **kwargs)
+            if schema and (unknown := kwargs.keys() - properties.keys()):
+                raise TypeError(
+                    f"Unknown arguments {sorted(unknown)} for {name}{call.__signature__}. {('Use path= for a file glob.' if 'glob' in unknown and 'path' in properties else '')}"
+                )
+            result = self.bridge.call(tool, **kwargs)
+            return CapabilityResult(result) if isinstance(result, dict) else result
 
+        call.__name__ = name
+        call.__signature__ = inspect.Signature(
+            [
+                *[
+                    inspect.Parameter(
+                        p,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        default=properties.get(p, {}).get("default", inspect.Parameter.empty),
+                    )
+                    for p in positional
+                ],
+                *(
+                    [
+                        inspect.Parameter(
+                            p,
+                            inspect.Parameter.KEYWORD_ONLY,
+                            default=detail.get(
+                                "default",
+                                inspect.Parameter.empty
+                                if p in schema.get("required", [])
+                                else None,
+                            ),
+                        )
+                        for p, detail in properties.items()
+                        if p not in positional
+                    ]
+                    if schema
+                    else [inspect.Parameter("options", inspect.Parameter.VAR_KEYWORD)]
+                ),
+            ]
+        )
+        call.__doc__ = f"{name}{call.__signature__}. Internal capability: {tool}. Retain the result and print a bounded selection."
+        bounds = {
+            p: {
+                k: v
+                for k, v in detail.items()
+                if k in {"minimum", "maximum", "enum", "minLength", "maxLength"}
+            }
+            for p, detail in properties.items()
+        }
+        bounds = {p: b for p, b in bounds.items() if b}
+        if bounds:
+            call.__doc__ += f" Bounds: {bounds}."
         return call
+
+
+class ContextView(Record):
+    def __init__(self, host, **values):
+        super().__init__(values)
+        self.host = host
+
+    def help(self):
+        return 'context.focus(files=[...], symbols=[...], hypothesis="...")\ncontext.search("current failure")\ncontext["task"] holds the complete objective.'
+
+    def focus(self, *, files=(), symbols=(), hypothesis="", constraints=()):
+        return self.host.call(
+            "context.focus",
+            files=list(files),
+            symbols=list(symbols),
+            hypothesis=hypothesis,
+            constraints=list(constraints),
+        )
+
+    def search(self, query, limit=5):
+        return self.host.bridge.call("history_search", query=query, limit=limit)
+
+
+class TestCapabilities(Capability):
+    def for_file(self, path, **options):
+        return self.related_to(files=[path], **options)
+
+    def for_symbol(self, symbol, **options):
+        return self.related_to(symbols=[symbol], **options)
+
+    def failed_recently(self):
+        return self.related_to(tier="failing")
+
+    def help(self, name=None):
+        return (
+            super().help(name)
+            + "\nfor_file(path), for_symbol(symbol), failed_recently(): ranked selection with provenance, not a replacement for final verification."
+        )
 
 
 class Edit(Capability):
@@ -356,6 +497,7 @@ def bootstrap(bridge, values, metadata):
     import pathlib
 
     host = Host(bridge)
+    bridge.argument_schemas = metadata.get("argument_schemas", {})
     recursive = Recursive(host)
     values.update(
         asyncio=asyncio,
@@ -363,9 +505,14 @@ def bootstrap(bridge, values, metadata):
         pathlib=pathlib,
         Path=Path,
         json=json,
-        context={"task": metadata.get("task", ""), "messages_path": metadata.get("messages_path")},
-        session=Record({k: v for k, v in metadata.items() if k not in {"task", "skills"}}),
+        context=ContextView(
+            host, task=metadata.get("task", ""), messages_path=metadata.get("messages_path")
+        ),
+        session=Record(
+            {k: v for k, v in metadata.items() if k not in {"task", "skills", "argument_schemas"}}
+        ),
         rlm=recursive,
+        agents=recursive,
         harness=recursive.harness,
         bash=Bash(host),
         agent_message=Messaging(host),
@@ -385,6 +532,11 @@ def bootstrap(bridge, values, metadata):
             "dependencies": ("dependency_context", ["path"]),
             "dependents": ("repo_dependents", ["path"]),
             "definition": ("repo_definition", ["query"]),
+            "declaration": ("repo_declaration", ["query"]),
+            "implementations": ("repo_implementations", ["query"]),
+            "related_symbols": ("repo_related_symbols", ["query"]),
+            "resolve": ("repo_resolve", ["path", "line", "column"]),
+            "semantic": ("repo_semantic", ["path", "line", "column"]),
             "callers": ("repo_callers", ["query"]),
             "callees": ("repo_callees", ["query"]),
             "context_for_symbol": ("repo_context_for_symbol", ["query"]),
@@ -427,9 +579,35 @@ def bootstrap(bridge, values, metadata):
             methods.update(
                 related_to=("related_tests", ["files"]),
                 targeted=("run_targeted_tests", ["targets"]),
+                import_coverage=("test_coverage_import", ["path"]),
+                selection_reason=("test_selection_reason", ["query"]),
             )
-        values[namespace] = Capability(bridge, methods)
+        values[namespace] = (TestCapabilities if namespace == "tests" else Capability)(
+            bridge, methods
+        )
     values["skills"] = Skills(host, values, metadata.get("skills", []))
+    values["shell"] = values["bash"]
+
+    class Verification:
+        @staticmethod
+        def help():
+            return "await verify.run(): run the independent configured verifier; does not override its gates."
+
+        async def run(self):
+            return await host.acall("verification.run")
+
+        def __repr__(self):
+            return self.help()
+
+    values["verify"] = Verification()
+    values["experiment"] = Capability(
+        bridge,
+        {
+            "create": ("experiment_create", ["hypothesis", "changes"]),
+            "run": ("experiment_run", ["experiment_id"]),
+            "list": ("experiment_list", []),
+        },
+    )
 
     async def compact():
         return await host.acall("context.compact")

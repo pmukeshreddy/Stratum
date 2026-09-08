@@ -50,6 +50,10 @@ class LimitReached(Exception):
     pass
 
 
+class TurnAdmissionLimit(LimitReached):
+    """No new turn may start; already-admitted turns may still return evidence."""
+
+
 class GoalLimitReached(LimitReached):
     def __init__(self, sid):
         self.session_id = sid
@@ -82,7 +86,7 @@ class Runtime(MemoryServices):
             self.store.close()
             raise RuntimeError("A runtime already owns this data directory") from exc
         self.artifacts = Artifacts(self.store)
-        self.context = Context(self.store)
+        self.context = Context(self.store, index_provider=self.index)
         self.providers = providers if providers is not None else default_providers()
         self.environment = Environment(self, adapters)
         self.adapters = self.environment.adapters  # Extension registration remains compatible.
@@ -90,6 +94,7 @@ class Runtime(MemoryServices):
         self.concurrency, self.idle_seconds = concurrency, idle_seconds
         self.kernels: dict[str, Kernel] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        self._admitted_turns: set[str] = set()
         self._scheduler_task = None
         self._wake = asyncio.Event()
         self._closing = False
@@ -181,6 +186,7 @@ class Runtime(MemoryServices):
         isolate=None,
         provider=None,
         purpose=None,
+        _defer_workspace=False,
     ):
         parent = self.store.session(parent_id)
         if parent.outcome != Outcome.ACTIVE:
@@ -199,15 +205,29 @@ class Runtime(MemoryServices):
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
-        if purpose not in {None, "research", "shared", "candidate"}:
-            raise ValueError("Child purpose must be research, shared, or candidate")
+        if purpose not in {
+            None,
+            "research",
+            "review",
+            "shared",
+            "candidate",
+            "test",
+            "performance",
+        }:
+            raise ValueError(
+                "Child purpose must be research, review, shared, candidate, test, or performance"
+            )
         if purpose:
-            isolate = purpose == "candidate"
-        if purpose == "research":
+            isolate = purpose in {"candidate", "test", "performance"}
+        if purpose in {"research", "review"}:
             config.execution.read_only = True
-            instruction += "\nResearch assignment: do not mutate the parent workspace. Python is trusted-host, not sandboxed."
-        if purpose == "candidate":
+            from .isolation import readonly_worker
+
+            readonly_worker(self.store.directory)  # Check support before admitting the child.
+            instruction += "\nRead-only investigation. Return findings with source locations, evidence and remaining uncertainty; do not implement changes."
+        if purpose in {"candidate", "test", "performance"}:
             config.task.adapter = "coding"
+            self.environment.configure(config)
         if provider is not None:
             config.provider = provider
             config.routing.default = None
@@ -215,7 +235,25 @@ class Runtime(MemoryServices):
             isolate = config.control_plane == "direct"
         if not isolate:
             config.task.adapter = "workspace"
-        workspace, checkpoint = self.environment.continuation_workspace(parent, config, child=True)
+        if _defer_workspace:
+            workspace, checkpoint = parent.workspace.model_copy(deep=True), None
+            workspace.metadata["candidate_pending"] = True
+        else:
+            workspace, checkpoint = self.environment.continuation_workspace(
+                parent, config, child=True
+            )
+        focus = self.store.events(parent_id, kind="working_focus", limit=1)
+        evidence = self.store.events(parent_id, kind="verifier_result", limit=1)
+        package = {
+            "parent_objective": parent.instruction[:1500],
+            "assignment": instruction,
+            "focus": focus[0]["payload"] if focus else None,
+            "verifier_event": evidence[0]["id"] if evidence else None,
+            "test_commands": config.task.test_commands,
+            "result_contract": "Report source locations, findings, executed test evidence, uncertainty; candidate patches require explicit parent acceptance.",
+        }
+        if config.control_plane == "python":
+            instruction += "\nDelegation context: " + encode(package)
         config.refinement.selected_entries = [
             eid
             for eid in parent.selected_state
@@ -237,7 +275,8 @@ class Runtime(MemoryServices):
                 "workspace_mode": "isolated" if isolate else "shared",
                 "base": workspace.metadata.get("base_revision"),
                 "parent": parent_id,
-                "trusted_python_mutation_risk": not isolate,
+                "trusted_python_mutation_risk": not isolate and not config.execution.read_only,
+                "kernel_write_policy": "os_read_only" if config.execution.read_only else "writable",
             },
         )
         if checkpoint:
@@ -258,8 +297,74 @@ class Runtime(MemoryServices):
                 ),
             )
         self.store.update(session.id, role=role)
+        if _defer_workspace:
+            self.store.update(session.id, paused=True, runnable=False)
+        self.store.event(session.id, "child_context_package", package)
         self._wake.set()
         return self.store.session(session.id)
+
+    async def spawn_async(self, parent_id, instruction, **options):
+        """Reserve a child on the daemon thread; prepare Git state off its event loop.
+
+        Each worker has a separate WAL connection. No Store or asyncio object is
+        shared between threads. Cancellation waits for the owned preparation to
+        settle, preventing an untracked checkout from appearing after shutdown.
+        """
+        if options.get("purpose") not in {"candidate", "test", "performance"}:
+            return self.spawn(parent_id, instruction, **options)
+        child = self.spawn(parent_id, instruction, _defer_workspace=True, **options)
+        job = asyncio.create_task(
+            asyncio.to_thread(self.environment.candidate_workspace, parent_id, child.id)
+        )
+        try:
+            workspace, checkpoint = await asyncio.shield(job)
+            self._check_limits(parent_id)
+            if self.store.session(child.id).outcome != Outcome.ACTIVE:
+                raise ValueError("Candidate was stopped during admission")
+            config = self.store.config(child.id).model_copy(deep=True)
+            config.task.repository = workspace.path
+            config.task.base_commit = None
+            config.task.require_change = False
+            self.store.reconfigure(child.id, config)
+            self.store.update(child.id, workspace=workspace, paused=False, runnable=True)
+            self.store.db.execute(
+                "INSERT INTO candidates VALUES(?,?,?,?)",
+                (
+                    child.id,
+                    parent_id,
+                    checkpoint,
+                    encode(
+                        {
+                            "instruction": instruction,
+                            "start_time": child.created_at,
+                            "accepted": False,
+                            "consumed": False,
+                        }
+                    ),
+                ),
+            )
+            self.store.event(
+                child.id,
+                "candidate_ready",
+                {"workspace": workspace.model_dump(), "checkpoint": checkpoint},
+            )
+            self._wake.set()
+            return self.store.session(child.id)
+        except BaseException:
+            # The failed reservation remains auditable; usage is never refunded.
+            result = await asyncio.gather(job, return_exceptions=True)
+            if self.store.session(child.id).outcome == Outcome.ACTIVE:
+                self.store.update(child.id, outcome=Outcome.FAILED, paused=True, runnable=False)
+            self.store.event(
+                child.id,
+                "candidate_admission_failed",
+                {
+                    "workspace_retained": str(result[0][0].path)
+                    if result and isinstance(result[0], tuple)
+                    else None
+                },
+            )
+            raise
 
     def related(self, sid: str):
         session = self.store.session(sid)
@@ -594,7 +699,7 @@ class Runtime(MemoryServices):
         if limits.cost_budget is not None and usage.cost >= limits.cost_budget:
             raise LimitReached("Root cost budget exhausted")
         if resource == "turns" and usage.turns >= limits.max_turns:
-            raise LimitReached("Root turn limit exhausted")
+            raise TurnAdmissionLimit("Root turn limit exhausted")
         for key, maximum in (
             ("tool_calls", limits.max_tool_calls),
             ("python_executions", limits.max_python_executions),
@@ -782,6 +887,17 @@ class Runtime(MemoryServices):
                     root_limit = self.store.config(session.root_id).limits.concurrency
                     if root_counts.get(session.root_id, 0) >= root_limit:
                         continue
+                    if session.pending_turn is None and session.runnable:
+                        active = any(
+                            self.store.session(s).root_id == session.root_id
+                            for s in self._admitted_turns
+                        )
+                        if (
+                            active
+                            and self.store.usage(session.root_id, tree=True).turns
+                            >= self.store.config(session.root_id).limits.max_turns
+                        ):
+                            continue  # Drain admitted turns without lifecycle/audit polling churn.
                     root_counts[session.root_id] = root_counts.get(session.root_id, 0) + 1
                     task = asyncio.create_task(
                         self._run_turn(session.id), name=f"session-{session.id}"
@@ -845,6 +961,7 @@ class Runtime(MemoryServices):
                 await self.auto_refine(sid)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
+                self._admitted_turns.add(sid)
                 response, response_event = await self._invoke(sid)
                 if (
                     not response.actions
@@ -858,6 +975,7 @@ class Runtime(MemoryServices):
                 pending = self.store.session(sid).pending_turn
                 assert pending and pending["event_id"] == response_event
             else:
+                self._admitted_turns.add(sid)
                 response = ModelResponse.model_validate(pending["response"])
                 response_event = pending["event_id"]
             while pending["index"] < len(response.actions):
@@ -994,6 +1112,19 @@ class Runtime(MemoryServices):
                 if current.mode == "heartbeat" and current.outcome == Outcome.ACTIVE:
                     pending_input = bool(self.store.messages(sid, pending=True, limit=1))
                     self.store.update(sid, runnable=pending_input and not current.paused)
+        except TurnAdmissionLimit as exc:
+            root_id = self.store.session(sid).root_id
+            active = [
+                other
+                for other in self._admitted_turns
+                if other != sid and self.store.session(other).root_id == root_id
+            ]
+            if active:
+                # A sibling exhausting admission must not cancel the final paid
+                # invocation already admitted within the root's turn budget.
+                self.defer(sid, 0.1)
+            else:
+                self._limit_tree(root_id, str(exc))
         except GoalLimitReached as exc:
             current = asyncio.current_task()
             for target in [exc.session_id, *self._active_descendants(exc.session_id)]:
@@ -1025,6 +1156,7 @@ class Runtime(MemoryServices):
                     sid, parent, f"Child {sid} failed ({failure.category}): {failure.message}"
                 )
         finally:
+            self._admitted_turns.discard(sid)
             with self.store.transaction():
                 self.store.charge(sid, Usage(wall_seconds=max(0, now() - started)))
                 self.store.update(sid, running_since=None)
@@ -1461,6 +1593,12 @@ class Runtime(MemoryServices):
                     "task": session.instruction,
                     "messages_path": str(self.context.history_file(sid)),
                     "control_plane": self.store.config(sid).control_plane,
+                    "research_read_only": self.store.config(sid).execution.read_only,
+                    "argument_schemas": {
+                        name: tool.arguments.model_json_schema()
+                        for name, tool in self.tools.entries.items()
+                        if tool.python_callable and self.tools.allowed(name, self.store.config(sid))
+                    },
                     "skills": [
                         e
                         for e in discover(
@@ -1642,7 +1780,14 @@ class Runtime(MemoryServices):
 
     async def _close_kernel(self, sid):
         if kernel := self.kernels.pop(sid, None):
-            await kernel.close()
+            cleanup = asyncio.create_task(kernel.close())
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Shutdown may cancel a turn already in its finally block. The
+                # kernel has left the registry, so this owner must finish teardown.
+                await cleanup
+                raise
 
     async def unload(self, sid):
         if sid in self.tasks and not self.tasks[sid].done():
@@ -1652,10 +1797,15 @@ class Runtime(MemoryServices):
 
     async def pause(self, sid):
         self.store.update(sid, runnable=False, paused=True, wake_at=None)
+        kernel = self.kernels.get(sid)
+        if kernel and kernel.active_execution:
+            await kernel.interrupt(kernel.active_execution)
         if task := self.tasks.get(sid):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await self.unload(sid)
+        # Keep an interrupted live namespace loaded; the daemon owns it, not UI.
+        if not kernel or not kernel.process:
+            await self.unload(sid)
         self.store.event(sid, "paused", {})
 
     async def fork(self, sid, *, name=None):

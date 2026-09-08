@@ -1,6 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 8
+VERSION = 10
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -99,4 +99,22 @@ def migrate(db, previous, timestamp):
             "CREATE INDEX code_short_lookup ON code_evidence(workspace,kind,short_name,path);"
             "CREATE INDEX code_exact_lookup ON code_evidence(workspace,kind,name,path);"
             f"INSERT INTO schema_migrations VALUES(8,{timestamp}); PRAGMA user_version=8; COMMIT;"
+        )
+    if previous < 9:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE module_bindings(workspace TEXT,path TEXT,module TEXT,target TEXT,alias TEXT,symbol TEXT,quality TEXT, PRIMARY KEY(workspace,path,module,alias,symbol));"
+            "CREATE INDEX module_target ON module_bindings(workspace,target,path);"
+            "CREATE INDEX module_source ON module_bindings(workspace,path);"
+            "CREATE TABLE test_coverage(workspace TEXT,test_id TEXT,path TEXT,line INTEGER,source TEXT,PRIMARY KEY(workspace,test_id,path,line));"
+            "CREATE INDEX coverage_file ON test_coverage(workspace,path,line);"
+            f"INSERT INTO schema_migrations VALUES(9,{timestamp}); PRAGMA user_version=9; COMMIT;"
+        )
+    if previous < 10:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE semantic_evidence(id TEXT,model TEXT,root_id TEXT,session_id TEXT,kind TEXT,seq INTEGER,excerpt TEXT,vector BLOB, PRIMARY KEY(id,model));"
+            "CREATE INDEX semantic_root ON semantic_evidence(model,root_id,seq);"
+            "CREATE TABLE semantic_cursors(root_id TEXT,model TEXT,seq INTEGER,PRIMARY KEY(root_id,model));"
+            f"INSERT INTO schema_migrations VALUES(10,{timestamp}); PRAGMA user_version=10; COMMIT;"
         )

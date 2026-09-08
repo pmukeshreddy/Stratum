@@ -163,7 +163,17 @@ class McpManager:
         self.runtime, self.connections, self.locks = runtime, {}, {}
 
     async def connection(self, context, name):
-        config = self.runtime.store.config(context.session_id).mcp_servers.get(name)
+        session_config = self.runtime.store.config(context.session_id)
+        if session_config.execution.read_only:
+            # These transports run in the daemon, outside the worker's OS write
+            # confinement. Server readOnlyHint annotations are not enforcement;
+            # even discovery can start a server with arbitrary filesystem effects.
+            raise PermissionError(
+                "MCP transports are unavailable to read-only research sessions: "
+                "host/remote server effects are not confined by the kernel sandbox. "
+                "Request MCP evidence from the parent instead."
+            )
+        config = session_config.mcp_servers.get(name)
         if config is None or not config.enabled:
             raise PermissionError(f"MCP server is not configured/enabled: {name}")
         key = (context.session_id, name)

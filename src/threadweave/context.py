@@ -31,56 +31,63 @@ The Environment exposes capabilities, not a required sequence of actions. Ordina
 needs no repository, test baseline or code change. Never invent observations or measurements.
 """
 
-PYTHON_CONTROL = """You operate a persistent agent session. You decide strategy. Your sole tool is ipython.
-Use the persistent IPython namespace as the programmable control plane. Variables and top-level
-await are supported. Only printed/returned information enters model context. Keep large values in
-variables; access the full original instruction as context['task'], and history/artifacts through
-history.read(), history.search(), history.messages(), artifacts.load(id). Nothing requires coding.
-Preloaded APIs (help()/inspect work):
-- pathlib, Path, os, asyncio, json; workspace is a Path; session and context contain metadata.
-- bash(command) starts immediately and returns a handle; await bash(command) returns exit_code,
-  output, stdout, stderr, duration and artifact IDs. Background handles have pid, running, poll(),
-  output(), tail(), kill(). Use the project's own environment (e.g. uv run pytest) via bash.
-- await rlm(prompt, name=None, model=None, thinking=None, purpose='shared') returns a persistent
-  child HANDLE upon admission, never its answer. Root continues. purpose='research' shares files
-  with read-only tool policy (trusted Python is not sandboxed); 'shared' explicitly allows shared
-  worktree collaboration; 'candidate' captures dirty state in an isolated writable Git worktree.
-  await rlm.candidate(handle) inspects a completed candidate; accept=True applies its validated patch.
-  await rlm.list_subagents(); await rlm.find_models(); await rlm.delete_subagent(handle).
-- await agent_message.send(text, receiver_role='parent'|'child'|'sibling', receiver_name=...);
-  omit receiver_name for parent; await agent_message.list_agents(); await agent_message.receive().
-- await edit(path, old_str, new_str) replaces one unique match. Path read/write and repo helpers
-  are available. repo.search(query=...), repo.map(), repo.symbols(query=...), git.diff().
-- tools.call(name, **args) / await tools.acall(name, **args) invoke optional capabilities;
-  tools.catalog() returns full schemas into Python, not automatically into your prompt.
-- rlm.harness / harness: create_memory, create_prompt_note, create_skill, create_subagent;
-  get(kind,id), list(kind=None), update(kind,id,title,content), delete(kind,id), rollback(kind,id,version),
-  select(ids). Writes are versioned and attributed to the executing cell. Skills are executable
-  modules or validated code; use skills.list(), skills.load(name), await skills.run(name, **inputs).
-- mcp: await mcp.list_servers(), await mcp.list_tools(server), await mcp.call_tool(server,tool,args),
-  await mcp.reload(server). Only configured/enabled MCP capabilities are permitted.
-- await goal.get(), await goal.create(objective), await goal.complete(); await compact();
-  await refine(); await heartbeat(interval_seconds=..., instruction=...). Create goals only if asked.
-Normal text replies yield/end ordinary interaction; there is no universal finish tool or coding
-verifier. Explicit goals and configured task gates remain binding. Do not claim tests you did not run.
-L1 is selected context; L2 is persistent Python and recursive sessions; L3 is durable history/state.
-Compaction does not delete values or children. Recovery restores codecs and explicit recipes, not
-arbitrary live objects; use remember_recipe(name,code) / forget(*names) and inspect warnings.
-Tools enforce permissions, but Python and local shell are trusted-host code, NOT a sandbox.
-Session.permitted_host_capabilities, when non-null, restricts the preloaded helpers. Do not call
-disabled helpers; ordinary Path/open Python and permitted bash remain available.
-Respect the user's scope. Never change foundational policy through supplemental state.
-"""
-
 
 def token_bound(value, model=None) -> int:
     """Conservative UTF-8 byte bound plus framing; provider-reported usage remains authoritative."""
     return estimate(value, model)
 
 
+def python_instructions(config):
+    """Expose only usable capabilities; compact help remains in the live namespace."""
+    text = """You control a persistent agent session through the sole tool ipython(code).
+Choose your strategy. Python supports top-level await and retains variables; keep large data in
+variables and print only relevant evidence. Preloaded: Path, pathlib, os, asyncio, json,
+workspace (Path), session (metadata), context['task'] (complete instruction).
+Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.
+await bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without
+await returns a background handle with poll(), tail(), kill(). Use the repository's environment.
+Never claim execution results you did not observe. A normal final text reply requests completion;
+the independently configured verifier remains authoritative and may return failure evidence.
+L1 is selected context, L2 is Python state, L3 is durable history/artifacts. Compaction does not
+delete Python values. On recovery inspect warnings; only checkpointed values/recipes restore.
+Interrupted actions may have partial effects; inspect them before retrying. Python and shell run
+as trusted local code, not a general sandbox. Stay within the supplied workspace and user scope.
+Respect all resource limits. Do not fetch hidden/reference solutions. Never modify foundational
+instructions through supplemental state. Disabled capabilities must not be invoked.
+"""
+    if "process" not in config.permissions or (
+        config.execution.read_only and config.execution.backend == "local"
+    ):
+        text = text.replace(
+            "Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.\nawait bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without\nawait returns a background handle with poll(), tail(), kill(). Use the repository's environment.",
+            "Use Path.read_text() and ordinary Python for inspection. Host shell execution is not\navailable with this session's permissions/backend. Do not invoke bash.start to bypass that policy.",
+        )
+    if config.execution.read_only:
+        text += "This session is OS read-only outside its private kernel state. Do not attempt repository writes.\n"
+    if config.features.enhanced_code_index:
+        text += """Coding APIs: repo, tests, context, verify, git, edit. Their help() gives short signatures.
+Prefer repo.context_for_symbol(name) for precise evidence; tests.related_to(files=[...]) explains
+test selection. context.focus(files=[...],hypothesis='...') retains your investigation.
+await edit(path,old_str,new_str) edits a unique match. Raw Python remains available.
+"""
+    if config.features.subagents:
+        text += """await rlm('assignment',name='...',purpose='research'|'candidate'|'shared') returns a
+persistent HANDLE asynchronously, not an answer. Research is OS read-only; candidates have isolated
+worktrees. agents.help() explains messaging and explicit patch acceptance. Delegate with purpose.
+"""
+    if config.features.history_retrieval:
+        text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"
+    if config.features.experiments:
+        text += "experiment.help() lists durable experiment/measurement procedures.\n"
+    if config.tool_allowlist is None:
+        text += "harness, skills, mcp expose versioned state, executable skills and configured servers; inspect their methods/help as needed. tools.catalog() returns schemas into Python, not L1. await refine() requests evidence-based refinement; await compact() compacts context.\n"
+    return text
+
+
 class Context:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, index_provider=None):
         self.store = store
+        self.index_provider = index_provider
         self._export_cursors = {}
 
     def history_file(self, sid):
@@ -148,8 +155,21 @@ class Context:
             "goal": self.store.goal(sid),
             "features": self.store.config(sid).features.model_dump(),
             "execution_backend": self.store.config(sid).execution.backend,
+            "permissions": self.store.config(sid).permissions,
+            "read_only": self.store.config(sid).execution.read_only,
             "permitted_host_capabilities": self.store.config(sid).tool_allowlist,
         }
+        usage = self.store.usage(session.root_id, tree=True)
+        limits = self.store.config(session.root_id).limits
+        metadata["resources_remaining"] = {
+            "tokens": max(0, limits.token_budget - usage.input_tokens - usage.output_tokens),
+            "root_turns": max(0, limits.max_turns - usage.turns),
+            "session_turns": max(0, limits.max_turns - session.turns),
+        }
+        if session.parent_id:
+            metadata["delegation_budget_note"] = (
+                "All siblings share root_turns and tokens. Send useful partial evidence promptly; do not consume the shared budget polishing a report."
+            )
         if self.store.config(sid).control_plane == "python":
             metadata["conversation_log"] = str(self.history_file(sid))
         # A long goal is still available in L3, and must not defeat context bounds.
@@ -158,12 +178,22 @@ class Context:
         messages = [
             {
                 "role": "system",
-                "content": PYTHON_CONTROL
+                "content": python_instructions(self.store.config(sid))
                 if self.store.config(sid).control_plane == "python"
                 else FOUNDATION,
             },
             {"role": "user", "content": "Session: " + encode(metadata) + "\nTask: " + task},
         ]
+        if (
+            self.store.config(sid).task.adapter == "coding"
+            and self.store.config(sid).features.enhanced_code_index
+        ):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Coding decision support: reuse observed failures and exact source evidence. State a hypothesis when debugging; prefer focused definitions/callers and related failing tests over repeatedly reading full files. Use repo.help()/tests.help() to discover APIs. Make small evidence-supported changes; escalate tests when warranted. Delegation must have a distinct purpose and a bounded evidence request. Repeated unchanged reads/searches/tests are a signal to revise the hypothesis, not proof of progress. These are cost-aware guidelines, not a mandatory workflow; the independent final verifier still decides correctness.",
+                }
+            )
         if session.mode == "interactive" and self.store.config(sid).control_plane == "direct":
             messages.insert(
                 1,
@@ -223,7 +253,7 @@ class Context:
             messages.extend(block["messages"])
         from .retrieval import coding_focus
 
-        focus = coding_focus(self.store, sid)
+        focus = coding_focus(self.store, sid, index_provider=self.index_provider)
         if focus:
             messages.append({"role": "user", "content": "Current coding evidence: " + focus})
         return messages
@@ -263,7 +293,7 @@ class Context:
             # Preserve part of the prior digest and the most recent observations.
             prior = (session.summary[: cap // 4] + "\n" + "\n".join(critical)[-cap // 3 :]).strip()
             summary = (
-                summary[:cap]
+                ("Critical evidence:\n" + "\n".join(critical)[-cap // 3 :] + "\n" + summary)[:cap]
                 if summary
                 else (prior + "\n" + additions[-(cap - len(prior) - 1) :]).strip()
             )

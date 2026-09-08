@@ -35,7 +35,7 @@ def resolve_capability(request):
         permissions = ("agents",)
     elif op.startswith(("harness.", "skills.")):
         permissions = ("state",)
-    elif op == "catalog" or op.startswith("goal.") or op == "context.compact":
+    elif op == "catalog" or op.startswith(("goal.", "context.")) or op == "verification.run":
         permissions = ()
     else:
         raise ValueError(f"Unknown host operation: {op}")
@@ -247,7 +247,7 @@ async def dispatch(context, request):
                 provider.parameters["reasoning_effort"] = p["thinking"]
             if provider.name == "codex_subscription" and (p.get("model") or p.get("thinking")):
                 provider, _ = await runtime.providers[provider.name].resolve(provider)
-            child = runtime.spawn(
+            child = await runtime.spawn_async(
                 sid,
                 p["prompt"],
                 name=name,
@@ -384,6 +384,25 @@ async def dispatch(context, request):
         return skill_operation(context, op.split(".")[1], p)
     if op == "context.compact":
         return {"event_id": runtime.context.compact(sid)}
+    if op == "context.focus":
+        fields = {"files", "symbols", "hypothesis", "constraints"}
+        if set(p) - fields:
+            raise ValueError("context.focus accepts files, symbols, hypothesis, constraints")
+        for key in ("files", "symbols", "constraints"):
+            values = p.get(key, [])
+            if (
+                not isinstance(values, list)
+                or len(values) > 30
+                or any(not isinstance(v, str) or len(v) > 1000 for v in values)
+            ):
+                raise ValueError(f"{key} must be at most 30 short strings")
+        if not isinstance(p.get("hypothesis", ""), str) or len(p.get("hypothesis", "")) > 3000:
+            raise ValueError("hypothesis must be a string of at most 3000 characters")
+        event = store.event(sid, "working_focus", p, parent=context.source_event)
+        return {"event_id": event, "focus": p}
+    if op == "verification.run":
+        result, error = await runtime._verify(sid, context.source_event)
+        return {"result": result.model_dump(mode="json") if result else None, "error": error}
     if op == "goal.get":
         return {"goal": store.goal(sid), "usage": store.usage(sid).model_dump()}
     if op == "goal.create":

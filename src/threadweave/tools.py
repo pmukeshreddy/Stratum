@@ -61,6 +61,7 @@ class Tool:
     permissions: tuple[str, ...] = ()
     python_callable: bool = True
     feature: str | None = None
+    model_callable: bool = True
 
     def schema(self):
         def compact(value):
@@ -126,6 +127,7 @@ class ToolRegistry:
             tool.schema()
             for name, tool in self.entries.items()
             if self.allowed(name, config)
+            and tool.model_callable
             and (name == "ipython" if config.control_plane == "python" else name != "ipython")
         ]
 

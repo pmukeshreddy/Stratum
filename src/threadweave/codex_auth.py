@@ -61,6 +61,10 @@ class CodexControl:
             raise
 
     async def __aexit__(self, *_):
+        if self.process and self.process.stdin:
+            self.process.stdin.close()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                await self.process.stdin.wait_closed()
         if self.process and self.process.returncode is None:
             self.process.terminate()
             try:

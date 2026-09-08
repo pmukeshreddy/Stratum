@@ -127,6 +127,15 @@ class Worker:
         self.recipes = {}
         self.pending_replies, self.requests = {}, queue.Queue()
         self.write_lock = threading.Lock()
+        self.execution_lock = threading.RLock()
+        self.active_id = None
+        self.interrupt_id = None
+        self.phase = "idle"
+        self.loop = None
+        self.cell_task = None
+        self.queued = set()
+        self.cancelled = set()
+        signal.signal(signal.SIGUSR1, self.on_interrupt)
         from IPython.core.interactiveshell import InteractiveShell
 
         self.shell = InteractiveShell()
@@ -155,6 +164,10 @@ class Worker:
         from .snapshots import SnapshotBlobs
 
         self.blobs = SnapshotBlobs(directory)
+        from .process_family import ProcessFamily, install_shutdown
+
+        self.family = ProcessFamily(directory)
+        install_shutdown(self.family)
 
     def emit(self, value):
         with self.write_lock:
@@ -190,7 +203,25 @@ class Worker:
         try:
             while True:
                 packet = self.receive()
-                if packet.get("type") in {"execute", "shutdown"}:
+                if packet.get("type") == "interrupt":
+                    with self.execution_lock:
+                        active = self.active_id == packet["id"] and self.phase == "executing"
+                        accepted = active or packet["id"] in self.queued
+                        if accepted and not active:
+                            self.cancelled.add(packet["id"])
+                        if active:
+                            self.interrupt_id = packet["id"]
+                            for replies in list(self.pending_replies.values()):
+                                replies.put(
+                                    {
+                                        "error": "Cell interrupted; inspect side effects before retrying"
+                                    }
+                                )
+                            os.kill(os.getpid(), signal.SIGUSR1)
+                    self.emit({"type": "interrupt_ack", "id": packet["id"], "accepted": accepted})
+                elif packet.get("type") in {"execute", "shutdown"}:
+                    if packet["type"] == "execute":
+                        self.queued.add(packet["id"])
                     self.requests.put(packet)
                 elif packet.get("id") in self.pending_replies:
                     self.pending_replies[packet["id"]].put(packet)
@@ -198,6 +229,17 @@ class Worker:
             for replies in list(self.pending_replies.values()):
                 replies.put({"error": "Runtime disconnected"})
             self.requests.put({"type": "shutdown"})
+
+    def on_interrupt(self, *_):
+        # Signal delivery can lag the RPC. Re-check identity AND phase on the
+        # main thread; never interrupt a snapshot or a subsequent execution.
+        if self.phase != "executing" or self.active_id != self.interrupt_id:
+            return
+        self.interrupt_id = None
+        if self.cell_task and self.cell_task._fut_waiter is not None:
+            self.loop.call_soon_threadsafe(self.cell_task.cancel, "Cell interrupted")
+        else:
+            raise KeyboardInterrupt("Cell interrupted")
 
     def receive(self):
         line = self.input.readline()
@@ -277,6 +319,10 @@ class Worker:
             except Exception as exc:
                 missing[name] = str(exc)
         self.blobs.cache = {k: v for k, v in self.blobs.cache.items() if k in values}
+        self.blobs.shadows = {k: v for k, v in self.blobs.shadows.items() if k in values}
+        self.blobs.array_shadows = {
+            k: v for k, v in self.blobs.array_shadows.items() if k in values
+        }
         receipt["result"]["snapshot_metrics"] = {
             **self.blobs.stats,
             "seconds": time.monotonic() - started,
@@ -337,6 +383,14 @@ class Worker:
                 os.dup2(out.fileno(), 1)
                 os.dup2(err.fileno(), 2)
                 try:
+                    with self.execution_lock:
+                        self.queued.discard(execution_id)
+                        self.active_id, self.phase = execution_id, "executing"
+                        self.cell_task = asyncio.current_task()
+                        self.family.execution_id = execution_id
+                        if execution_id in self.cancelled:
+                            self.cancelled.discard(execution_id)
+                            raise KeyboardInterrupt("Cell interrupted before execution")
                     value = await self.evaluate(request["code"])
                     result["value"] = reprlib.repr(value)
                 except BaseException as exc:
@@ -347,6 +401,10 @@ class Worker:
                         "traceback": traceback.format_exc()[-8000:],
                     }
                 finally:
+                    with self.execution_lock:
+                        self.phase, self.active_id, self.interrupt_id = "snapshot", None, None
+                    self.emit({"type": "phase", "id": execution_id, "phase": "snapshot"})
+                    self.family.execution_id = None
                     sys.stdout.flush()
                     sys.stderr.flush()
         finally:
@@ -359,11 +417,14 @@ class Worker:
                 result[key] = stream.read(4000)
             result[f"{key}_bytes"] = path.stat().st_size
         result["variables"] = sorted(n for n in self.values if not n.startswith("__"))[:100]
+        result["process_effects"] = self.family.observation()
         self.receipt = {"id": execution_id, "result": result}
         result["not_checkpointed"] = self.snapshot(self.receipt)
+        self.phase = "idle"
         return result
 
     async def run(self):
+        self.loop = asyncio.get_running_loop()
         threading.Thread(target=self.read_packets, daemon=True).start()
         try:
             saved_out, saved_err = os.dup(1), os.dup(2)
@@ -386,6 +447,7 @@ class Worker:
         while True:
             request = await asyncio.to_thread(self.requests.get)
             if request["type"] == "shutdown":
+                self.family.close()
                 return
             if request["type"] == "execute":
                 self.emit(

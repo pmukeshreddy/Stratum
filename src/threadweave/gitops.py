@@ -212,7 +212,7 @@ class GitWorkspace:
             raise ValueError("Checkpoint checksum mismatch")
         return raw
 
-    def diff(self, checkpoint_id=None):
+    def diff(self, checkpoint_id=None, *, paths=None):
         if checkpoint_id is None:
             tracked = git(self.root, "diff", "HEAD", "--no-ext-diff", "--no-textconv", "--")
             untracked = git(self.root, "ls-files", "--others", "--exclude-standard", "-z").split(
@@ -225,7 +225,9 @@ class GitWorkspace:
             return tracked
         checkpoint = self.checkpoint(checkpoint_id)
         patch = ""
-        for relative in sorted(set(self.files()) | set(checkpoint["manifest"])):
+        for relative in sorted(
+            set(paths) if paths is not None else set(self.files()) | set(checkpoint["manifest"])
+        ):
             entry = checkpoint["manifest"].get(relative)
             if entry and "symlink" in entry:
                 continue

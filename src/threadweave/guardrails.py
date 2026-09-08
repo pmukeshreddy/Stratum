@@ -26,7 +26,32 @@ def state_fingerprint(runtime, sid):
 
 
 def observe(runtime, sid, name, arguments):
-    fingerprint = state_fingerprint(runtime, sid)
+    read_action = name in {
+        "workspace_read",
+        "repo_search",
+        "symbol_search",
+        "references_search",
+        "repo_definition",
+        "repo_callers",
+        "repo_callees",
+        "repo_context_for_symbol",
+        "history_search",
+        "run_tests",
+        "run_targeted_tests",
+        "apply_patch",
+    }
+    if read_action:
+        session = runtime.store.session(sid)
+        row = runtime.store.db.execute(
+            "SELECT state_id FROM mutation_workspaces WHERE path=?", (session.workspace.path,)
+        ).fetchone()
+        # Assigning a Python result variable does not make an unchanged query new.
+        edited = runtime.store.events(sid, kind="code_edit", limit=1)
+        fingerprint = encode(
+            [row[0] if row else "unobserved-workspace", edited[0]["id"] if edited else None]
+        )
+    else:
+        fingerprint = state_fingerprint(runtime, sid)
     signature = hashlib.sha256(encode([name, arguments, fingerprint]).encode()).hexdigest()
     recent = runtime.store.events(sid, kind="action_fingerprint", limit=100)
     count = 1 + sum(event["payload"]["signature"] == signature for event in recent)

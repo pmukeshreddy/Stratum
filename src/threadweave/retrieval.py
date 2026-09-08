@@ -38,6 +38,7 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20):
         "agent_message_received",
     }
     for row in candidates:
+        row["excerpt"] = row["excerpt"][:900]
         overlap = sum(t.casefold() in row["excerpt"].casefold() for t in terms) / len(terms)
         row["score"] = (
             overlap + (0.2 if row["kind"] in important else 0) + 0.1 * row["ordinal"] / newest
@@ -45,14 +46,45 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20):
         row["ranking"] = (
             "FTS/BM25 candidates + term overlap + evidence type + relative recency; not semantic"
         )
-    return sorted(candidates, key=lambda r: (r["score"], -r["lexical_score"]), reverse=True)[:limit]
+    lexical = sorted(candidates, key=lambda r: (r["score"], -r["lexical_score"]), reverse=True)
+    if store.config(sid).context.embedding_model:
+        from .semantic_retrieval import search as semantic_search
+
+        try:
+            semantic = semantic_search(
+                store, sid, query, kind=kind, session_id=session_id, limit=limit * 2
+            )
+        except (ImportError, ValueError, OSError) as exc:
+            store.event(
+                sid,
+                "semantic_retrieval_unavailable",
+                {"reason": str(exc)[:500], "fallback": "FTS and structural/recency ranking"},
+            )
+            semantic = []
+        fused = {}
+        for source, rows in (("lexical", lexical), ("semantic", semantic)):
+            for rank, row in enumerate(rows):
+                record = fused.setdefault(row["id"], {**row, "score": 0, "sources": []})
+                record["score"] += 1 / (60 + rank)
+                record["sources"].append(source)
+                record["ranking"] = (
+                    "reciprocal-rank fusion of local embeddings and FTS/type/recency"
+                )
+        return sorted(fused.values(), key=lambda r: -r["score"])[:limit]
+    return lexical[:limit]
 
 
-def coding_focus(store, sid):
+def coding_focus(store, sid, *, index_provider=None):
     """Small working set, not automatic recall of the whole trajectory."""
-    if store.config(sid).task.adapter != "coding":
+    if (
+        store.config(sid).task.adapter != "coding"
+        or not store.config(sid).features.enhanced_code_index
+    ):
         return ""
     state = {}
+    focus = store.events(sid, kind="working_focus", limit=1)
+    if focus:
+        state["investigation"] = focus[0]["payload"]
     verifications = store.db.execute(
         "SELECT passed,body FROM final_verifications WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
         (sid,),
@@ -73,11 +105,31 @@ def coding_focus(store, sid):
     edits = store.events(sid, kind="code_edit", limit=3) + store.events(
         sid, kind="workspace_effects", limit=3
     )
-    state["recent_failures"] = [
-        {"event_id": e["id"], "failures": e["payload"].get("failures", [])[:3]}
-        for e in store.events(sid, kind="coding_command", limit=5)
-        if not e["payload"].get("passed")
-    ]
+    state["recent_failures"] = []
+    for event in store.events(sid, kind="coding_command", limit=5):
+        payload = event["payload"]
+        if payload.get("passed"):
+            continue
+        failures = []
+        for failure in payload.get("failures", [])[:2]:
+            # Keep decision-bearing fields, not repeated JUnit stack/output blobs.
+            # Exact full diagnostics remain retrievable by source event/artifact.
+            item = {
+                k: failure[k]
+                for k in ("test_id", "file", "line", "failure_type", "expected", "actual")
+                if failure.get(k) is not None
+            }
+            item["message"] = str(failure.get("message", ""))[:350]
+            if not item["message"]:
+                item["message"] = str(failure.get("stack", ""))[-350:]
+            failures.append(item)
+        state["recent_failures"].append(
+            {
+                "event_id": event["id"],
+                "artifact_id": payload.get("structured_artifact"),
+                "failures": failures,
+            }
+        )
     state["recent_child_evidence"] = [
         {"id": m["id"], "body": m["body"][:400]}
         for m in store.messages(sid, limit=3)
@@ -87,4 +139,53 @@ def coding_focus(store, sid):
     state["recently_modified_files"] = sorted(
         {p for e in edits for p in e["payload"].get("files", {})}
     )[:30]
-    return json.dumps(state)[:2500]
+    if focus and store.config(sid).features.history_retrieval:
+        terms = " ".join(
+            focus[0]["payload"].get("symbols", []) + focus[0]["payload"].get("files", [])
+        )
+        if terms:
+            cited = (
+                {e["event_id"] for e in state["recent_failures"]}
+                | {e["id"] for e in edits}
+                | {focus[0]["id"]}
+            )
+            state["related_evidence"] = [
+                r for r in search(store, sid, terms, limit=8) if r["id"] not in cited
+            ][:3]
+    if index_provider:
+        from pathlib import Path
+
+        from .repository import LANGUAGES
+
+        implicated = state["recently_modified_files"] + (
+            focus[0]["payload"].get("files", []) if focus else []
+        )
+        for command in store.events(sid, kind="coding_command", limit=2):
+            if not command["payload"].get("passed"):
+                implicated += [d.get("file", "") for d in command["payload"].get("diagnostics", [])]
+        packet = []
+        for path in dict.fromkeys(p for p in implicated if p and Path(p).suffix in LANGUAGES):
+            if len(packet) == 2:
+                break
+            try:
+                index = index_provider(sid)
+                outline = index.outline(path)
+                packet.append(
+                    {
+                        "file": path,
+                        "definitions": [
+                            {
+                                k: s[k]
+                                for k in ("name", "line", "end_line", "signature", "quality")
+                                if k in s
+                            }
+                            for s in outline["symbols"][:4]
+                        ],
+                        "module_dependencies": index.resolver.bindings(path)[:3],
+                    }
+                )
+            except (ValueError, PermissionError, OSError):
+                continue
+        if packet:
+            state["source_evidence"] = packet
+    return json.dumps(state)[:6000]

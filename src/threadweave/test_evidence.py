@@ -44,16 +44,32 @@ def junit(text, name):
         skipped = case.find("skipped") is not None
         identifier = case.get("classname", "").replace(".", "/") + "::" + case.get("name", "")
         if name == "pytest":
-            parts = case.get("classname", "").split(".")
+            parts = [p for p in case.get("classname", "").split(".") if p]
             boundary = next((i for i, p in enumerate(parts) if p[:1].isupper()), len(parts))
-            filename = case.get("file") or "/".join(parts[:boundary]) + ".py"
-            identifier = "::".join([filename, *parts[boundary:], case.get("name", "")])
+            module = "/".join(parts[:boundary])
+            # Collection errors can have no classname and a module as name.
+            # Never invent the bogus path '.py' when metadata is absent.
+            collection = problem is not None and problem.get("message") == "collection failure"
+            if not module and collection:
+                module = case.get("name", "").replace(".", "/")
+            filename = case.get("file") or (module + ".py" if module else None)
+            identifier = "::".join(
+                [
+                    p
+                    for p in [
+                        filename,
+                        *parts[boundary:],
+                        None if collection else case.get("name", ""),
+                    ]
+                    if p
+                ]
+            ) or case.get("name", "unknown")
         records.append(
             {
                 "framework": name,
                 "test_id": identifier,
                 "name": identifier,
-                "file": case.get("file"),
+                "file": case.get("file") or (filename if name == "pytest" else None),
                 "line": int(case.get("line", "0")) or None,
                 "status": "failed" if problem is not None else "skipped" if skipped else "passed",
                 "duration": float(case.get("time", "0")),
@@ -67,6 +83,63 @@ def junit(text, name):
             }
         )
     return records
+
+
+def resolve_locations(evidence, workspace, *, container=False):
+    """Resolve framework paths without changing its rootdir/configuration semantics.
+
+    Pytest may choose an ancestor project as rootdir for a nested checkout. Keep
+    the original identity for provenance, but expose runnable workspace-relative
+    test IDs. Never guess by basename/suffix; require an actual in-workspace file.
+    Resolution is cached per distinct reported path, not per test case.
+    """
+    root = Path(workspace).resolve()
+    cache = {}
+
+    def resolve(raw):
+        if raw in cache:
+            return cache[raw]
+        source = Path(raw)
+        candidates = (
+            [source] if source.is_absolute() else [p / source for p in (root, *root.parents)]
+        )
+        if container and source.is_absolute() and source.is_relative_to("/workspace"):
+            candidates.insert(0, root / source.relative_to("/workspace"))
+        result = None
+        for candidate in candidates:
+            try:
+                path = candidate.resolve()
+                if path.is_relative_to(root) and path.is_file():
+                    result = str(path.relative_to(root))
+                    break
+            except (OSError, RuntimeError):
+                continue
+        cache[raw] = result
+        return result
+
+    seen = set()
+    for record in [
+        *evidence.get("tests", []),
+        *evidence.get("failures", []),
+        *evidence.get("diagnostics", []),
+    ]:
+        if id(record) in seen:
+            continue
+        seen.add(id(record))
+        for item in [record, *record.get("stack_frames", [])]:
+            raw = item.get("file")
+            if not raw:
+                continue
+            relative = resolve(raw)
+            item["path_resolution"] = "workspace file" if relative else "unresolved"
+            if relative is None or relative == raw:
+                continue
+            item["reported_file"], item["file"] = raw, relative
+            if item.get("test_id", "").startswith(raw + "::"):
+                item["reported_test_id"] = item["test_id"]
+                item["test_id"] = relative + item["test_id"][len(raw) :]
+                item["name"] = item["test_id"]
+    return evidence
 
 
 def structured(text, name, xml=None):
@@ -107,6 +180,19 @@ def structured(text, name, xml=None):
     for packet in packets:
         if not isinstance(packet, dict):
             continue
+        for entry in packet.get("generalDiagnostics", []):
+            start = entry.get("range", {}).get("start", {})
+            diagnostics.append(
+                {
+                    "file": entry.get("file"),
+                    "line": start.get("line", 0) + 1,
+                    "column": start.get("character", 0) + 1,
+                    "severity": entry.get("severity"),
+                    "diagnostic_code": entry.get("rule"),
+                    "message": entry.get("message"),
+                    "provenance": "pyright_json",
+                }
+            )
         if packet.get("kind") in {"error", "warning", "note"} and packet.get("locations"):
             for location in packet["locations"]:
                 point = location.get("caret", {})
@@ -212,6 +298,48 @@ def structured(text, name, xml=None):
                 "provenance": "tsc_text_location",
             }
         )
+    for match in re.finditer(
+        r"([\w./-]+\.\w+):(\d+)(?::(\d+))?:\s*(error|warning|note):\s*([^\n]+?)(?:\s+\[([\w-]+)\])?$",
+        text,
+        re.M,
+    ):
+        diagnostics.append(
+            {
+                "file": match[1],
+                "line": int(match[2]),
+                "column": int(match[3]) if match[3] else None,
+                "severity": match[4],
+                "message": match[5],
+                "diagnostic_code": match[6],
+                "provenance": "compiler_text_location",
+            }
+        )
+    for match in re.finditer(
+        r"([\w./-]+\.cu(?:h)?)\((\d+)\):\s*(error|warning)\s*#?(\d+)?:?\s*([^\n]+)", text
+    ):
+        diagnostics.append(
+            {
+                "file": match[1],
+                "line": int(match[2]),
+                "severity": match[3],
+                "diagnostic_code": match[4],
+                "message": match[5],
+                "provenance": "nvcc_text_location",
+            }
+        )
+    for record in tests:
+        excerpt = record.get("message", "") + "\n" + record.get("stack", "")
+        match = re.search(r"(?:assert |AssertionError: )([^\n]+?)\s*==\s*([^\n]+)", excerpt)
+        if match:
+            record["actual_expression"], record["expected_expression"] = (
+                match[1][:500],
+                match[2][:500],
+            )
+            record["comparison_provenance"] = "assertion text, not evaluated values"
+        record["stack_frames"] = [
+            {"file": m[1], "line": int(m[2]), "symbol": m[3]}
+            for m in re.finditer(r'File "([^"]+)", line (\d+), in (\w+)', excerpt)
+        ][:12]
     failures = [t for t in tests if t["status"] == "failed"] if tests else fallback["failures"]
     return {
         **fallback,

@@ -49,6 +49,7 @@ class MutationObserver:
         self.stats = {}
         self.trackers = {}
         self.force_full = False
+        self.verification_changes = {}
 
     def close(self):
         for tracker in self.trackers.values():
@@ -116,6 +117,31 @@ class MutationObserver:
         files, hashed_bytes, hashed_files = ({} if full else previous["files"].copy()), 0, 0
         old = previous["files"] if previous else {}
         parents = {}
+        enumerated = {}
+        if full:
+            # Directory-entry stat avoids constructing/resolving a Path per
+            # metadata syscall. Trust reconciliation still examines every file.
+            for parent in {os.path.dirname(p) for p in paths}:
+                current, safe = root, True
+                for part in parent.split("/") if parent else []:
+                    current = os.path.join(current, part)
+                    if os.path.islink(current):
+                        safe = False
+                        break
+                parents[parent] = safe
+                if not safe:
+                    continue
+                try:
+                    with os.scandir(current) as entries:
+                        for entry in entries:
+                            relative = parent + "/" + entry.name if parent else entry.name
+                            if relative in paths:
+                                try:
+                                    enumerated[relative] = entry.stat(follow_symlinks=False)
+                                except FileNotFoundError:
+                                    pass
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
         for relative in sorted(paths):
             files.pop(relative, None)
             if Path(relative).name.startswith(".threadweave-watch-"):
@@ -128,18 +154,23 @@ class MutationObserver:
             # A tracked directory can have been replaced with a symlink. Never
             # hash an outside target, even though Python itself is unrestricted.
             safe = True
-            for parent in path.parents:
-                if parent == root_path:
-                    break
-                if parent not in parents:
-                    parents[parent] = not parent.is_symlink()
-                if not parents[parent]:
-                    safe = False
-                    break
+            parent = os.path.dirname(relative)
+            if parent not in parents:
+                parts = parent.split("/") if parent else []
+                current = root
+                parents[parent] = True
+                for part in parts:
+                    current = os.path.join(current, part)
+                    if os.path.islink(current):
+                        parents[parent] = False
+                        break
+            safe = parents[parent]
             if not safe:
                 continue
             try:
-                info = path.lstat()
+                info = enumerated.get(relative) if full else path.lstat()
+                if info is None:
+                    continue
             except FileNotFoundError:
                 continue
             sig = signature(info)
@@ -187,8 +218,11 @@ class MutationObserver:
                     "mode": mode,
                 }
             files[relative] = {"stat": sig, "value": value}
-        identity = state_id(head, files)
-        manifest = {"head": head, "state_id": identity, "files": files}
+        if previous and head == previous["head"] and files == old:
+            identity, manifest = previous["state_id"], previous
+        else:
+            identity = state_id(head, files)
+            manifest = {"head": head, "state_id": identity, "files": files}
         if previous != manifest:
             artifact = self.runtime.artifacts.put(
                 context.session_id, manifest, source_event=context.source_event

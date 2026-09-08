@@ -170,11 +170,13 @@ async def test_cli_detach_does_not_cancel_and_controls_are_usable(tmp_path):
             str(data),
             "attach",
             sid,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=PROJECT,
         )
-        await asyncio.sleep(0.2)
+        # Synchronize on attachment, not interpreter/import startup latency.
+        first_event = await asyncio.wait_for(client.stdout.readline(), 10)
+        assert json.loads(first_event)["session_id"] == sid
         client.send_signal(signal.SIGINT)
         _, stderr = await client.communicate()
         assert client.returncode == 0 and b"Detached" in stderr

@@ -11,7 +11,7 @@ from .gitops import GitWorkspace
 from .models import Verification, new_id, now
 from .repository import confined, detect, is_test, symbols
 from .storage import encode
-from .test_evidence import machine_command, structured
+from .test_evidence import machine_command, resolve_locations, structured
 
 KINDS = {
     "test": "test_commands",
@@ -38,7 +38,11 @@ async def run_command(context, command, *, kind="command", timeout_seconds=None)
         context.runtime.artifacts.load(context.session_id, result[k + "_artifact"])
         for k in ("stdout", "stderr")
     )
-    evidence = structured(text, framework, report.read_text() if report.is_file() else None)
+    evidence = resolve_locations(
+        structured(text, framework, report.read_text() if report.is_file() else None),
+        context.session.workspace.path,
+        container=config.execution.backend != "local",
+    )
     evidence_id = context.runtime.artifacts.put(
         context.session_id, evidence, source_event=context.source_event
     )
@@ -191,16 +195,45 @@ class CodingTask:
         observer = context.runtime.environment.mutations
         observer.reconcile(context, reason="before_verifier")
         git = GitWorkspace(context)
+        _, observed = observer.previous(str(git.root.resolve()))
+        origin = original.get("mutation_baseline")
+        if origin:
+            key = "verification:" + origin["artifact"]
+            if key not in observer.baselines:
+                observer.baselines[key] = observer.load(origin["owner"], origin["artifact"])
+            initial = observer.baselines[key]
+            cache_key = (origin["artifact"], observed["state_id"])
+            cached = observer.verification_changes.get(context.session_id)
+            if cached and cached[0] == cache_key:
+                all_changed_paths = cached[1]
+            else:
+                all_changed_paths = {
+                    p
+                    for p in initial["files"].keys() | observed["files"].keys()
+                    if initial["files"].get(p, {}).get("value")
+                    != observed["files"].get(p, {}).get("value")
+                }
+                observer.verification_changes[context.session_id] = (cache_key, all_changed_paths)
+            changed_paths = all_changed_paths.copy()
+        else:
+            changed_paths = (
+                None  # Migrated sessions without an observation baseline reconcile conservatively.
+            )
         violations, results, regressions = [], {}, []
+        prior = git.checkpoint(original["checkpoint_id"])["manifest"]
+        governed_paths = set(git.files()) | set(prior)
+        if changed_paths is not None:
+            changed_paths &= governed_paths
         if task.require_tests and not original["commands"]["test"]:
             violations.append("No test commands configured; coding completion cannot be verified")
-        patch = git.diff(original["checkpoint_id"])
+        patch = git.diff(original["checkpoint_id"], paths=changed_paths)
         if task.require_change and not patch.strip():
             violations.append("A nonempty change is required")
-        if git.status()["head"] != original["git"]["head"]:
+        if observed["head"] != original["git"]["head"]:
             violations.append("Repository HEAD changed; automatic commits are not permitted")
-        prior = git.checkpoint(original["checkpoint_id"])["manifest"]
-        for relative in set(git.files()) | set(prior):
+        for relative in (
+            changed_paths if changed_paths is not None else set(git.files()) | set(prior)
+        ):
             entry, path = prior.get(relative), git.root / relative
             if entry and "symlink" in entry:
                 import os
@@ -218,6 +251,8 @@ class CodingTask:
             ):
                 violations.append(f"Forbidden modification: {relative}")
         for relative, recorded in original["tests"].items():
+            if changed_paths is not None and relative not in changed_paths:
+                continue
             path = confined(git.root, relative)
             if task.prohibit_test_deletion and not path.is_file():
                 violations.append(f"Test file deleted: {relative}")
@@ -282,12 +317,24 @@ class CodingTask:
             )
             if not measured["passed"]:
                 violations.append("Benchmark correctness/performance threshold failed")
-        observer.reconcile(context, reason="after_verifier")
+        # The entry boundary already performed a full trust reconciliation. A
+        # healthy watch stream fences command effects; uncertainty still forces
+        # full reconciliation. Never repeat an unchanged full scan just for exit.
+        observer.reconcile(context, reason="verification_effects")
         _, final = observer.previous(str(git.root.resolve()))
+        if final["state_id"] != observed["state_id"] and any(
+            final["files"].get(p, {}).get("value") != observed["files"].get(p, {}).get("value")
+            for p in governed_paths | set(git.files())
+        ):
+            violations.append("Workspace changed during verification; retry against stable inputs")
         if origin := original.get("mutation_baseline"):
-            observed = observer.load(origin["owner"], origin["artifact"])
-            governed_paths = set(git.files()) | set(prior)
-            for path in observed["files"].keys() | final["files"].keys():
+            stable = final["state_id"] == observed["state_id"]
+            observed = initial
+            if not stable:
+                governed_paths = set(git.files()) | set(prior)
+            for path in (
+                all_changed_paths if stable else observed["files"].keys() | final["files"].keys()
+            ):
                 if observed["files"].get(path, {}).get("value") == final["files"].get(path, {}).get(
                     "value"
                 ):

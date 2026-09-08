@@ -74,16 +74,17 @@ lost = iter([1, 2, 3])
         await again.close()
 
 
-async def test_timeout_cancels_process_and_recovers_last_completed_checkpoint(tmp_path):
+async def test_timeout_interrupts_execution_preserving_partial_namespace(tmp_path):
     kernel = Kernel(tmp_path / "kernel", tmp_path, bridge)
     try:
         await kernel.execute(new_id(), "value = 42", 5)
+        pid = kernel.process.pid
         with pytest.raises(HarnessError) as caught:
             await kernel.execute(new_id(), "value = 99\nwhile True: pass", 0.1)
         assert caught.value.failure.code == "python_timeout"
         assert caught.value.failure.uncertain
-        assert kernel.process is None
-        assert (await kernel.execute(new_id(), "value", 5))["value"] == "42"
+        assert kernel.process.pid == pid
+        assert (await kernel.execute(new_id(), "value", 5))["value"] == "99"
     finally:
         await kernel.close()
 

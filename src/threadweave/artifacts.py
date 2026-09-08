@@ -157,9 +157,14 @@ class Artifacts:
         aid = self.put(sid, value, source_event=source_event)
         serialized = encode(value)
         cap = self.store.config(sid).context.result_chars
-        return {
+        result = {
             "artifact_id": aid,
             "preview": serialized[:cap],
             "truncated": len(serialized) > cap,
             "characters": len(serialized),
         }
+        if result["truncated"]:
+            result["inspection"] = (
+                f"Full result: artifacts.load({aid!r}). Prefer selecting fields from your retained Python variable. Do not repeat an unchanged read to recover truncated output."
+            )
+        return result

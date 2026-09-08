@@ -31,6 +31,17 @@ class QueryArgs(Record):
     limit: int = Field(default=20, ge=1, le=100)
 
 
+class PositionArgs(Record):
+    path: str
+    line: int = Field(ge=1)
+    column: int = Field(ge=1)
+
+
+class SemanticArgs(PositionArgs):
+    operation: str = "definition"
+    server: str | None = None
+
+
 class HistorySearchArgs(QueryArgs):
     kind: str | None = None
     session_id: str | None = None
@@ -139,8 +150,19 @@ def register(registry):
         permissions=("workspace.read",),
         *,
         feature=None,
+        model_callable=True,
     ):
-        registry.register(Tool(name, description, args, handler, permissions, feature=feature))
+        registry.register(
+            Tool(
+                name,
+                description,
+                args,
+                handler,
+                permissions,
+                feature=feature,
+                model_callable=model_callable,
+            )
+        )
 
     async def repo_map(c, a):
         return c.runtime.index(c.session_id).repo_map()
@@ -163,7 +185,65 @@ def register(registry):
     async def dependencies(c, a):
         return c.runtime.index(c.session_id).dependencies(a.path)
 
-    for method in ("definition", "callers", "callees", "context_for_symbol"):
+    async def resolve(c, a):
+        return c.runtime.index(c.session_id).resolve(**a.model_dump())
+
+    async def semantic(c, a):
+        from .lsp import query
+
+        return await query(c, **a.model_dump())
+
+    add(
+        "repo_semantic",
+        "Installed compiler/LSP semantic source-position query; bounded runtime and retained logs.",
+        SemanticArgs,
+        semantic,
+        permissions=("workspace.read", "process"),
+        model_callable=False,
+    )
+
+    add(
+        "repo_resolve",
+        "Python static name inference at a source position (Jedi).",
+        PositionArgs,
+        resolve,
+        model_callable=False,
+    )
+
+    async def coverage(c, a):
+        from .test_selection import import_coverage
+
+        return import_coverage(c, a.path)
+
+    async def selection(c, a):
+        from .test_selection import selection_reason
+
+        return selection_reason(c, a.query)
+
+    add(
+        "test_coverage_import",
+        "Import real coverage.py per-test dynamic contexts.",
+        PathArgs,
+        coverage,
+        model_callable=False,
+    )
+    add(
+        "test_selection_reason",
+        "Inspect attributed reasons for a selected test.",
+        QueryArgs,
+        selection,
+        model_callable=False,
+    )
+
+    for method in (
+        "definition",
+        "declaration",
+        "implementations",
+        "related_symbols",
+        "callers",
+        "callees",
+        "context_for_symbol",
+    ):
 
         async def query(c, a, method=method):
             return getattr(c.runtime.index(c.session_id), method)(a.query, limit=a.limit)
@@ -173,6 +253,7 @@ def register(registry):
             "Ranked syntax-derived evidence; names may be ambiguous.",
             QueryArgs,
             query,
+            model_callable=method not in {"declaration", "implementations", "related_symbols"},
         )
 
     async def dependents(c, a):

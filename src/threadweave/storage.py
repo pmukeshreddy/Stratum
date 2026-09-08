@@ -155,6 +155,16 @@ class Store:
             ).fetchone()
         return RunConfig.model_validate_json(row[0])
 
+    def reconfigure(self, sid, config):
+        """Persist a new immutable config identity at an explicit host boundary."""
+        body = encode(config.model_dump(mode="json"))
+        identifier = hashlib.sha256(body.encode()).hexdigest()
+        with self.transaction():
+            self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (identifier, body))
+            self.update(sid, config_id=identifier)
+            self.event(sid, "session_configured", {"config_id": identifier})
+        return identifier
+
     def session(self, session_id: str) -> Session:
         row = self.db.execute("SELECT body FROM sessions WHERE id=?", (session_id,)).fetchone()
         if row is None:
@@ -455,11 +465,13 @@ class Store:
 
     def messages(self, sid: str, *, pending=False, limit=30) -> list[dict]:
         self.session(sid)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("Message limit must be a positive integer; at most 100 are returned")
         condition = " AND received_at IS NULL" if pending else ""
         order = "ASC" if pending else "DESC"
         rows = self.db.execute(
             f"SELECT * FROM messages WHERE recipient_id=?{condition} "
-            f"ORDER BY created_at {order} LIMIT ?",
+            f"ORDER BY created_at {order}, rowid {order} LIMIT ?",
             (sid, min(limit, 100)),
         )
         return [dict(r) for r in rows]
@@ -468,12 +480,14 @@ class Store:
         with self.transaction():
             messages = self.messages(sid, pending=True, limit=limit)
             for message in messages:
+                message["received_at"] = now()
                 eid = self.event(
                     sid, "agent_message_received", message, parent=message["source_event"]
                 )
                 self.add_context(sid, eid, [{"role": "user", "content": render(message)}])
                 self.db.execute(
-                    "UPDATE messages SET received_at=? WHERE id=?", (now(), message["id"])
+                    "UPDATE messages SET received_at=? WHERE id=?",
+                    (message["received_at"], message["id"]),
                 )
             return messages
 

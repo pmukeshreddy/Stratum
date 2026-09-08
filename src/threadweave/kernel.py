@@ -67,16 +67,32 @@ class Kernel:
         self.calls, self.results = set(), {}
         self.write_lock = asyncio.Lock()
         self.active_execution = None
+        self.interrupts = {}
+        self.interrupt_lock = asyncio.Lock()
+        self.execution_phase = "idle"
 
     async def start(self):
         if self.process and self.process.returncode is None:
             return
+        if self.process is not None:
+            # A crashed worker still owns pipe transports and its stderr file.
+            # Dispose them on the owning loop before replacing the process.
+            await self.close()
+        from .process_family import cleanup_registry
+
+        cleanup_registry(self.directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         from .artifacts import atomic_write
 
         atomic_write(self.directory / "bootstrap.json", json.dumps(self.bootstrap).encode())
         self._stderr = (self.directory / "worker.log").open("ab")
+        prefix = []
+        if self.bootstrap.get("research_read_only"):
+            from .isolation import readonly_worker
+
+            prefix = readonly_worker(self.directory)
         self.process = await asyncio.create_subprocess_exec(
+            *prefix,
             sys.executable,
             "-u",
             "-c",
@@ -88,7 +104,11 @@ class Kernel:
             stderr=self._stderr,
             start_new_session=True,
             limit=8 * 1024 * 1024,
-            env=self.env,
+            env={
+                **(self.env if self.env is not None else os.environ),
+                "IPYTHONDIR": str(self.directory / "ipython"),
+                "TMPDIR": str(self.directory),
+            },
         )
         try:
             async with asyncio.timeout(20):
@@ -146,6 +166,12 @@ class Kernel:
                     task = asyncio.create_task(self._reply(packet))
                     self.calls.add(task)
                     task.add_done_callback(self.calls.discard)
+                elif packet["type"] == "interrupt_ack":
+                    waiter = self.interrupts.get(packet["id"])
+                    if waiter and not waiter.done():
+                        waiter.set_result(packet["accepted"])
+                elif packet["type"] == "phase" and packet["id"] == self.active_execution:
+                    self.execution_phase = packet["phase"]
                 else:
                     raise HarnessError(
                         "environment", "kernel_protocol", "Unexpected worker packet", uncertain=True
@@ -163,18 +189,19 @@ class Kernel:
                     result = asyncio.get_running_loop().create_future()
                     self.results[execution_id] = result
                     self.active_execution = execution_id
+                    self.execution_phase = "executing"
                     await self._send({"type": "execute", "id": execution_id, "code": code})
-                    return await result
+                    return await asyncio.shield(result)
             except TimeoutError as exc:
-                await self.close()
+                await self.interrupt(execution_id)
                 raise HarnessError(
                     "environment",
                     "python_timeout",
-                    "Python execution timed out; worker was stopped",
+                    "Python execution timed out; inspect partial effects before retrying",
                     uncertain=True,
                 ) from exc
             except asyncio.CancelledError:
-                await self.close()
+                await self.interrupt(execution_id)
                 raise
             except (BrokenPipeError, ConnectionError) as exc:
                 await self.close()
@@ -185,16 +212,44 @@ class Kernel:
                 self.results.pop(execution_id, None)
                 self.active_execution = None
 
-    async def interrupt(self, execution_id):
-        """Identity-fenced hard interruption. A stale interrupt never targets a later cell.
+    async def interrupt(self, execution_id, *, grace=1.0):
+        async with self.interrupt_lock:
+            return await self._interrupt(execution_id, grace=grace)
 
-        Worker termination preserves the last committed snapshot, not partial live
-        namespace changes. It also cancels pending host RPCs before kernel replacement.
+    async def _interrupt(self, execution_id, *, grace=1.0):
+        """Worker-validated interruption, preserving namespace when Python can stop.
+
+        The worker checks generation/phase before delivering its private signal.
+        Snapshot commits are protected. Unresponsive native calls escalate to kill.
         """
         if execution_id != self.active_execution:
             return False
-        await self.close()
-        return True
+        process = self.process
+        acknowledgement = asyncio.get_running_loop().create_future()
+        self.interrupts[execution_id] = acknowledgement
+        try:
+            await self._send({"type": "interrupt", "id": execution_id})
+            accepted = await asyncio.wait_for(acknowledgement, grace)
+            if not accepted:
+                return False
+            for call in list(self.calls):
+                call.cancel()
+            pending = self.results.get(execution_id)
+            if pending:
+                try:
+                    await asyncio.wait_for(asyncio.shield(pending), grace)
+                except TimeoutError:
+                    if self.execution_phase != "snapshot":
+                        raise
+                    # The bounded snapshot commit is not the interrupted cell.
+                    await asyncio.wait_for(asyncio.shield(pending), 7)
+            return True
+        except TimeoutError:
+            if self.process is process and self.active_execution == execution_id:
+                await self.close()
+            return True
+        finally:
+            self.interrupts.pop(execution_id, None)
 
     async def close(self):
         jobs = [
@@ -214,11 +269,32 @@ class Kernel:
                     )
                 )
         if self.process:
+            # Ask the worker to clean detached descendants before group escalation.
+            if self.process.returncode is None:
+                try:
+                    if self.active_execution is None:
+                        await self._send({"type": "shutdown"})
+                    else:
+                        self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), 0.6)
+                except (ProcessLookupError, TimeoutError):
+                    pass
+            from .process_family import cleanup_registry
+
+            cleanup_registry(self.directory)
             # Reap the process group even if the direct child already exited.
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            # Explicitly close the RPC input transport while its event loop is
+            # alive. Waiting for the PID alone does not close an asyncio writer.
+            if self.process.stdin:
+                self.process.stdin.close()
+                try:
+                    await self.process.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             await self.process.wait()
             self.process = None
         if self._stderr:

@@ -7,7 +7,7 @@ import pytest
 
 from threadweave.gitops import GitWorkspace, git
 from threadweave.kernel import Kernel
-from threadweave.models import HarnessError, new_id
+from threadweave.models import new_id
 from threadweave.repository import RepositoryIndex, symbols
 from threadweave.storage import Store
 from threadweave.test_evidence import machine_command, structured
@@ -260,12 +260,13 @@ async def test_stale_interrupt_cannot_hit_next_cell(tmp_path):
         assert not await kernel.interrupt(first)
         assert (await kernel.execute(new_id(), "x", 5))["value"] == "123"
         current = new_id()
+        pid = kernel.process.pid
         running = asyncio.create_task(kernel.execute(current, "await asyncio.sleep(30)", 40))
         while kernel.active_execution != current:  # noqa: ASYNC110 - inspect actual production admission
             await asyncio.sleep(0.01)
         assert await kernel.interrupt(current)
-        with pytest.raises(HarnessError):
-            await running
+        assert (await running)["error"]["code"] in {"CancelledError", "KeyboardInterrupt"}
+        assert kernel.process.pid == pid
         assert (await kernel.execute(new_id(), "x", 5))["value"] == "123"
     finally:
         await kernel.close()

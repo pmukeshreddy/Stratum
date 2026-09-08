@@ -36,6 +36,12 @@ class Environment:
     async def prepare(self, sid, *, force=False):
         runtime, store = self.runtime, self.runtime.store
         config, session = store.config(sid), store.session(sid)
+        if session.workspace.metadata.get("candidate_pending"):
+            raise HarnessError(
+                "environment",
+                "candidate_not_ready",
+                "Candidate workspace admission has not completed",
+            )
         if store.events(sid, kind="environment_prepared", limit=1):
             return
         # Even an explicitly coding-configured interactive conversation may greet,
@@ -156,11 +162,66 @@ class Environment:
         from .editing import recover_edits
         from .execution import recover_containers
         from .gitops import recover_workspace_effects
+        from .process_family import cleanup_registry
 
         recover_edits(self.runtime)
+        for session in self.runtime.store.sessions():
+            kernel = self.runtime.kernels.get(session.id)
+            if not kernel or not kernel.process or kernel.process.returncode is not None:
+                cleanup_registry(self.runtime.store.directory / "kernels" / session.kernel_id)
         await recover_containers(self.runtime)
         await recover_workspace_effects(self.runtime)
         self.mutations.recover()
+        for session in self.runtime.store.sessions():
+            if session.workspace.metadata.get("candidate_pending"):
+                from .models import Outcome
+
+                self.runtime.store.update(
+                    session.id, outcome=Outcome.FAILED, paused=True, runnable=False
+                )
+                self.runtime.store.event(
+                    session.id,
+                    "candidate_recovery",
+                    {
+                        "status": "admission_interrupted",
+                        "workspace_leases_retained": True,
+                        "replayed": False,
+                    },
+                )
         self.runtime.store.db.execute(
             "UPDATE experiments SET status='interrupted' WHERE status='running'"
         )
+
+    def candidate_workspace(self, parent_id, child_id):
+        """Thread-local connection around immutable Git capture and worktree admission."""
+        from types import SimpleNamespace
+
+        from .artifacts import Artifacts
+        from .gitops import GitWorkspace
+        from .storage import Store
+
+        store = Store(self.runtime.store.directory)
+        try:
+            runtime = SimpleNamespace(store=store, artifacts=Artifacts(store))
+            event = store.event(child_id, "candidate_workspace_started", {"parent": parent_id})
+            workspace = GitWorkspace(ToolContext(runtime, parent_id, new_id(), event))
+            checkpoint = workspace.snapshot_tree("candidate-source")
+            isolated = workspace.isolate(checkpoint)
+            result = Workspace(
+                path=str(isolated),
+                metadata={
+                    "source_session": parent_id,
+                    "source_checkpoint": checkpoint,
+                    "isolation": "git_worktree",
+                    "base_revision": workspace.checkpoint(checkpoint)["head"],
+                },
+            )
+            # Persist the lease even if the daemon exits before admission completes.
+            store.event(
+                child_id,
+                "candidate_workspace_lease",
+                {"workspace": result.model_dump(), "checkpoint": checkpoint},
+            )
+            return result, checkpoint
+        finally:
+            store.close()

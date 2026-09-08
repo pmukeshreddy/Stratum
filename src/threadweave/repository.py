@@ -156,6 +156,9 @@ class RepositoryIndex:
         self.tracker = None
         self.initialized = False
         self.last_changed = []
+        from .resolution import Resolver
+
+        self.resolver = Resolver(self)
 
     def close(self):
         if self.tracker:
@@ -169,12 +172,7 @@ class RepositoryIndex:
             self.refresh()
             self.tracker.reconciled()
         elif candidates:
-            previous = {
-                r[0]
-                for r in self.store.db.execute(
-                    "SELECT path FROM repository_files WHERE workspace=?", (str(self.root),)
-                )
-            }
+            previous = self.resolver.paths
             paths = expand_paths(self.root, candidates, previous)
             self.refresh(p for p in paths if not set(Path(p).parts) & EXCLUDED)
 
@@ -214,6 +212,8 @@ class RepositoryIndex:
                 (str(self.root), relative),
             ).fetchone()
             if not path.is_file() or path.is_symlink() or path.stat().st_size > 2_000_000:
+                if old:
+                    changed.append(relative)
                 self.store.db.execute(
                     "DELETE FROM code_evidence WHERE workspace=? AND path=?",
                     (str(self.root), relative),
@@ -230,8 +230,7 @@ class RepositoryIndex:
             except (ValueError, TypeError):
                 indexed = False  # Disposable corrupt index row is rebuilt, not trajectory data.
             if (
-                full
-                and old
+                old
                 and indexed
                 and old["mtime_ns"] == stat.st_mtime_ns
                 and old["size"] == stat.st_size
@@ -305,6 +304,7 @@ class RepositoryIndex:
                 "SELECT path FROM repository_files WHERE workspace=?", (str(self.root),)
             ).fetchall():
                 if row[0] not in keep:
+                    changed.append(row[0])
                     self.store.db.execute(
                         "DELETE FROM code_evidence WHERE workspace=? AND path=?",
                         (str(self.root), row[0]),
@@ -313,6 +313,12 @@ class RepositoryIndex:
                         "DELETE FROM repository_files WHERE workspace=? AND path=?",
                         (str(self.root), row[0]),
                     )
+        if full and not self.initialized:
+            self.resolver.configure()
+            # Migration/recovery rebuilds this disposable relationship projection.
+            self.resolver.update(paths)
+        else:
+            self.resolver.update(changed)
         self.initialized = True
         self.last_changed = changed
         return changed
@@ -385,27 +391,124 @@ class RepositoryIndex:
         }
 
     def definition(self, query, *, limit=20):
-        return self.evidence("symbols", query, limit=limit)
+        path, separator, name = query.partition("::")
+        result = self.evidence("symbols", name if separator else query, limit=limit)
+        if separator:
+            result["matches"] = [m for m in result["matches"] if m["path"] == path]
+        for item in result["matches"]:
+            item.update(symbol_id=item["path"] + "::" + item["name"], relationship="definition")
+        return result
+
+    def declaration(self, query, *, limit=20):
+        result = self.definition(query, limit=limit)
+        for item in result["matches"]:
+            item["relationship"] = "declaration/definition"
+        return result
+
+    def resolve(self, path, line, column):
+        self.ensure_current()
+        return self.resolver.infer(path, line, column)
+
+    def _incoming(self, query, kind, limit):
+        definitions = self.definition(query, limit=limit)["matches"]
+        resolved = []
+        for definition in definitions:
+            short = definition.get("short_name", definition["name"].split(".")[-1])
+            for binding in self.store.db.execute(
+                "SELECT * FROM module_bindings WHERE workspace=? AND target=?",
+                (str(self.root), definition["path"]),
+            ):
+                if binding["symbol"] not in {"", "*", short}:
+                    continue
+                name = (
+                    binding["alias"]
+                    if binding["symbol"] == short
+                    else (binding["alias"] + "." + short if binding["alias"] else short)
+                )
+                names = (name, name.replace(".", "::"))
+                for row in self.store.db.execute(
+                    "SELECT body FROM code_evidence WHERE workspace=? AND path=? AND kind=? AND name IN (?,?) LIMIT ?",
+                    (str(self.root), binding["path"], kind, *names, limit),
+                ):
+                    resolved.append(
+                        {
+                            **json.loads(row[0]),
+                            "path": binding["path"],
+                            "symbol_id": definition["symbol_id"],
+                            "relationship": "calls" if kind == "calls" else "references",
+                            "quality": "resolved structural",
+                            "rank_reason": "explicit import binding to target module and exported name; dynamic shadowing is not type-checked",
+                        }
+                    )
+        fallback = self.evidence(kind, query.split("::")[-1], limit=limit)["matches"]
+        seen = {(m["path"], m["line"], m["name"]) for m in resolved}
+        for item in fallback:
+            if (item["path"], item["line"], item["name"]) not in seen:
+                item.update(
+                    relationship=kind,
+                    rank_reason="unresolved syntax occurrence; may refer to a different symbol",
+                )
+                resolved.append(item)
+        return {
+            "matches": resolved[:limit],
+            "precision": "per-item evidence quality; static import binding is not dynamic dispatch proof",
+        }
 
     def references(self, query, *, limit=20):
-        return self.evidence("references", query, limit=limit)
+        return self._incoming(query, "references", limit)
 
     def callers(self, query, *, limit=20):
-        return self.evidence("calls", query, limit=limit)
+        return self._incoming(query, "calls", limit)
 
     def callees(self, query, *, limit=20):
         return self.evidence("calls", query, limit=limit, owner=True)
 
     def context_for_symbol(self, query, *, limit=10):
+        import itertools
+
+        definitions = self.definition(query, limit=limit)
+        sources = []
+        for definition in definitions["matches"][:2]:
+            path = confined(
+                self.root, definition["path"], allowed=self.allowed, forbidden=self.forbidden
+            )
+            start = max(1, definition["line"])
+            end = min(definition.get("end_line", start + 30), start + 79)
+            with path.open(errors="replace") as stream:
+                lines = list(itertools.islice(stream, start - 1, end))
+            source = "".join(f"{start + i}: {line}" for i, line in enumerate(lines))
+            sources.append(
+                {
+                    "symbol_id": definition["symbol_id"],
+                    "file": definition["path"],
+                    "start_line": start,
+                    "end_line": end,
+                    "source": source[:4000],
+                    "truncated": len(source) > 4000 or end < definition.get("end_line", end),
+                    "quality": "exact source excerpt; identity syntax-derived",
+                }
+            )
         return {
-            "definitions": self.definition(query, limit=limit),
+            "sources": sources,
+            "definitions": definitions,
             "callers": self.callers(query, limit=limit),
             "callees": self.callees(query, limit=limit),
         }
 
+    def implementations(self, query, *, limit=20):
+        return self.evidence("inheritance", query, limit=limit)
+
+    def related_symbols(self, query, *, limit=10):
+        return self.context_for_symbol(query, limit=limit)
+
     def changed_symbols(self):
         self.ensure_current()
-        return [{"path": p, **s} for p in self.last_changed for s in self.outline(p)["symbols"]]
+        return [
+            {"path": p, **s}
+            for p in list(self.last_changed)
+            if (self.root / p).is_file()
+            for s in self.outline(p)["symbols"]
+        ]
 
     def search(self, query, *, regex=False, path="*", language=None, context=2, limit=100):
         pattern = re.compile(query if regex else re.escape(query))
@@ -460,6 +563,15 @@ class RepositoryIndex:
 
     def dependencies(self, path):
         self.ensure_current()
+        bindings = self.resolver.bindings(path)
+        return {
+            "path": path,
+            "imports": bindings,
+            "likely_local_modules": sorted({b["target"] for b in bindings if b["target"]}),
+            "quality": "per-import resolved structural or unresolved evidence",
+        }
+
+    def _lexical_dependencies(self, path):
         outline = self.outline(path)
         related = []
         for item in outline["imports"]:
@@ -485,18 +597,21 @@ class RepositoryIndex:
     def dependents(self, path, *, current=True):
         if current:
             self.ensure_current()
-        stem = Path(path).stem
         return {
             "path": path,
             "matches": [
                 dict(r)
                 for r in self.store.db.execute(
-                    "SELECT DISTINCT path FROM code_evidence WHERE workspace=? AND kind='imports' "
-                    "AND body LIKE ? LIMIT 100",
-                    (str(self.root), "%" + stem + "%"),
+                    "SELECT DISTINCT path,quality FROM module_bindings WHERE workspace=? AND target IN (?,?) LIMIT 100",
+                    (
+                        str(self.root),
+                        path,
+                        "package:"
+                        + ("" if str(Path(path).parent) == "." else str(Path(path).parent)),
+                    ),
                 )
             ],
-            "quality": "heuristic import overlap",
+            "quality": "resolved structural module binding",
         }
 
 

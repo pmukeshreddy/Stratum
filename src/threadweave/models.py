@@ -93,6 +93,8 @@ class ContextPolicy(Record):
     summary_chars: int = Field(default=3000, ge=256)
     result_chars: int = Field(default=1800, ge=128)
     supplemental_chars: int = Field(default=3000, ge=0)
+    embedding_model: str | None = None
+    embedding_cache: str | None = None
 
 
 class RetryPolicy(Record):
