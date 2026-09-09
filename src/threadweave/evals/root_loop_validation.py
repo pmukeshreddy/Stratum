@@ -69,7 +69,7 @@ def validate_request(request):
         "Skills and project context:",
     ]
     assert [foundation.index(m) for m in markers] == sorted(foundation.index(m) for m in markers)
-    assert "Direct reasoning and a direct answer are valid" in foundation
+    assert "IPython is the default working and control environment" in foundation
     assert [t["function"]["name"] for t in request.tools] == ["ipython"]
 
 

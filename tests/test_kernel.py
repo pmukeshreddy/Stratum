@@ -102,15 +102,19 @@ async def test_execution_receipt_prevents_duplicate_side_effect(tmp_path):
         await kernel.close()
 
 
-async def test_broken_checkpoint_reported_as_environment_failure(tmp_path):
+async def test_broken_checkpoint_reports_warning_and_continues(tmp_path):
     directory = tmp_path / "kernel"
     directory.mkdir()
     (directory / "checkpoint.json").write_text("broken JSON")
     kernel = Kernel(directory, tmp_path, bridge)
-    with pytest.raises(HarnessError) as caught:
+    try:
         await kernel.start()
-    assert caught.value.failure.category == "environment"
-    assert kernel.process is None
+        assert "__checkpoint__" in kernel.recovery["missing"]
+        result = await kernel.execute("recovered", "value = 42\nvalue", 10)
+        assert result["error"] is None
+        assert not result["snapshot_metrics"].get("commit_failed")
+    finally:
+        await kernel.close()
 
 
 async def test_workspace_module_import_recovery_captures_native_startup_output(tmp_path):

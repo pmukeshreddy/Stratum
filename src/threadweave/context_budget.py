@@ -107,6 +107,11 @@ def merge_summary(previous, update, *, source_events=()):
         )
 
     resolved = {c.get("id") for c in update.get("resolved_items", []) if supported(c)}
+    # Extractive/model summaries can repeat prior pending items. An evidenced
+    # resolution applies to both copies, otherwise merging resurrects finished work.
+    for item in pending_ledger(incoming):
+        if item["id"] in resolved:
+            incoming[item["field"]].remove(item["content"])
     changes = {
         c.get("id"): c
         for c in update.get("pending_updates", [])
@@ -173,7 +178,21 @@ def extractive_summary(previous, blocks):
 
     def lines(value):
         if isinstance(value, dict):
-            for content in value.values():
+            # Raw outputs and source code are evidence, not unresolved task instructions.
+            # Keep their durable references; explicit structured pending/error fields
+            # and authored user/assistant observations still enter the protected ledger.
+            for key, content in value.items():
+                if key in {
+                    "stdout",
+                    "stderr",
+                    "traceback",
+                    "code",
+                    "arguments",
+                    "value",
+                    "preview",
+                    "tests",
+                }:
+                    continue
                 yield from lines(content)
         elif isinstance(value, list):
             for content in value:

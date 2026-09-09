@@ -148,7 +148,8 @@ class EvidenceReducer:
 
 
 @pytest.mark.parametrize("sizes", [[20000], [20, 20000], [20000, 24000]])
-async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config, sizes):
+@pytest.mark.parametrize("mode", ["manual", "completion"])
+async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config, sizes, mode):
     config.provider.model = "gpt-6-astra"
     config.context.max_tokens = 4096
     config.task.instruction_messages = [
@@ -172,7 +173,7 @@ async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config,
                     },
                 )
             )
-        await runtime._refinement_pass(root.id, "completion")
+        await runtime._refinement_pass(root.id, mode)
         assert len(provider.requests) > 1
         assert all(request.input_token_bound <= 4096 - 128 for request in provider.requests)
         for request in provider.requests:
@@ -185,7 +186,11 @@ async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config,
         assert "EARLY-LESSON" in final and "LATE-LESSON" in final
         assert all(eid in final for eid in ids)
         chunks = [r for r in provider.requests if '"chunk_index"' in r.messages[-1]["content"]]
-        assert chunks
+        if mode == "manual":
+            assert chunks
+        else:
+            assert not chunks and len(provider.requests) == 2
+            assert runtime.store.events(root.id, kind="refinement_evidence_bounded")
         assert all(
             '"total_chunks"' in r.messages[-1]["content"]
             and '"timestamp"' in r.messages[-1]["content"]
@@ -213,7 +218,7 @@ async def test_interrupted_refinement_chunks_keep_provenance_and_usage(tmp_path,
     try:
         runtime.store.event(root.id, "python_result", {"stdout": "evidence " * 40000})
         with pytest.raises(asyncio.CancelledError):
-            await runtime._refinement_pass(root.id, "completion")
+            await runtime._refinement_pass(root.id, "manual")
         assert len(provider.requests) == 3
         assert runtime.store.usage(root.id, tree=True).model_calls == 3
         assert runtime.store.events(root.id, kind="refinement_evidence_chunk")

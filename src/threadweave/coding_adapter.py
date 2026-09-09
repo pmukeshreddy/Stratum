@@ -455,7 +455,7 @@ await edit(path,old_str,new_str) edits a unique match. Raw Python remains availa
 """
     text += "Coding decision support: reuse observed failures and exact source evidence. State a hypothesis when debugging; prefer focused definitions/callers and related failing tests over repeatedly reading full files. Use repo.help()/tests.help() to discover APIs. Make small evidence-supported changes; escalate tests when warranted. Delegation must have a distinct purpose and a bounded evidence request. Repeated unchanged reads/searches/tests are a signal to revise the hypothesis, not proof of progress. These are cost-aware guidelines, not a mandatory workflow; the independent final verifier still decides correctness.\n"
     if config.features.subagents:
-        text += "Coding child profiles: research/review are read-only; candidate/test/performance use isolated worktrees. agents.candidate(handle, accept=False) inspects; accept=True explicitly applies.\n"
+        text += "Coding child profiles: use purpose='research' or 'review' for independent investigation; these are read-only and finish on findings without waiting for the parent repository's full test suite to pass. The default shared profile inherits the parent's completion gates and suits implementation work. candidate/test/performance use isolated worktrees. agents.candidate(handle, accept=False) inspects; accept=True explicitly applies.\n"
     if config.features.experiments:
         text += "experiment.help() lists durable experiment/measurement procedures.\n"
     return text

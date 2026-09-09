@@ -1,0 +1,13 @@
+# Final unit/integration regression suite
+.venv/bin/pytest -q
+# Focused tests after completion-receipt and cache scheduling fixes
+.venv/bin/pytest -q tests/test_runtime_upgrade.py tests/test_architecture.py tests/test_context_budget_regressions.py
+# Static and package checks
+.venv/bin/ruff check src tests
+git diff --check
+uv build --out-dir /tmp/buffalo-runtime-package
+# Final unforced real-model evaluation; new output directory required on reruns
+PYTHONPATH=src .venv/bin/python -m threadweave.evals.runtime_upgrade --output /tmp/buffalo-behavior-delivery --model gpt-6-astra
+# Final resolution regression and unforced recheck of the affected recursive task
+.venv/bin/pytest -q tests/test_runtime_upgrade.py::test_compacted_work_resolution_is_authoritative tests/test_context_budget_regressions.py
+PYTHONPATH=src .venv/bin/python -m threadweave.evals.runtime_upgrade --output /tmp/buffalo-behavior-resolution --model gpt-6-astra --case independent_components

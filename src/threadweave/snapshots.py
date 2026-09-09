@@ -52,7 +52,10 @@ class SafeProcedurePickler(cloudpickle.CloudPickler):
 
 
 class SnapshotBlobs:
-    def __init__(self, directory):
+    def __init__(self, directory, policy=None):
+        from .models import KernelStatePolicy
+
+        self.policy = policy or KernelStatePolicy()
         self.directory = directory / "values"
         self.directory.mkdir(exist_ok=True, mode=0o700)
         self.cache = {}
@@ -73,7 +76,7 @@ class SnapshotBlobs:
             and type(value).__name__ == "ndarray"
             and not value.dtype.hasobject
             and value.flags.c_contiguous
-            and value.nbytes <= 16 * 1024 * 1024
+            and value.nbytes <= self.policy.mutable_cache_bytes
         )
         saved_array = self.array_shadows.get(name)
         if array and saved_array:
@@ -116,17 +119,24 @@ class SnapshotBlobs:
                 not isinstance(value, (types.FunctionType, type))
                 and type(value).__module__ != "__session__"
                 and (type(value).__module__, type(value).__name__)
-                not in {("array", "array"), ("numpy", "ndarray")}
+                not in {
+                    ("array", "array"),
+                    ("numpy", "ndarray"),
+                    ("pandas.core.frame", "DataFrame"),
+                    ("pandas.core.series", "Series"),
+                }
             ):
                 raise
             buffer = io.BytesIO()
             SafeProcedurePickler(buffer, protocol=5).dump(value)
             data, codec = buffer.getvalue(), "cloudpickle"
             encoded = None
-        if len(data) > 16 * 1024 * 1024:
-            raise ValueError("Variable exceeds 16 MiB snapshot bound; use artifacts/recipes")
+        if len(data) > self.policy.artifact_bytes:
+            raise ValueError(
+                "Variable exceeds artifact size budget; register a reconstruction recipe"
+            )
         self.stats["serialized_bytes"] += len(data)
-        if len(data) > 65536 or codec == "cloudpickle":
+        if len(data) > self.policy.inline_bytes or codec == "cloudpickle":
             digest = hashlib.sha256(data).hexdigest()
             path = self.directory / digest
             if not path.exists():
@@ -135,7 +145,7 @@ class SnapshotBlobs:
             encoded = ["blob", {"sha256": digest, "codec": codec, "bytes": len(data)}]
         if immutable:
             self.cache[name] = (value, encoded, len(data))
-        if flat:
+        if flat and len(data) <= self.policy.mutable_cache_bytes:
             # Exact scalar-container equality, not mutable identity or a hash.
             # Nested/opaque mutations deliberately take the full codec path.
             self.shadows[name] = (value.copy(), encoded, len(data))
@@ -147,6 +157,17 @@ class SnapshotBlobs:
             self.array_shadows.pop(name, None)
         return encoded, len(data)
 
+    def offload(self, record):
+        if record[0] == "blob":
+            return record
+        data = json.dumps(record, allow_nan=False).encode()
+        digest = hashlib.sha256(data).hexdigest()
+        path = self.directory / digest
+        if not path.exists():
+            atomic_write(path, data)
+            self.stats["written_bytes"] += len(data)
+        return ["blob", {"sha256": digest, "codec": "json", "bytes": len(data)}]
+
     def decode(self, record, unpack):
         if record[0] != "blob":
             return unpack(record)
@@ -155,7 +176,7 @@ class SnapshotBlobs:
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("Invalid snapshot blob identity")
         data = (self.directory / digest).read_bytes()
-        if len(data) > 16 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+        if len(data) > self.policy.artifact_bytes or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError("Snapshot blob checksum/size mismatch")
         if metadata["codec"] == "json":
             return unpack(json.loads(data))

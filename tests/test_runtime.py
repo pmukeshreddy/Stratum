@@ -252,7 +252,18 @@ async def test_verifier_failure_is_not_a_task_failure_and_completion_gate(
     assert runtime.store.usage(root.id).retries == 1
     failure = runtime.store.events(root.id, kind="failure")[0]
     assert failure["payload"]["category"] == "verifier"
-    assert "x" * 5000 in str(provider.requests[-1].messages)
+    assert "x" * 5000 not in str(provider.requests[-1].messages)
+    assert "full_verifier_artifact" in str(provider.requests[-1].messages)
+    receipts = runtime.store.events(root.id, kind="verifier_result")
+    exposed = receipts[0]["payload"]["result"]
+    detail = (
+        runtime.artifacts.load(root.id, exposed["artifact_id"])
+        if "artifact_id" in exposed
+        else json.loads(exposed["preview"])
+    )
+    assert (
+        runtime.artifacts.load(root.id, detail["full_verifier_artifact"])["details"] == "x" * 100000
+    )
     assert "x" * 100000 not in str(provider.requests[-1].messages)
 
 

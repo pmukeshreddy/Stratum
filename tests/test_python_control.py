@@ -29,7 +29,8 @@ def test_default_schema_has_one_control_plane():
     assert schema == json.loads(snapshot.read_text())
     assert [s["function"]["name"] for s in schema] == ["ipython"]
     assert schema[0]["function"]["parameters"]["required"] == ["code"]
-    assert not RunConfig().task.wait_for_children
+    assert RunConfig().task.wait_for_children
+    assert not RunConfig(task={"wait_for_children": False}).task.wait_for_children
     assert RunConfig(task={"wait_for_children": True}).task.wait_for_children
     direct_config = RunConfig(control_plane="direct")
     direct_config.permissions.append("process")

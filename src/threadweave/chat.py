@@ -181,7 +181,7 @@ class Chat:
                 return False
             self.session = await self.call(
                 "create",
-                instruction="Assist the user in this persistent session. Follow their latest messages. Choose tools or delegation only when useful; preserve unrelated workspace changes.",
+                instruction="Assist the user in this persistent session. Follow their latest messages. Use persistent IPython for inspectable, stateful or verifiable work and delegate independent investigations; preserve unrelated workspace changes.",
                 workspace=str(self.workspace),
                 config=self.config.model_dump(mode="json"),
                 name="root",

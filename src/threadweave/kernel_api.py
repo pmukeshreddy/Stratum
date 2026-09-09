@@ -184,6 +184,14 @@ class Recursive:
         )
         return AgentHandle(**result)
 
+    async def followup(self, target, instruction):
+        """Reuse a child's kernel and context, including after it completed."""
+        return await self.host.acall(
+            "rlm.followup",
+            target=target.session_id if isinstance(target, AgentHandle) else target,
+            instruction=instruction,
+        )
+
     async def list_subagents(self):
         return [Record(s) for s in await self.host.acall("rlm.list_subagents")]
 
@@ -442,6 +450,15 @@ class ContextView(Record):
     def help(self):
         return 'context.search("query") retrieves history; context["task"] holds the complete objective.'
 
+    def track(self, text, kind="requirement", id=None):
+        return self.host.call("context.track", text=text, kind=kind, id=id)
+
+    def resolve(self, id, evidence_events):
+        return self.host.call("context.resolve", id=id, evidence_events=evidence_events)
+
+    def state(self):
+        return self.host.call("context.state")
+
     def search(self, query, limit=5):
         return self.host.bridge.call("history_search", query=query, limit=limit)
 
@@ -574,10 +591,13 @@ def bootstrap(bridge, values, metadata):
     class Verification:
         @staticmethod
         def help():
-            return "await verify.run(): run the independent configured verifier; does not override its gates."
+            return "await verify.run(level=2): targeted checks; level=1 diagnoses, level=3 runs the full completion gate. verify.latest() returns structured evidence."
 
-        async def run(self):
-            return await host.acall("verification.run")
+        async def run(self, level=2):
+            return await host.acall("verification.run", level=level)
+
+        def latest(self):
+            return host.call("verification.latest")
 
         def __repr__(self):
             return self.help()
@@ -585,7 +605,9 @@ def bootstrap(bridge, values, metadata):
     values["verify"] = Verification()
 
     async def compact():
-        return await host.acall("context.compact")
+        result = await host.acall("context.compact")
+        values["repl_state"].force = "l1_compaction"
+        return result
 
     async def refine():
         return await host.acall("harness.refine")

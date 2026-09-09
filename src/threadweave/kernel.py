@@ -12,12 +12,19 @@ from .models import HarnessError
 SOURCE_ROOT = str(Path(__file__).resolve().parent.parent)
 
 
-def fork_checkpoint(source, destination, old_workspace, new_workspace):
-    """Rebind explicit Path codecs; do not replay source-bound reconstruction recipes."""
+def fork_checkpoint(source, destination, old_workspace, new_workspace, *, owner=None):
+    """Copy per-variable artifacts and rebind explicit paths into a new owner."""
+    import hashlib
+    import shutil
+
     from .artifacts import atomic_write
 
     checkpoint = json.loads(source.read_text())
     old, new = Path(old_workspace).resolve(), Path(new_workspace).resolve()
+    isolated = old != new
+    missing = checkpoint.setdefault("missing", {})
+    target_blobs = destination.parent / "values"
+    target_blobs.mkdir(parents=True, exist_ok=True)
 
     def rebind(value):
         if isinstance(value, list):
@@ -30,27 +37,52 @@ def fork_checkpoint(source, destination, old_workspace, new_workspace):
             return {key: rebind(item) for key, item in value.items()}
         return value
 
-    checkpoint["values"] = rebind(checkpoint["values"])
-    # Blob values may capture source-workspace paths. Do not silently rebind opaque
-    # procedure closures into a different environment.
-    for name, record in list(checkpoint["values"].items()):
-        if record[0] == "blob":
-            if record[1]["codec"] == "cloudpickle":
-                checkpoint.setdefault("missing", {})[name] = (
-                    "Procedure blob requires explicit reconstruction in isolated fork"
+    def copy_record(record):
+        if record[0] != "blob":
+            return rebind(record)
+        meta = record[1]
+        blob = source.parent / "values" / meta["sha256"]
+        data = blob.read_bytes()
+        if hashlib.sha256(data).hexdigest() != meta["sha256"]:
+            raise ValueError("Snapshot blob checksum mismatch")
+        if isolated and meta["codec"] == "cloudpickle":
+            raise ValueError("Procedure blob requires explicit reconstruction in isolated fork")
+        if isolated and meta["codec"] == "json":
+            data = json.dumps(rebind(json.loads(data))).encode()
+            digest = hashlib.sha256(data).hexdigest()
+            atomic_write(target_blobs / digest, data)
+            return ["blob", {**meta, "sha256": digest, "bytes": len(data)}]
+        shutil.copy2(blob, target_blobs / meta["sha256"])
+        return record
+
+    checkpoint["owner"] = owner or destination.parent.name
+    manifest = checkpoint.get("manifest", {})
+    for name, record in checkpoint.get("values", {}).items():
+        manifest.setdefault(name, {"action": "keep_live", "record": record})
+    values = {}
+    for name, row in manifest.items():
+        row["owner"] = checkpoint["owner"]
+        try:
+            if row.get("record") is not None:
+                row["record"] = copy_record(row["record"])
+                if row["action"] in {"keep_live", "snapshot_inline"}:
+                    values[name] = row["record"]
+            if isolated and row.get("recipe"):
+                raise ValueError(
+                    "Reconstruction recipe not inherited into an isolated fork; review workspace bindings"
                 )
-                del checkpoint["values"][name]
-            else:
-                blob = source.parent / "values" / record[1]["sha256"]
-                data = json.loads(blob.read_bytes())
-                checkpoint["values"][name] = rebind(data)
-    missing = checkpoint.setdefault("missing", {})
-    for name in checkpoint.get("recipes", {}):
-        missing[name] = (
-            "Reconstruction recipe not inherited into an isolated fork; review workspace bindings before registering it again"
-        )
-    checkpoint["recipes"] = {}
-    checkpoint["receipt"] = None
+        except Exception as exc:
+            missing[name] = str(exc)
+            row.update(action="skip", reason=str(exc))
+            row.pop("record", None)
+            row.pop("recipe", None)
+    if isolated:
+        for name in checkpoint.get("recipes", {}):
+            missing[name] = (
+                "Reconstruction recipe not inherited into an isolated fork; review workspace bindings"
+            )
+        checkpoint["recipes"] = {}
+    checkpoint.update(manifest=manifest, values=values, receipt=None)
     atomic_write(destination, json.dumps(checkpoint).encode())
 
 
@@ -211,6 +243,24 @@ class Kernel:
             finally:
                 self.results.pop(execution_id, None)
                 self.active_execution = None
+
+    async def checkpoint_state(self, reason="l1_compaction"):
+        """Synthetic protocol operation; never replay a user cell or charge execution."""
+        import uuid
+
+        async with self.lock:
+            await self.start()
+            identifier = uuid.uuid4().hex
+            pending = asyncio.get_running_loop().create_future()
+            self.results[identifier] = pending
+            try:
+                await self._send({"type": "checkpoint", "id": identifier, "reason": reason})
+                async with asyncio.timeout(
+                    self.bootstrap.get("kernel_state", {}).get("snapshot_seconds", 5) + 5
+                ):
+                    return await pending
+            finally:
+                self.results.pop(identifier, None)
 
     async def interrupt(self, execution_id, *, grace=1.0):
         async with self.interrupt_lock:

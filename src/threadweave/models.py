@@ -87,6 +87,7 @@ class ProviderConfig(Record):
 
 
 class ContextPolicy(Record):
+    semantic_first: bool = True
     max_tokens: int = Field(default=96000, ge=2048)
     compact_at: float = Field(default=0.8, gt=0.1, lt=1)
     recent_blocks: int = Field(default=6, ge=1)
@@ -109,8 +110,10 @@ class RefinementPolicy(Record):
     enabled: bool = True
     allow_global_writes: bool = False
     selected_entries: list[str] = Field(default_factory=list)
-    automatic: bool = False
+    automatic: bool = True
+    evaluation_isolation: bool = False
     every_turns: int = Field(default=10, ge=1)
+    progress_every_turns: int = Field(default=3, ge=1)
     on_completion: bool = True
     verifier_failures: int = Field(default=3, ge=1)
     max_proposals: int = Field(default=3, ge=1, le=10)
@@ -120,6 +123,33 @@ class RefinementPolicy(Record):
     reasoning: Literal["off", "inherit"] = "off"
     completion_followup: bool = False
     root_only: bool = True
+
+
+class KernelStatePolicy(Record):
+    memory_bytes: int = Field(default=128 * 1024 * 1024, ge=1024)
+    variable_bytes: int = Field(default=16 * 1024 * 1024, ge=256)
+    mutable_cache_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
+    inline_bytes: int = Field(default=64 * 1024, ge=128)
+    snapshot_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    artifact_bytes: int = Field(default=512 * 1024 * 1024, ge=1024)
+    stale_cells: int = Field(default=20, ge=1)
+    checkpoint_cells: int = Field(default=5, ge=1)
+    snapshot_seconds: float = Field(default=5, gt=0)
+    variable_seconds: float = Field(default=1, gt=0)
+    size_scan_nodes: int = Field(default=10000, ge=100)
+
+
+class VerificationPolicy(Record):
+    continuous: bool = True
+    completion_wait_seconds: float = Field(default=30, gt=0)
+    generated_path_parts: list[str] = Field(
+        default_factory=lambda: ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"]
+    )
+    targeted_commands: list[list[str]] = Field(default_factory=list)
+    targeted_every_turns: int = Field(default=3, ge=1)
+    max_target_files: int = Field(default=8, ge=1)
+    failure_items: int = Field(default=12, ge=1)
+    diagnostic_chars: int = Field(default=1200, ge=128)
 
 
 class Features(Record):
@@ -191,7 +221,7 @@ class TaskConfig(Record):
     specification: dict[str, Any] = Field(default_factory=dict)
     verifier: str = Field(default="none", min_length=1)
     verifier_options: dict[str, Any] = Field(default_factory=dict)
-    verify_each_turn: bool = True
+    verify_each_turn: bool = False
     require_verifier: bool = False
     wait_for_children: bool = True
     success_metrics: dict[str, Any] = Field(default_factory=dict)
@@ -251,6 +281,8 @@ class RunConfig(Record):
     context: ContextPolicy = Field(default_factory=ContextPolicy)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
     refinement: RefinementPolicy = Field(default_factory=RefinementPolicy)
+    kernel_state: KernelStatePolicy = Field(default_factory=KernelStatePolicy)
+    verification: VerificationPolicy = Field(default_factory=VerificationPolicy)
     limits: ResourceLimits = Field(default_factory=ResourceLimits)
     task: TaskConfig = Field(default_factory=TaskConfig)
     permissions: list[str] = Field(
@@ -271,8 +303,6 @@ class RunConfig(Record):
 
     @model_validator(mode="after")
     def coherent(self):
-        if self.control_plane == "python" and "wait_for_children" not in self.task.model_fields_set:
-            self.task.wait_for_children = False
         if (
             max(p.max_output_tokens for p in [self.provider, *self.models.values()])
             >= self.context.max_tokens

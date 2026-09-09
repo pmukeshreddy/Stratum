@@ -532,7 +532,11 @@ class Store(RequestHistory, TrajectoryHistory):
 
     def state(self, sid: str, entry_id: str, version: int | None = None) -> dict:
         entry = self.db.execute("SELECT * FROM state_entries WHERE id=?", (entry_id,)).fetchone()
-        if not entry or entry["owner_id"] not in (None, sid):
+        if (
+            not entry
+            or entry["owner_id"] not in (None, sid)
+            or (entry["owner_id"] is None and self.config(sid).refinement.evaluation_isolation)
+        ):
             raise KeyError(f"State entry not accessible: {entry_id}")
         version = version or entry["current_version"]
         row = self.db.execute(
@@ -544,6 +548,8 @@ class Store(RequestHistory, TrajectoryHistory):
 
     def states(self, sid: str, *, include_deleted=False) -> list[dict]:
         clause = "" if include_deleted else " AND deleted=0"
+        if self.config(sid).refinement.evaluation_isolation:
+            clause += " AND owner_id IS NOT NULL"
         rows = self.db.execute(
             "SELECT id FROM state_entries WHERE (owner_id IS NULL OR owner_id=?)" + clause, (sid,)
         ).fetchall()
@@ -734,7 +740,9 @@ class Store(RequestHistory, TrajectoryHistory):
         current = self.state(sid, eid) if edit.entry_id else None
         owner = current["owner_id"] if current else (sid if edit.scope == "session" else None)
         config = self.config(sid)
-        if owner is None and not config.refinement.allow_global_writes:
+        if owner is None and (
+            not config.refinement.allow_global_writes or config.refinement.evaluation_isolation
+        ):
             raise PermissionError("Global state writes are disabled")
         if current and edit.expected_version and edit.expected_version != current["version"]:
             raise ValueError("State changed since the expected version; retrieve and retry")
@@ -787,6 +795,12 @@ class Store(RequestHistory, TrajectoryHistory):
             )
         self.db.execute("INSERT INTO state_versions VALUES(?,?,?)", (eid, version, encode(body)))
         self.event(sid, "refinement", {"entry_id": eid, "kind": kind, **body}, parent=source)
+        self.event(
+            sid,
+            "refinement_activated",
+            {"entry_id": eid, "version": version, "kind": kind, "deleted": deleted},
+            parent=source,
+        )
         if edit.select:
             selected = list(dict.fromkeys([*self.session(sid).selected_state, eid]))
             self.update(sid, selected_state=selected)

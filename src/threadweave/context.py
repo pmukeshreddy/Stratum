@@ -7,8 +7,9 @@ from .storage import Store, encode
 from .tokenization import estimate, method
 
 # Foundational instructions are code-owned. Adaptive entries never replace this message.
-FOUNDATION = """You operate a persistent agent session. Decide your own strategy and next actions.
-Use the provided tools to compute, inspect evidence, delegate, communicate, and finish.
+FOUNDATION = """You operate a persistent agent session. Your normal control environment is persistent IPython.
+Work through Python to inspect, search, transform, test, persist, verify and delegate.
+Use observations to decide your next action and to support your final answer.
 When enabled, python executes in your own Python worker with top-level await. Variables are retained
 only when the session's persistent_repl feature is enabled; inspect the capability metadata.
 Python helpers: await rlm(instruction, name=None), tools.call(name, **arguments), await tools.acall(name, **arguments),
@@ -26,9 +27,9 @@ Tool permissions are capabilities. Python/process access executes trusted code w
 authority; it is not an isolation sandbox. Respect the workspace and the user's instructions.
 L1 is selected active context. L2 is your persistent REPL and concurrent child handles: values do
 not become model context unless explicitly printed, returned, summarized or retrieved. L3 is the
-disk-backed history, artifacts, messages and versioned reusable state. Compaction affects only L1.
-The Environment exposes capabilities, not a required sequence of actions. Ordinary conversation
-needs no domain-specific preparation. Never invent observations or measurements.
+disk-backed history, artifacts, snapshots, messages and versioned reusable state. L1 compaction
+checkpoints L2; useful large values become recoverable artifact handles. Ordinary conversation
+can end directly when there is no inspectable or mechanically checkable work. Never invent observations or measurements.
 """
 
 
@@ -39,12 +40,20 @@ def token_bound(value, model=None) -> int:
 
 def python_instructions(config, *, child=False, specifications=()):
     """Expose only usable capabilities; compact help remains in the live namespace."""
-    text = """You are Buffalo, a code-using agent that solves tasks by reasoning, executing code when useful,
-observing results, and iterating.
+    text = """You are Buffalo, a code-using agent that solves tasks through persistent IPython: inspect,
+decompose, execute, observe, validate and iterate.
 Your persistent IPython environment is your primary, long-lived working environment for computation,
 tool use, task state and recursive orchestration. Work through the sole tool ipython(code).
-Use code when it adds value: decompose problems, inspect task data, observe results and iterate.
-Direct reasoning and a direct answer are valid when computation or delegation would add no value.
+IPython is the default working and control environment, not an optional calculator.
+Enter it whenever work can be inspected, transformed, tested, searched, delegated, persisted or
+verified. This includes coding and repository tasks, conflicting instructions, long context,
+multi-step reasoning, stateful work, numerical work, structured extraction, search/filtering,
+uncertain intermediate conclusions, decomposition and mechanically checkable answers.
+For conflicting instructions, retain and compare the role-bearing contract in Python; instruction
+priority still governs. For reasoning tasks, externalize hypotheses and check intermediate claims.
+Choose substantive cells that advance the task; never execute ceremonial code merely to use a tool.
+A direct final answer is the exception, appropriate for a simple conversational reply with no
+inspectable work. Finish substantive tasks from observed evidence and retained working state.
 Retain intermediate variables, functions, candidate artifacts and child handles across turns.
 The original user instruction is available as task.instructions. task.messages contains the complete
 original message contract in order; respect its system, developer and user roles. task.assignment
@@ -70,8 +79,11 @@ await bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(co
 await returns a background handle with poll(), tail(), kill(). Use the workspace environment.
 Never claim execution results you did not observe. A normal final text reply requests completion;
 the independently configured verifier remains authoritative and may return failure evidence.
-L1 is selected context, L2 is Python state, L3 is durable history/artifacts. Compaction does not
-delete Python values. On recovery inspect warnings; only checkpointed values/recipes restore.
+L1 is selected context, L2 is live Python state, L3 is durable history/artifacts/snapshots.
+Compaction preserves the kernel while offloading large values and retiring stale values with
+recovery metadata. Inspect repl_state.describe(); repl_state.rehydrate(name) restores a value.
+Use repl_state.retain(name) for important live state and remember_recipe(name, code, dependencies=[...])
+for reconstructible state. Offloaded handles have load(); assign the returned value before using it. On recovery inspect warnings; only checkpointed values/recipes restore.
 Interrupted actions may have partial effects; inspect them before retrying. Python and shell run
 as trusted local code, not a general sandbox. Stay within the supplied workspace and user scope.
 Respect all resource limits. Do not fetch hidden/reference solutions. Never modify foundational
@@ -95,7 +107,9 @@ Put the work description in the prompt. Optional purpose selects a registered ch
 profile, not a prose description; omit it for the default shared profile. Inspect agents.help() for profiles.
 Children inherit the effective model, reasoning, capabilities and limits; they can recursively delegate
 within the shared task budget and depth limit. Each child has its own persistent Python namespace.
-Keep handles in variables. Receive results through messages or inspect committed child trajectories:
+Completion normally waits for admitted children so their evidence can be incorporated.
+Cancel children whose work is no longer relevant. Keep handles in variables. await agents.followup(handle, assignment) reuses a child and its kernel
+after completion. await agents.delete_subagent(handle) cancels it. Receive results through messages or inspect committed child trajectories:
 await agent_message.send('findings', receiver_role='parent') in a child;
 await agent_message.send('follow-up', receiver_role='child', receiver_name='worker') in the parent.
 await agent_message.receive(); await agent_observe.recent_messages(handle.session_id).
@@ -107,7 +121,10 @@ Choose complementary, substantive child assignments; avoid duplicating work with
         text += """\nIndependent work:
 For a candidate solution with distinct specification risks, a child can investigate edge cases while
 you develop and test the candidate. Evaluate its evidence before incorporating it.
-For separable investigations, start independent children without waiting for each to finish:
+Delegate independent investigation, repository exploration, long-context analysis, isolated
+implementation experiments, alternative hypotheses, review, testing, performance work or research
+branches when their evidence can advance your task. For separable investigations, start independent
+children without waiting for each to finish:
 left = await rlm('Investigate the first component against its specification.', name='left')
 right = await rlm('Investigate the second component against its specification.', name='right')
 Then continue complementary local work. Use these patterns only when they add useful evidence;
@@ -136,17 +153,24 @@ skills.list() discovers procedures; skills.load(name) loads their module or stat
 await skills.run(name, **inputs) executes a validated skill. Read the matching SKILL.md or
 entry instructions before executing it. tools.catalog() returns tool schemas
 into Python, not active model context. mcp exposes configured external servers.
-The runtime automatically reviews meaningful progress, failures, child findings, compaction and
-completion at bounded safe checkpoints. The reviewer may decline; no edit is required.
+Continual harness improvement is part of normal execution. Capture reusable repository discoveries,
+successful fixes, effective searches/commands, environment quirks, debugging strategies and child
+specializations as memory, prompt_note, executable skill or subagent_spec. The runtime filters
+duplicate/trivial evidence before reviewing successful progress, failures, child findings and
+compaction at safe checkpoints; validated versions activate for later turns. The reviewer may decline; no edit is required.
 You do not need to call refine() for automatic review. await refine() optionally requests manual
 evidence-based planning at a safe boundary. Applied edits are retrieved into later turns of this task.
 Validate useful lessons on subsequent work. await compact() compacts active context while retaining
-Python state, artifacts and durable history. Retrieve omitted details explicitly as needed.
+recoverable Python state, artifacts and durable history. Retrieve omitted details explicitly as needed.
 Use meaningful mechanisms within the task's resource budget; never manufacture activity.
 """
     text += """\nAction patterns:
-If additional execution is unlikely to provide useful evidence, solve and answer directly.
-For structured inspection, computation or testing, use IPython and retain useful intermediate values.
+Begin substantive work in IPython by inspecting the actual inputs and recording a useful next step.
+Keep hypotheses, requirements, intermediate results and evidence in named variables.
+context.track(text, kind="requirement", id=None) durably records unresolved work; kinds also include
+hypothesis, blocker, decision and failed_approach. context.resolve(id, evidence_events=[...])
+requires observed supporting events. Omitted or old unresolved work remains active through compaction. Use focused
+checks during development; reserve full configured verification for completion or an explicit request.
 After a failed check or a new finding, inspect the actual evidence and choose the next useful action:
 another local check, a correction, more context, or independent investigation. Failure alone does not
 require delegation. Your next action follows from the task and observed trajectory.
@@ -408,6 +432,57 @@ class Context:
             messages.append(
                 {"role": "user", "content": "Selected supplemental state:\n" + supplemental}
             )
+        from .semantic_state import completion_evidence, work_items
+
+        completion_state = completion_evidence(self.store, sid)
+        if completion_state:
+            # Expose status and source handles, not the potentially huge receipt.
+            verification = completion_state["last_full_verification"]
+            if verification:
+                verification.pop("receipt", None)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Live completion evidence (survives compaction): "
+                    + encode(completion_state)
+                    + "\nThis is the last observed result, not a claim about unobserved changes. "
+                    "When requirements are satisfied and relevant children have finished, synthesize "
+                    "your final answer. Do not repeatedly reread unchanged files or rerun successful "
+                    "checks without a new change, unresolved requirement or concrete uncertainty. "
+                    "The runtime still performs the configured completion gate on your final answer.",
+                }
+            )
+
+        active_work = [i for i in work_items(self.store, sid) if i["status"] == "open"]
+        if active_work:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Live unresolved work (context.track/resolve): "
+                    + encode(active_work),
+                }
+            )
+        snapshots = self.store.events(sid, kind="kernel_snapshot", limit=1)
+        if snapshots:
+            snapshot = snapshots[-1]["payload"]
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "L2 state: "
+                    + encode(
+                        {
+                            k: snapshot.get(k)
+                            for k in (
+                                "manifest_artifact",
+                                "offloaded",
+                                "pruned",
+                                "reconstructible",
+                                "missing",
+                            )
+                        }
+                    ),
+                }
+            )
         if session.summary:
             messages.append(
                 {
@@ -476,7 +551,10 @@ class Context:
             count = count or max(1, len(session.context) - policy.recent_blocks)
             removed = session.context[:count]
             from .artifacts import Artifacts
+            from .semantic_state import capture, compact_reference, protected_summary
 
+            live_tree = capture(self, sid)
+            tree_artifact = Artifacts(self.store).put(sid, live_tree)
             archive = Artifacts(self.store).put(
                 sid,
                 {
@@ -484,6 +562,7 @@ class Context:
                     "blocks": removed,
                     "selected_state": session.selected_state,
                     "proposed_summary": summary,
+                    "semantic_tree_artifact": tree_artifact,
                 },
             )
             from .context_budget import (
@@ -502,10 +581,28 @@ class Context:
                 parsed = extractive_summary(session.summary, removed)
                 if summary:
                     parsed["established_facts"].append(summary)
+            resolutions = [
+                {
+                    "id": "child-" + b["id"],
+                    "reason": "Child completed; conclusion and provenance retained",
+                    "source_events": b.get("completion_events", []),
+                }
+                for b in live_tree["branches"]
+                if b["status"] == "completed" and b.get("completion_events")
+            ]
+            parsed.setdefault("resolved_items", []).extend(resolutions)
             parsed = merge_summary(
                 session.summary,
                 parsed,
-                source_events=[b["event_id"] for b in session.context],
+                source_events=[b["event_id"] for b in session.context]
+                + [e for r in resolutions for e in r["source_events"]],
+            )
+            for field, items in protected_summary(live_tree).items():
+                parsed.setdefault(field, []).extend(
+                    i for i in items if i not in parsed.get(field, [])
+                )
+            parsed.setdefault("important_references", []).append(
+                compact_reference(live_tree, tree_artifact)
             )
             summary = summary_budget(
                 parsed,
@@ -520,6 +617,10 @@ class Context:
                 {
                     "source_events": source_events,
                     "archive_artifact": archive,
+                    "semantic_tree_artifact": tree_artifact,
+                    "pending_children": [
+                        b["id"] for b in live_tree["branches"] if b["status"] == "active"
+                    ],
                     "summary": summary,
                     "method": "model_structured" if provenance else "bounded_extractive",
                     "model_response_event": provenance,

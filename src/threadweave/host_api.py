@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pydantic import Field
 
-from .models import Record, StateEdit, now
+from .models import Record, StateEdit, new_id, now
 from .storage import encode
 
 
@@ -38,8 +38,8 @@ def resolve_capability(request, registry=None):
     elif (
         op == "catalog"
         or op.startswith("goal.")
-        or op == "context.compact"
-        or op == "verification.run"
+        or op in {"context.compact", "context.track", "context.resolve", "context.state"}
+        or op in {"verification.run", "verification.latest"}
     ):
         permissions = ()
     else:
@@ -218,6 +218,15 @@ async def dispatch(context, request):
                 for s in runtime.related(sid)
                 if s["parent_id"] == sid
             ]
+        if op == "rlm.followup":
+            child = store.session(p["target"])
+            if child.parent_id != sid:
+                raise PermissionError("Follow-up target must be a direct child")
+            return {
+                "message_id": runtime.message(sid, child.id, p["instruction"]),
+                "session_id": child.id,
+                "kernel_id": child.kernel_id,
+            }
         if op == "rlm.delete_subagent":
             child = store.session(p["target"])
             if child.parent_id != sid:
@@ -442,9 +451,79 @@ async def dispatch(context, request):
         return await runtime.mcp.call(context, op.split(".")[1], p)
     if op.startswith("skills."):
         return skill_operation(context, op.split(".")[1], p)
+    if op in {"context.track", "context.resolve", "context.state"}:
+        from .semantic_state import capture, work_items
+
+        if op == "context.state":
+            return capture(runtime.context, sid)
+        identifier = p.get("id") or new_id()
+        if op == "context.resolve":
+            from .context_budget import pending_ledger
+
+            item = next((i for i in work_items(store, sid) if i["id"] == identifier), None)
+            if item is None:
+                pending = next(
+                    (
+                        i
+                        for i in pending_ledger(store.session(sid).summary)
+                        if i["id"] == identifier
+                    ),
+                    None,
+                )
+                if pending is None:
+                    raise KeyError(f"Unknown pending work item: {identifier}")
+                item = {
+                    "id": identifier,
+                    "kind": {
+                        "active_hypotheses": "hypothesis",
+                        "blockers": "blocker",
+                    }.get(pending["field"], "requirement"),
+                    "text": encode(pending["content"]),
+                }
+            sources = p.get("evidence_events", [])
+            if not sources or any(
+                store.event_by_id(e)["root_id"] != context.session.root_id for e in sources
+            ):
+                raise ValueError("Resolution requires supporting events from this task tree")
+            item.update(status="resolved", evidence_events=sources)
+        else:
+            kind = p.get("kind", "requirement")
+            if kind not in {"requirement", "hypothesis", "blocker", "decision", "failed_approach"}:
+                raise ValueError("Unsupported semantic work kind")
+            if not isinstance(p.get("text"), str) or not p["text"].strip():
+                raise ValueError("Work item needs nonempty text")
+            item = {"id": identifier, "kind": kind, "text": p["text"], "status": "open"}
+        event = store.event(sid, "semantic_state_updated", item, parent=context.source_event)
+        if op == "context.resolve" and store.session(sid).summary:
+            from .context_budget import merge_summary
+
+            summary = merge_summary(
+                store.session(sid).summary,
+                {
+                    "resolved_items": [
+                        {
+                            "id": identifier,
+                            "reason": "Explicit resolution backed by task evidence",
+                            "source_events": sources,
+                        }
+                    ]
+                },
+                source_events=sources,
+            )
+            store.update(sid, summary=encode(summary))
+        return {**item, "source_event": event}
     if op == "context.compact":
         return {"event_id": runtime.context.compact(sid)}
+    if op == "verification.latest":
+        return store.events(sid, kind="verification_evidence", limit=5) + store.events(
+            sid, kind="verifier_result", limit=1
+        )
     if op == "verification.run":
+        level = p.get("level", 2)
+        if level not in (1, 2, 3):
+            raise ValueError("Verification level must be 1, 2 or 3")
+        if level != 3:
+            return await runtime.verification.run(sid, context.source_event, level=level)
         result, error = await runtime._verify(sid, context.source_event)
         return {"result": result.model_dump(mode="json") if result else None, "error": error}
     if op == "goal.get":

@@ -12,7 +12,6 @@ import importlib
 import json
 import logging
 import os
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -103,6 +102,9 @@ class Runtime(MemoryServices):
         self.store.refinement_guard = self.refinement_boundary
         self._transitioning = set()
         self._active_refinements = {}
+        from .verification import VerificationScheduler
+
+        self.verification = VerificationScheduler(self)
 
     def load_extensions(self, config):
         for reference in config.extensions:
@@ -269,6 +271,10 @@ class Runtime(MemoryServices):
             "parent_objective": parent.instruction[:1500],
             "assignment": instruction,
             "verifier_event": evidence[0]["id"] if evidence else None,
+            "verification_evidence": [
+                e["payload"]
+                for e in self.store.events(parent_id, kind="verification_evidence", limit=1)
+            ],
             "result_contract": "Return findings, supporting evidence and remaining uncertainty.",
             **getattr(
                 self.environment.adapters[config.task.adapter], "delegation", lambda *args: {}
@@ -316,6 +322,37 @@ class Runtime(MemoryServices):
         if _defer_workspace:
             self.store.update(session.id, paused=True, runnable=False)
         self.store.event(session.id, "child_context_package", package)
+        # Copy selected task-local refinements into the child's private version store.
+        # This preserves the parent's identity/version as lineage, without granting writes back.
+        from .models import StateEdit
+
+        selected = list(session.selected_state)
+        for entry_id in parent.selected_state:
+            entry = self.store.state(parent.id, entry_id)
+            if entry["owner_id"] is None or entry["deleted"]:
+                continue
+            source = self.store.event(
+                session.id,
+                "child_harness_inherited",
+                {
+                    "parent_entry_id": entry_id,
+                    "parent_version": entry["version"],
+                    "parent_session": parent.id,
+                },
+            )
+            copied = self.store._apply_edit(
+                session.id,
+                StateEdit(
+                    kind=entry["kind"],
+                    title=entry["title"],
+                    content=entry["content"],
+                    source_events=[source],
+                    intended_effect=f"Inherited {entry_id} version {entry['version']}",
+                ),
+                source,
+            )
+            selected.append(copied)
+        self.store.update(session.id, selected_state=list(dict.fromkeys(selected)))
         self._wake.set()
         return self.store.session(session.id)
 
@@ -1150,8 +1187,14 @@ class Runtime(MemoryServices):
                 )
             verification = None
             verification_error = False
+            await self.verification.run(sid, response_event)
+            completion_waiting = bool(
+                completion is not None
+                and config.task.wait_for_children
+                and self._active_descendants(sid)
+            )
             if config.task.verifier != "none" and (
-                config.task.verify_each_turn or completion is not None
+                config.task.verify_each_turn or completion is not None and not completion_waiting
             ):
                 verification, verification_error = await self._verify(sid, response_event)
             explicit_ok = completion is not None and (
@@ -1225,7 +1268,7 @@ class Runtime(MemoryServices):
             with self.store.transaction():
                 children_active = self._active_descendants(sid)
                 if (
-                    (explicit_ok or verifier_ok)
+                    (explicit_ok or verifier_ok or completion_waiting)
                     and config.task.wait_for_children
                     and children_active
                 ):
@@ -1246,7 +1289,7 @@ class Runtime(MemoryServices):
                             }
                         ],
                     )
-                    self.defer(sid, 0.2)
+                    self.defer(sid, config.verification.completion_wait_seconds)
                 elif explicit_ok or verifier_ok:
                     self.apply_pending_refinements(sid)
                     if self.store.session(sid).mode == "interactive":
@@ -1386,6 +1429,8 @@ class Runtime(MemoryServices):
         self.receive(sid, include_followups=False)
         schemas = self.tools.schemas(config)
         messages, size = self.context.assemble(sid, schemas, proactive=compacted is not False)
+        if await self._sync_l2_compaction(sid):
+            messages, size = self.context.assemble(sid, schemas, proactive=False)
         session = self.store.session(sid)
         usage = self.store.usage(session.root_id, tree=True)
         remaining = (
@@ -1437,6 +1482,29 @@ class Runtime(MemoryServices):
                     request.metadata["execution_inputs"],
                     parent=event,
                 )
+                for entry in request.metadata["execution_inputs"].get("harness_state", []):
+                    self.store.event(
+                        sid,
+                        "refinement_later_consumed",
+                        {
+                            "entry": entry,
+                            "request_event": event,
+                            "meaning": "version included in model input; behavioral use requires separate evidence",
+                        },
+                        parent=event,
+                    )
+                self.store.event(
+                    sid,
+                    "agent_operating_path",
+                    {
+                        "path": "repl"
+                        if any(a.name in {"ipython", "python"} for a in response.actions)
+                        else "direct_response",
+                        "rationale": response.text,
+                        "actions": [a.name for a in response.actions],
+                    },
+                    parent=event,
+                )
                 return response, event
             except HarnessError as exc:
                 if exc.failure.code not in {
@@ -1454,6 +1522,8 @@ class Runtime(MemoryServices):
                     messages, smaller = self.context.assemble(sid, schemas)
                 if smaller >= size:
                     raise
+                if await self._sync_l2_compaction(sid):
+                    messages, smaller = self.context.assemble(sid, schemas, proactive=False)
                 self.store.charge(sid, Usage(retries=1))
                 self.store.event(
                     sid,
@@ -1925,6 +1995,7 @@ class Runtime(MemoryServices):
                 env=environment(self.store.config(sid).execution),
                 bootstrap={
                     "session_id": sid,
+                    "kernel_state": self.store.config(sid).kernel_state.model_dump(),
                     "root_id": session.root_id,
                     "parent_id": session.parent_id,
                     "name": session.name,
@@ -2004,6 +2075,7 @@ class Runtime(MemoryServices):
         result = await kernel.execute(
             context.action_id, code, self.store.config(sid).limits.python_timeout_seconds
         )
+        self._record_kernel_state(sid, result, eid)
         result = self._capture_kernel_logs(sid, result, eid)
         self.store.event(
             sid,
@@ -2012,6 +2084,51 @@ class Runtime(MemoryServices):
             parent=eid,
         )
         return result
+
+    def _record_kernel_state(self, sid, result, parent):
+        metrics = result.get("snapshot_metrics", {})
+        artifact = self.artifacts.put(sid, result.get("kernel_state", {}), source_event=parent)
+        event = self.store.event(
+            sid,
+            "kernel_snapshot",
+            {
+                **metrics,
+                "manifest_artifact": artifact,
+                "missing": result.get("not_checkpointed", {}),
+            },
+            parent=parent,
+        )
+        for action in ("offloaded", "pruned", "reconstructible"):
+            if metrics.get(action):
+                self.store.event(
+                    sid,
+                    "kernel_variables_" + action,
+                    {
+                        "names": metrics[action],
+                        "manifest_artifact": artifact,
+                        "reason": metrics.get("reason"),
+                    },
+                    parent=event,
+                )
+        # Full inventory lives in L3; expose a small operational receipt in L1.
+        result.pop("kernel_state", None)
+        result["state_manifest_artifact"] = artifact
+
+    async def _sync_l2_compaction(self, sid):
+        boundaries = self.store.events(sid, kind="context_compaction", limit=1)
+        snapshots = self.store.events(sid, kind="kernel_snapshot", limit=1)
+        if not boundaries or sid not in self.kernels:
+            return
+        if snapshots and snapshots[0]["seq"] > boundaries[0]["seq"]:
+            return
+        try:
+            result = await self.kernels[sid].checkpoint_state()
+            self._record_kernel_state(sid, result, boundaries[0]["id"])
+            return True
+        except Exception as exc:
+            self.store.event(
+                sid, "kernel_snapshot_failed", {"reason": str(exc)}, parent=boundaries[0]["id"]
+            )
 
     def _capture_kernel_logs(self, sid, result, event):
         result = dict(result)
@@ -2030,7 +2147,16 @@ class Runtime(MemoryServices):
         for attempt in range(config.retry.attempts):
             self._check_limits(sid)
             self.store.charge(sid, Usage(verifier_calls=1), parent=parent)
-            eid = self.store.event(sid, "verifier_started", {"attempt": attempt + 1}, parent=parent)
+            eid = self.store.event(
+                sid,
+                "verifier_started",
+                {
+                    "attempt": attempt + 1,
+                    "level": 3,
+                    "reason": "completion gate or explicit full verification",
+                },
+                parent=parent,
+            )
             try:
                 async with asyncio.timeout(config.limits.tool_timeout_seconds):
                     await self.environment.prepare(sid, force=True)
@@ -2038,11 +2164,25 @@ class Runtime(MemoryServices):
                         ToolContext(self, sid, new_id(), eid), config.task
                     )
                 result = verification.model_dump() if verification else {"skipped": True}
-                exposed = self.artifacts.expose(sid, result, source_event=eid)
+                from .verification import concise
+
+                full_artifact = self.artifacts.put(sid, result, source_event=eid)
+                exposed = self.artifacts.expose(
+                    sid,
+                    {
+                        **concise(result, config.verification),
+                        "full_verifier_artifact": full_artifact,
+                    },
+                    source_event=eid,
+                )
                 result_event = self.store.event(
                     sid,
                     "verifier_result",
-                    {"result": exposed, "passed": verification.passed if verification else None},
+                    {
+                        "result": exposed,
+                        "passed": verification.passed if verification else None,
+                        "level": 3,
+                    },
                     parent=eid,
                 )
                 self.store.add_context(
@@ -2218,15 +2358,13 @@ class Runtime(MemoryServices):
                 target_dir.mkdir(parents=True, exist_ok=True)
                 checkpoint = source_dir / "checkpoint.json"
                 if checkpoint.exists():
-                    if workspace.path != source.workspace.path:
-                        fork_checkpoint(
-                            checkpoint,
-                            target_dir / "checkpoint.json",
-                            source.workspace.path,
-                            workspace.path,
-                        )
-                    else:
-                        shutil.copy2(checkpoint, target_dir / "checkpoint.json")
+                    fork_checkpoint(
+                        checkpoint,
+                        target_dir / "checkpoint.json",
+                        source.workspace.path,
+                        workspace.path,
+                        owner=branch.id,
+                    )
             self.store.event(
                 sid, "branch_created", {"branch_id": branch.id}, parent=source.branch_event
             )

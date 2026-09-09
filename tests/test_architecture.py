@@ -343,7 +343,7 @@ def test_explicit_environment_config_is_not_rewritten(tmp_path):
     assert chat_config(tmp_path, path).task.adapter == "external_simulation"
 
 
-async def test_model_compaction_in_plain_environment_preserves_l2_l3(runtime, tmp_path, config):
+async def test_explicit_model_compaction_in_plain_environment_preserves_l2_l3(runtime, tmp_path, config):
     config.context.max_tokens = 18000
     config.context.recent_blocks = 1
     config.tool_allowlist = ["python", "rlm", "finish"]
@@ -367,7 +367,7 @@ async def test_model_compaction_in_plain_environment_preserves_l2_l3(runtime, tm
         runtime.store.add_context(root.id, eid, [{"role": "user", "content": "z" * 4000}])
         events.append(eid)
     worker = runtime.kernels[root.id].process
-    await runtime.semantic_compact(root.id)
+    await runtime.semantic_compact(root.id, force=True)
     compact = runtime.store.events(root.id, kind="context_compaction")[-1]
     assert compact["payload"]["method"] == "model_structured"
     assert compact["payload"]["model_response_event"]

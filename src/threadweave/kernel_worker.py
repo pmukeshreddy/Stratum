@@ -26,8 +26,6 @@ import types
 import uuid
 from pathlib import Path
 
-from .artifacts import atomic_write
-
 
 def pack(value, seen=None):
     from .kernel_api import Record, snapshot_handle
@@ -156,11 +154,16 @@ class Worker:
         self.host = bootstrap(self.values["tools"], self.values, metadata)
         self.values["get_ipython"] = lambda: self.shell
         self.shell.user_ns = self.values
+        from .kernel_state import KernelState
+
+        self.state = KernelState(self, metadata)
+        self.values["repl_state"] = self.state
         self.protected = set(self.values)
+        self.pack = pack
         self.receipt = None
         from .snapshots import SnapshotBlobs
 
-        self.blobs = SnapshotBlobs(directory)
+        self.blobs = SnapshotBlobs(directory, self.state.policy)
         from .process_family import ProcessFamily, install_shutdown
 
         self.family = ProcessFamily(directory)
@@ -216,7 +219,7 @@ class Worker:
                                 )
                             os.kill(os.getpid(), signal.SIGUSR1)
                     self.emit({"type": "interrupt_ack", "id": packet["id"], "accepted": accepted})
-                elif packet.get("type") in {"execute", "shutdown"}:
+                elif packet.get("type") in {"execute", "checkpoint", "shutdown"}:
                     if packet["type"] == "execute":
                         self.queued.add(packet["id"])
                     self.requests.put(packet)
@@ -244,12 +247,20 @@ class Worker:
             raise EOFError("Runtime disconnected")
         return json.loads(line)
 
-    def remember_recipe(self, name: str, code: str):
+    def remember_recipe(
+        self, name: str, code: str, *, dependencies=(), artifacts=(), source_file=None, sha256=None
+    ):
         """Opt in to re-running this reconstruction code on restart (not the original action)."""
         if not name.isidentifier() or name in self.protected:
             raise ValueError("Recipe needs a non-reserved Python variable name")
         compile(code, "<recovery-recipe>", "exec")
-        self.recipes[name] = code
+        self.recipes[name] = {
+            "code": code,
+            "dependencies": list(dependencies),
+            "artifacts": list(artifacts),
+            "source_file": source_file,
+            "sha256": sha256,
+        }
 
     def forget(self, *names):
         for name in names:
@@ -257,89 +268,18 @@ class Worker:
                 raise ValueError(f"Reserved name: {name}")
             self.values.pop(name, None)
             self.recipes.pop(name, None)
+            self.state.manifest.pop(name, None)
 
     def restore(self):
-        restored, missing, reconstructed = [], {}, []
-        if self.checkpoint.exists():
-            data = json.loads(self.checkpoint.read_text())
-            if data.get("version") != 1:
-                raise ValueError("Unsupported checkpoint version")
-            self.recipes = data.get("recipes", {})
-            self.receipt = data.get("receipt")
-            missing.update(data.get("missing", {}))
-            for name, value in data["values"].items():
-                try:
-                    self.values[name] = self.blobs.decode(value, lambda v: unpack(v, self.host))
-                    restored.append(name)
-                except Exception as exc:
-                    missing[name] = str(exc)
-            # Explicit recipes run after serializable artifacts have been restored.
-            # Redirect their output too, so it cannot corrupt the protocol.
-            with (self.directory / "recovery.log").open("a") as output:
-                import contextlib
+        return self.state.restore()
 
-                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-                    for name, code in self.recipes.items():
-                        try:
-                            exec(compile(code, "<recovery-recipe>", "exec"), self.values)
-                            if name not in self.values:
-                                raise ValueError(f"Recipe did not recreate {name}")
-                            reconstructed.append(name)
-                            missing.pop(name, None)
-                        except BaseException as exc:
-                            missing[name] = f"Recipe failed: {exc}"
-        return {"restored": restored, "reconstructed": reconstructed, "missing": missing}
-
-    def snapshot(self, receipt):
-        from .snapshots import deadline
-
-        started = self.blobs.begin()
-        values, missing, used = {}, {}, 0
-        for name, value in list(self.values.items()):
-            if name in self.protected or name.startswith("__") or name in self.recipes:
-                continue
-            try:
-                if time.monotonic() - started > 5:
-                    raise ValueError("Namespace snapshot exceeded 5 seconds; variable not saved")
-                with deadline(min(1, 5 - (time.monotonic() - started))):
-                    encoded, size = self.blobs.encode(name, value, pack)
-                if size > 16 * 1024 * 1024 or used + size > 64 * 1024 * 1024:
-                    raise ValueError(
-                        "Checkpoint size cap reached; persist an artifact and a recipe"
-                    )
-                values[name] = encoded
-                used += size
-            except Exception as exc:
-                missing[name] = str(exc)
-        self.blobs.cache = {k: v for k, v in self.blobs.cache.items() if k in values}
-        self.blobs.shadows = {k: v for k, v in self.blobs.shadows.items() if k in values}
-        self.blobs.array_shadows = {
-            k: v for k, v in self.blobs.array_shadows.items() if k in values
-        }
-        receipt["result"]["snapshot_metrics"] = {
-            **self.blobs.stats,
-            "seconds": time.monotonic() - started,
-            "saved_variables": len(values),
-            "missing_variables": len(missing),
-        }
-        atomic_write(
-            self.checkpoint,
-            json.dumps(
-                {
-                    "version": 1,
-                    "values": values,
-                    "missing": missing,
-                    "recipes": self.recipes,
-                    "receipt": receipt,
-                },
-                allow_nan=False,
-            ).encode(),
-        )
-        return missing
+    def snapshot(self, receipt, *, reason=None):
+        return self.state.snapshot(receipt, reason=reason)
 
     async def evaluate(self, code):
         code = self.shell.transform_cell(code)
         tree = ast.parse(code, mode="exec")
+        self.state.observe(tree)
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         compiled = compile(tree, "<session>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
         outcome = eval(compiled, self.values)
@@ -413,6 +353,7 @@ class Worker:
         result["process_effects"] = self.family.observation()
         self.receipt = {"id": execution_id, "result": result}
         result["not_checkpointed"] = self.snapshot(self.receipt)
+        result["variables"] = sorted(n for n in self.values if not n.startswith("__"))[:100]
         self.phase = "idle"
         return result
 
@@ -442,6 +383,13 @@ class Worker:
             if request["type"] == "shutdown":
                 self.family.close()
                 return
+            if request["type"] == "checkpoint":
+                result = {}
+                receipt = self.receipt or {"id": None, "result": {}}
+                missing = self.snapshot(receipt, reason=request["reason"])
+                result.update(receipt["result"])
+                result["not_checkpointed"] = missing
+                self.emit({"type": "result", "id": request["id"], "result": result})
             if request["type"] == "execute":
                 self.emit(
                     {"type": "result", "id": request["id"], "result": await self.execute(request)}
