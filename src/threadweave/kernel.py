@@ -18,8 +18,16 @@ def fork_checkpoint(source, destination, old_workspace, new_workspace, *, owner=
     import shutil
 
     from .artifacts import atomic_write
+    from .models import KernelStatePolicy
+    from .snapshot_io import CappedFile, rebind_paths
 
     checkpoint = json.loads(source.read_text())
+    bootstrap = source.parent / "bootstrap.json"
+    policy = (
+        KernelStatePolicy.model_validate(json.loads(bootstrap.read_text()).get("kernel_state", {}))
+        if bootstrap.exists()
+        else KernelStatePolicy()
+    )
     old, new = Path(old_workspace).resolve(), Path(new_workspace).resolve()
     isolated = old != new
     missing = checkpoint.setdefault("missing", {})
@@ -40,20 +48,32 @@ def fork_checkpoint(source, destination, old_workspace, new_workspace, *, owner=
     def copy_record(record):
         if record[0] != "blob":
             return rebind(record)
-        meta = record[1]
+        meta = dict(record[1])
         blob = source.parent / "values" / meta["sha256"]
-        data = blob.read_bytes()
-        if hashlib.sha256(data).hexdigest() != meta["sha256"]:
+        digest = hashlib.sha256()
+        with blob.open("rb") as stream:
+            while block := stream.read(policy.stream_chunk_bytes):
+                digest.update(block)
+        if digest.hexdigest() != meta["sha256"] or blob.stat().st_size != meta["bytes"]:
             raise ValueError("Snapshot blob checksum mismatch")
         if isolated and meta["codec"] == "cloudpickle":
             raise ValueError("Procedure blob requires explicit reconstruction in isolated fork")
-        if isolated and meta["codec"] == "json":
-            data = json.dumps(rebind(json.loads(data))).encode()
-            digest = hashlib.sha256(data).hexdigest()
-            atomic_write(target_blobs / digest, data)
-            return ["blob", {**meta, "sha256": digest, "bytes": len(data)}]
+        if isolated and meta["codec"] == "json" and meta.get("has_paths", True):
+            sink = CappedFile(target_blobs, policy.artifact_bytes, policy.stream_chunk_bytes, [0])
+            try:
+                with blob.open("rb") as stream:
+                    rebind_paths(stream, sink, old, new, policy.stream_chunk_bytes)
+                sink.finish()
+                digest = sink.digest.hexdigest()
+                os.replace(sink.path, target_blobs / digest)
+                return ["blob", {**meta, "sha256": digest, "bytes": sink.size}]
+            finally:
+                sink.discard()
         shutil.copy2(blob, target_blobs / meta["sha256"])
-        return record
+        for key in ("dependencies", "buffers"):
+            if key in meta:
+                meta[key] = [copy_record(item) for item in meta[key]]
+        return ["blob", meta]
 
     checkpoint["owner"] = owner or destination.parent.name
     manifest = checkpoint.get("manifest", {})

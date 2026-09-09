@@ -640,6 +640,8 @@ class Runtime(MemoryServices):
     def resume(self, sid: str):
         session = self.store.session(sid)
         self.validate_config(self.store.config(sid))
+        if self._stopped_ancestor(sid):
+            raise ValueError("Resume the stopped parent before resuming its child")
         if session.outcome == Outcome.LIMITED:
             raise ValueError(
                 "A resource-limited trajectory cannot reset its budget; fork a new run"
@@ -658,6 +660,15 @@ class Runtime(MemoryServices):
             )
             self.store.event(sid, "resumed", {})
         self._wake.set()
+
+    def _stopped_ancestor(self, sid):
+        parent = self.store.session(sid).parent_id
+        while parent:
+            session = self.store.session(parent)
+            if session.outcome in {Outcome.CANCELLED, Outcome.FAILED, Outcome.LIMITED}:
+                return parent
+            parent = session.parent_id
+        return None
 
     def schedule(
         self, sid: str, *, interval_seconds=None, cron=None, instruction="Scheduled continuation"
@@ -955,6 +966,19 @@ class Runtime(MemoryServices):
             with self.store.transaction():
                 self._continue_completed_child(session.id)
             session = self.store.session(session.id)
+            if session.outcome == Outcome.ACTIVE and (
+                ancestor := self._stopped_ancestor(session.id)
+            ):
+                await self.stop(session.id)
+                self.store.event(
+                    session.id,
+                    "orphan_child_cancelled",
+                    {
+                        "stopped_ancestor": ancestor,
+                        "reason": "Recovered interrupted parent termination",
+                    },
+                )
+                continue
             if session.outcome == Outcome.ACTIVE:
                 eid = self.store.event(
                     session.id,
@@ -2143,26 +2167,53 @@ class Runtime(MemoryServices):
         return result
 
     async def _verify(self, sid, parent):
+        # Serialize gates for one working tree. The second requester observes the
+        # first committed receipt instead of launching an identical concurrent suite.
+        if not hasattr(self, "_verification_locks"):
+            self._verification_locks = {}
+        workspace = str(await asyncio.to_thread(Path(self.store.session(sid).workspace.path).resolve))
+        lock = self._verification_locks.setdefault(workspace, asyncio.Lock())
+        async with lock:
+            return await self._verify_locked(sid, parent)
+
+    async def _verify_locked(self, sid, parent):
         config = self.store.config(sid)
         for attempt in range(config.retry.attempts):
             self._check_limits(sid)
-            self.store.charge(sid, Usage(verifier_calls=1), parent=parent)
-            eid = self.store.event(
-                sid,
-                "verifier_started",
-                {
-                    "attempt": attempt + 1,
-                    "level": 3,
-                    "reason": "completion gate or explicit full verification",
-                },
-                parent=parent,
-            )
+            eid = parent
             try:
                 async with asyncio.timeout(config.limits.tool_timeout_seconds):
                     await self.environment.prepare(sid, force=True)
-                    verification = await self.adapters[config.task.adapter].verify(
-                        ToolContext(self, sid, new_id(), eid), config.task
-                    )
+                    from .verification_receipts import VerificationReceipts
+
+                    receipts = VerificationReceipts(ToolContext(self, sid, new_id(), parent))
+                    identity = receipts.fingerprint()
+                    verification = receipts.find(identity)
+                    reused = verification is not None
+                    if not reused:
+                        self.store.charge(sid, Usage(verifier_calls=1), parent=parent)
+                        eid = self.store.event(
+                            sid,
+                            "verifier_started",
+                            {
+                                "attempt": attempt + 1,
+                                "level": 3,
+                                "reason": "completion gate or explicit full verification",
+                            },
+                            parent=parent,
+                        )
+                        self.store.event(
+                            sid,
+                            "verification_executed",
+                            {
+                                "level": 3,
+                                "key": identity["key"] if identity else None,
+                            },
+                            parent=eid,
+                        )
+                        verification = await self.adapters[config.task.adapter].verify(
+                            ToolContext(self, sid, new_id(), eid), config.task
+                        )
                 result = verification.model_dump() if verification else {"skipped": True}
                 from .verification import concise
 
@@ -2182,12 +2233,15 @@ class Runtime(MemoryServices):
                         "result": exposed,
                         "passed": verification.passed if verification else None,
                         "level": 3,
+                        "receipt_reused": reused,
                     },
                     parent=eid,
                 )
                 self.store.add_context(
                     sid, result_event, [{"role": "user", "content": "Verifier: " + encode(exposed)}]
                 )
+                if not reused:
+                    receipts.save(identity, verification, full_artifact, result_event)
                 if verification and not verification.passed:
                     self.retain_failure(sid, result_event, verification)
                 return verification, False
@@ -2235,9 +2289,16 @@ class Runtime(MemoryServices):
 
     async def stop(self, sid, *, tree=True):
         self.store.session(sid)
-        ids = [sid, *self._active_descendants(sid)] if tree else [sid]
+        ids = [sid]
+        if tree:
+            # Finished children may still own host-managed background processes.
+            # Traverse the whole ownership tree, preserving completed outcomes.
+            sessions = self.store.sessions(root_id=self.store.session(sid).root_id)
+            for owner in ids:
+                ids.extend(s.id for s in sessions if s.parent_id == owner)
         for target in ids:
-            self.store.finish(target, Outcome.CANCELLED, "Stopped by user")
+            if target == sid or self.store.session(target).outcome == Outcome.ACTIVE:
+                self.store.finish(target, Outcome.CANCELLED, "Stopped by user")
             self.cancel_refinements(target, "Session stopped")
             for refinement_task, refinement_sid in list(self._active_refinements.items()):
                 if refinement_sid == target and refinement_task is not asyncio.current_task():

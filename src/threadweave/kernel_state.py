@@ -10,6 +10,7 @@ import ast
 import json
 import sys
 import time
+from itertools import chain
 from pathlib import Path
 
 from .artifacts import atomic_write
@@ -33,18 +34,21 @@ class StateHandle:
 
 
 def memory_size(value, max_nodes):
-    seen, pending, total = set(), [value], 0
+    seen, pending, total = set(), [iter((value,))], 0
     while pending and len(seen) < max_nodes:
-        item = pending.pop()
+        try:
+            item = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
         if id(item) in seen:
             continue
         seen.add(id(item))
         total += sys.getsizeof(item, 0)
         if type(item) is dict:
-            pending.extend(item.keys())
-            pending.extend(item.values())
+            pending.append(chain(item.keys(), item.values()))
         elif type(item) in (list, tuple, set, frozenset):
-            pending.extend(item)
+            pending.append(iter(item))
         elif type(item).__module__.startswith("pandas") and hasattr(item, "memory_usage"):
             usage = item.memory_usage(deep=True)
             total = max(total, int(usage.sum() if hasattr(usage, "sum") else usage))
@@ -82,7 +86,13 @@ class KernelState:
         row = self.manifest[name]
         if row.get("owner") != self.owner:
             raise ValueError("Kernel state owner mismatch")
-        if row.get("record") is not None:
+        alias = row.get("alias_of")
+        if alias and alias in self.manifest:
+            value = worker.values.get(alias)
+            if alias not in worker.values or isinstance(value, StateHandle):
+                value = self.rehydrate(alias, loading | {name})
+            worker.values[name] = value
+        elif row.get("record") is not None:
             from .kernel_worker import unpack
 
             value = worker.blobs.decode(row["record"], lambda v: unpack(v, worker.host))
@@ -188,6 +198,7 @@ class KernelState:
         )
         manifest = {n: r for n, r in self.manifest.items() if r["action"] == "prune"}
         values, missing, changes, used = {}, {}, {}, 0
+        identities = {}
         projected = total
         # Important/recent values get first claim on the checkpoint allowance.
         ordered = sorted(candidates, key=lambda n: (n not in self.pinned, -self.used.get(n, 0)))
@@ -206,6 +217,18 @@ class KernelState:
                     changes[name] = None
                 manifest[name] = row
                 continue
+            if id(value) in identities:
+                canonical = identities[id(value)]
+                row = {**manifest[canonical], "name": name, "alias_of": canonical}
+                manifest[name] = row
+                if canonical in changes:
+                    changes[name] = StateHandle(self, name, row) if changes[canonical] else None
+                    projected -= size
+                elif row.get("record") is not None:
+                    values[name] = row["record"]
+                continue
+            if type(value) not in (str, bytes, int, float, bool, type(None)):
+                identities[id(value)] = name
             row = {
                 "name": name,
                 "owner": self.owner,
@@ -289,6 +312,13 @@ class KernelState:
             "missing": missing,
             "recipes": worker.recipes,
             "receipt": receipt,
+            "reference_identity": {
+                "top_level_aliases": "preserved",
+                "cross_variable_nested_aliases": "independent values; not guaranteed",
+                "allocation_policy": "streamed typed values and protocol-5 buffers; native user reducers execute trusted code",
+                "stream_chunk_bytes": policy.stream_chunk_bytes,
+                "serialized_operation_limit": policy.artifact_bytes,
+            },
         }
         receipt["result"]["snapshot_metrics"] = metrics
         # Commit before eviction. A failed write leaves live objects intact.

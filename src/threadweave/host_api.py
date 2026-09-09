@@ -222,6 +222,12 @@ async def dispatch(context, request):
             child = store.session(p["target"])
             if child.parent_id != sid:
                 raise PermissionError("Follow-up target must be a direct child")
+            if child.outcome in {"cancelled", "limited"}:
+                raise ValueError("A cancelled or limited child cannot accept follow-up work")
+            if not isinstance(p.get("instruction"), str) or not p["instruction"].strip():
+                raise ValueError("Follow-up requires a nonempty assignment")
+            if child.outcome == "failed":
+                runtime.resume(child.id)
             return {
                 "message_id": runtime.message(sid, child.id, p["instruction"]),
                 "session_id": child.id,
@@ -342,10 +348,18 @@ async def dispatch(context, request):
             }
         if op == "agent_message.send":
             role, name = p.get("receiver_role"), p.get("receiver_name")
+            target_id = p.get("receiver_id")
             if p.get("broadcast_message") is not None:
-                if p["message"] != "all" or role or name:
+                if p["message"] != "all" or role or name or target_id:
                     raise ValueError("Broadcast syntax is send('all', message)")
                 targets, body = related, p["broadcast_message"]
+            elif target_id:
+                if role or name:
+                    raise ValueError("Use receiver_id or a role/name pair, not both")
+                targets = [s for s in related if s["id"] == target_id]
+                if len(targets) != 1:
+                    raise ValueError("Recipient ID is not visible from this session")
+                body = p["message"]
             else:
                 if role not in {"parent", "child", "sibling"}:
                     raise ValueError("receiver_role must be parent, child or sibling")

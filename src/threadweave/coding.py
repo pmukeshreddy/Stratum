@@ -197,6 +197,10 @@ class CodingTask:
     async def verify(self, context, task):
         options = coding_options(task)
         original = baseline(context)
+        commands_by_kind = {
+            kind: getattr(options, field) or original["commands"].get(kind, [])
+            for kind, field in KINDS.items()
+        }
         observer = context.runtime.environment.adapter(context.session_id).mutations
         observer.reconcile(context, reason="before_verifier")
         git = GitWorkspace(context)
@@ -229,7 +233,7 @@ class CodingTask:
         governed_paths = set(git.files()) | set(prior)
         if changed_paths is not None:
             changed_paths &= governed_paths
-        if options.require_tests and not original["commands"]["test"]:
+        if options.require_tests and not commands_by_kind["test"]:
             violations.append("No test commands configured; coding completion cannot be verified")
         patch = git.diff(original["checkpoint_id"], paths=changed_paths)
         if options.require_change and not patch.strip():
@@ -281,13 +285,19 @@ class CodingTask:
         for required in options.required_files:
             if not confined(git.root, required).is_file():
                 violations.append(f"Required file missing: {required}")
-        for kind, commands in original["commands"].items():
+        for kind, commands in commands_by_kind.items():
             results[kind] = []
             for i, command in enumerate(commands):
                 result = await run_command(context, command, kind="verify_" + kind)
                 results[kind].append(result)
                 previous = original["results"].get(kind, [])
-                old = previous[i] if i < len(previous) else None
+                old = (
+                    previous[i]
+                    if i < len(previous)
+                    and i < len(original["commands"].get(kind, []))
+                    and original["commands"][kind][i] == command
+                    else None
+                )
                 if not result["passed"]:
                     old_names = {f["name"] for f in old["failures"] if f["name"]} if old else set()
                     names = {f["name"] for f in result["failures"] if f["name"]}

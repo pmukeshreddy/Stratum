@@ -137,6 +137,7 @@ class KernelStatePolicy(Record):
     snapshot_seconds: float = Field(default=5, gt=0)
     variable_seconds: float = Field(default=1, gt=0)
     size_scan_nodes: int = Field(default=10000, ge=100)
+    stream_chunk_bytes: int = Field(default=64 * 1024, ge=1024, le=1024 * 1024)
 
 
 class VerificationPolicy(Record):

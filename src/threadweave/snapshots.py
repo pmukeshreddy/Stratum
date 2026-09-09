@@ -9,16 +9,19 @@ import hashlib
 import inspect
 import io
 import json
+import os
+import pickle
 import signal
 import socket
 import subprocess
 import time
 import types
 from contextlib import contextmanager
+from itertools import chain
 
 import cloudpickle
 
-from .artifacts import atomic_write
+from .snapshot_io import CappedFile, write_packed
 
 
 class SnapshotTimeout(ValueError):
@@ -68,7 +71,7 @@ class SnapshotBlobs:
         scalars = {str, bytes, int, float, bool, type(None)}
         flat = type(value) in {list, dict} and all(
             type(item) in scalars
-            for item in (value if type(value) is list else (*value.keys(), *value.values()))
+            for item in (value if type(value) is list else chain(value.keys(), value.values()))
         )
         shadow = self.shadows.get(name)
         array = (
@@ -110,78 +113,196 @@ class SnapshotBlobs:
         if immutable and cached and cached[0] is value:
             self.stats["cache_hits"] += 1
             return cached[1], cached[2]
+        budget, created = [0], []
         try:
-            encoded = pack(value)
-            data = json.dumps(encoded, allow_nan=False).encode()
-            codec = "json"
-        except TypeError:
-            if (
-                not isinstance(value, (types.FunctionType, type))
-                and type(value).__module__ != "__session__"
-                and (type(value).__module__, type(value).__name__)
-                not in {
-                    ("array", "array"),
-                    ("numpy", "ndarray"),
-                    ("pandas.core.frame", "DataFrame"),
-                    ("pandas.core.series", "Series"),
-                }
-            ):
-                raise
-            buffer = io.BytesIO()
-            SafeProcedurePickler(buffer, protocol=5).dump(value)
-            data, codec = buffer.getvalue(), "cloudpickle"
-            encoded = None
-        if len(data) > self.policy.artifact_bytes:
-            raise ValueError(
-                "Variable exceeds artifact size budget; register a reconstruction recipe"
-            )
-        self.stats["serialized_bytes"] += len(data)
-        if len(data) > self.policy.inline_bytes or codec == "cloudpickle":
-            digest = hashlib.sha256(data).hexdigest()
-            path = self.directory / digest
-            if not path.exists():
-                atomic_write(path, data)
-                self.stats["written_bytes"] += len(data)
-            encoded = ["blob", {"sha256": digest, "codec": codec, "bytes": len(data)}]
+            encoded = self._encode_stream(value, budget, created)
+        except BaseException:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+        size = budget[0]
+        self.stats["serialized_bytes"] += size
         if immutable:
-            self.cache[name] = (value, encoded, len(data))
-        if flat and len(data) <= self.policy.mutable_cache_bytes:
+            self.cache[name] = (value, encoded, size)
+        if flat and size <= self.policy.mutable_cache_bytes:
             # Exact scalar-container equality, not mutable identity or a hash.
             # Nested/opaque mutations deliberately take the full codec path.
-            self.shadows[name] = (value.copy(), encoded, len(data))
+            self.shadows[name] = (value.copy(), encoded, size)
         else:
             self.shadows.pop(name, None)
         if array:
-            self.array_shadows[name] = (value.copy(), encoded, len(data))
+            self.array_shadows[name] = (value.copy(), encoded, size)
         else:
             self.array_shadows.pop(name, None)
-        return encoded, len(data)
+        return encoded, size
+
+    def _encode_stream(self, value, budget, created, *, force_blob=False):
+        policy = self.policy
+        sink = CappedFile(self.directory, policy.artifact_bytes, policy.stream_chunk_bytes, budget)
+        codec, dependencies, buffers = "json", [], []
+        typecode = None
+        try:
+            if type(value) in (bytes, memoryview) and (
+                force_blob or len(value) > policy.inline_bytes
+            ):
+                codec = "bytes"
+                sink.write(value)
+            elif type(value) is str and (force_blob or len(value) > policy.inline_bytes):
+                codec = "utf8"
+                step = max(1, policy.stream_chunk_bytes // 4)
+                for offset in range(0, len(value), step):
+                    sink.write(value[offset : offset + step].encode("utf8", errors="surrogatepass"))
+            elif (type(value).__module__, type(value).__name__) == ("array", "array"):
+                codec, typecode = "array", value.typecode
+                sink.write(memoryview(value))
+            else:
+                try:
+                    write_packed(sink, value, policy.stream_chunk_bytes)
+                except TypeError:
+                    if (
+                        not isinstance(value, (types.FunctionType, type))
+                        and type(value).__module__ != "__session__"
+                        and (type(value).__module__, type(value).__name__)
+                        not in {
+                            ("array", "array"),
+                            ("numpy", "ndarray"),
+                            ("pandas.core.frame", "DataFrame"),
+                            ("pandas.core.series", "Series"),
+                        }
+                    ):
+                        raise
+                    budget[0] -= sink.size
+                    sink.discard()
+                    sink = CappedFile(
+                        self.directory, policy.artifact_bytes, policy.stream_chunk_bytes, budget
+                    )
+                    codec = "cloudpickle"
+                    owner = self
+
+                    class StreamingPickler(SafeProcedurePickler):
+                        def persistent_id(self, item):
+                            if type(item) in (str, bytes) and len(item) > policy.inline_bytes:
+                                record = owner._encode_stream(
+                                    item, budget, created, force_blob=True
+                                )
+                                dependencies.append(record)
+                                return ("snapshot_blob", record)
+                            return None
+
+                    def buffer_callback(buffer):
+                        # Protocol 5 exports array storage without copying it into pickle bytes.
+                        buffers.append(
+                            self._encode_stream(buffer.raw(), budget, created, force_blob=True)
+                        )
+
+                    StreamingPickler(sink, protocol=5, buffer_callback=buffer_callback).dump(value)
+            sink.finish()
+            self.stats["max_write_bytes"] = max(self.stats["max_write_bytes"], sink.max_write)
+            if codec == "json" and not force_blob and sink.size <= policy.inline_bytes:
+                with sink.path.open() as stream:
+                    return json.load(stream)
+            digest = sink.digest.hexdigest()
+            target = self.directory / digest
+            if not target.exists():
+                os.replace(sink.path, target)
+                created.append(target)
+                self.stats["written_bytes"] += sink.size
+            metadata = {"sha256": digest, "codec": codec, "bytes": sink.size}
+            if typecode:
+                import sys
+
+                metadata.update(typecode=typecode, byteorder=sys.byteorder)
+            if codec == "json":
+                metadata["has_paths"] = sink.has_paths
+            if dependencies:
+                metadata["dependencies"] = dependencies
+            if buffers:
+                metadata["buffers"] = buffers
+            return ["blob", metadata]
+        finally:
+            sink.discard()
 
     def offload(self, record):
         if record[0] == "blob":
             return record
-        data = json.dumps(record, allow_nan=False).encode()
-        digest = hashlib.sha256(data).hexdigest()
+        sink = CappedFile(
+            self.directory, self.policy.artifact_bytes, self.policy.stream_chunk_bytes, [0]
+        )
+        try:
+            # Inline records are capped already; iterencode avoids a second bytes buffer.
+            for part in json.JSONEncoder(allow_nan=False).iterencode(record):
+                sink.write(part.encode())
+            sink.finish()
+            digest = sink.digest.hexdigest()
+            path = self.directory / digest
+            if not path.exists():
+                os.replace(sink.path, path)
+                self.stats["written_bytes"] += sink.size
+            return ["blob", {"sha256": digest, "codec": "json", "bytes": sink.size}]
+        finally:
+            sink.discard()
+
+    def checked_path(self, metadata):
+        digest = metadata["sha256"]
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("Invalid snapshot blob identity")
         path = self.directory / digest
-        if not path.exists():
-            atomic_write(path, data)
-            self.stats["written_bytes"] += len(data)
-        return ["blob", {"sha256": digest, "codec": "json", "bytes": len(data)}]
+        if (
+            path.stat().st_size != metadata["bytes"]
+            or path.stat().st_size > self.policy.artifact_bytes
+        ):
+            raise ValueError("Snapshot blob size mismatch")
+        checksum = hashlib.sha256()
+        with path.open("rb") as stream:
+            while block := stream.read(self.policy.stream_chunk_bytes):
+                checksum.update(block)
+        if checksum.hexdigest() != digest:
+            raise ValueError("Snapshot blob checksum mismatch")
+        return path
 
     def decode(self, record, unpack):
         if record[0] != "blob":
             return unpack(record)
         metadata = record[1]
-        digest = metadata["sha256"]
-        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise ValueError("Invalid snapshot blob identity")
-        data = (self.directory / digest).read_bytes()
-        if len(data) > self.policy.artifact_bytes or hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("Snapshot blob checksum/size mismatch")
+        path = self.checked_path(metadata)
         if metadata["codec"] == "json":
-            return unpack(json.loads(data))
+            with path.open() as stream:
+                return unpack(json.load(stream))
+        if metadata["codec"] == "bytes":
+            return path.read_bytes()
+        if metadata["codec"] == "array":
+            import array
+            import sys
+
+            value = array.array(metadata["typecode"])
+            with path.open("rb") as stream:
+                value.fromfile(stream, metadata["bytes"] // value.itemsize)
+            if metadata.get("byteorder", sys.byteorder) != sys.byteorder:
+                value.byteswap()
+            return value
+        if metadata["codec"] == "utf8":
+            with path.open(encoding="utf8", errors="surrogatepass", newline="") as stream:
+                return stream.read()
         if metadata["codec"] == "cloudpickle":
-            return cloudpickle.loads(data)
+            owner = self
+
+            class SnapshotUnpickler(pickle.Unpickler):
+                def persistent_load(self, identity):
+                    kind, leaf = identity
+                    if kind != "snapshot_blob":
+                        raise ValueError("Unknown persistent snapshot reference")
+                    return owner.decode(leaf, unpack)
+
+            def buffers():
+                for record in metadata.get("buffers", []):
+                    buffer_path = self.checked_path(record[1])
+                    value = bytearray(record[1]["bytes"])
+                    with buffer_path.open("rb") as source:
+                        source.readinto(value)
+                    yield value
+
+            with path.open("rb") as stream:
+                return SnapshotUnpickler(stream, buffers=buffers()).load()
         raise ValueError("Unknown snapshot blob codec")
 
     def begin(self):
@@ -190,5 +311,6 @@ class SnapshotBlobs:
             "written_bytes": 0,
             "cache_hits": 0,
             "mutable_cache_hits": 0,
+            "max_write_bytes": 0,
         }
         return time.monotonic()

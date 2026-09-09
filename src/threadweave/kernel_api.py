@@ -213,7 +213,7 @@ class Messaging:
         self.host = host
 
     def help(self):
-        return 'await agent_message.send("findings", receiver_role="parent")\nFor child/sibling: receiver_role="child"|"sibling", receiver_name="name".\nawait agent_message.receive(); await agent_message.list_agents()'
+        return 'await agent_message.send("findings", receiver_role="parent")\nSend directly with receiver_id=handle (or a visible session ID). Alternatively for child/sibling: receiver_role="child"|"sibling", receiver_name="name".\nawait agent_message.receive(); await agent_message.list_agents()'
 
     def __repr__(self):
         return self.help()
@@ -222,7 +222,13 @@ class Messaging:
         return await self.host.acall("agent_message.list_agents")
 
     async def send(
-        self, message, broadcast_message=None, *, receiver_role=None, receiver_name=None
+        self,
+        message,
+        broadcast_message=None,
+        *,
+        receiver_role=None,
+        receiver_name=None,
+        receiver_id=None,
     ):
         return await self.host.acall(
             "agent_message.send",
@@ -230,6 +236,9 @@ class Messaging:
             broadcast_message=broadcast_message,
             receiver_role=receiver_role,
             receiver_name=receiver_name,
+            receiver_id=receiver_id.session_id
+            if isinstance(receiver_id, AgentHandle)
+            else receiver_id,
         )
 
     async def receive(self):
