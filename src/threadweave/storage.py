@@ -637,6 +637,64 @@ class Store(RequestHistory, TrajectoryHistory):
                     )
         return applied
 
+    def enqueue_refinement_request(
+        self, sid, *, source, request_id=None, source_event=None, trigger="manual"
+    ):
+        """Request a model-generated evidence pass, NOT a pre-authored StateEdit.
+
+        Durable IDs make retries idempotent. Admission never changes an agent's
+        outcome, pause state, budgets or ordinary-turn runnable flag.
+        """
+        session, config = self.session(sid), self.config(sid)
+        request_id = request_id or new_id()
+        if self.db.execute(
+            "SELECT 1 FROM refinement_requests WHERE id=?", (request_id,)
+        ).fetchone():
+            return self.refinement_request(sid, request_id)
+        with self.transaction():
+            event = self.event(
+                sid,
+                "refinement_trigger",
+                {
+                    "source": source,
+                    "trigger": trigger,
+                    "request_id": request_id,
+                },
+                parent=source_event,
+            )
+            self.db.execute(
+                "INSERT INTO refinement_requests VALUES(?,?,?,?,?,?)",
+                (
+                    request_id,
+                    sid,
+                    event,
+                    "pending",
+                    encode({"waiting_for_resume": session.paused}),
+                    trigger,
+                ),
+            )
+            if not config.refinement.enabled:
+                return self.refinement_request_result(
+                    sid,
+                    request_id,
+                    "skipped",
+                    reason="Refinement is disabled in this session configuration",
+                )
+            if session.outcome not in {Outcome.ACTIVE, Outcome.COMPLETED}:
+                return self.refinement_request_result(
+                    sid,
+                    request_id,
+                    "failed",
+                    reason="Session is cancelled, failed or resource-limited; not reactivated",
+                )
+            self.event(
+                sid,
+                "refinement_status",
+                {"request_id": request_id, "status": "requested"},
+                parent=event,
+            )
+        return self.refinement_request(sid, request_id)
+
     def pending_refinement_requests(self, sid):
         return [
             dict(row)
@@ -655,6 +713,7 @@ class Store(RequestHistory, TrajectoryHistory):
         return {
             "request_id": row["id"],
             "event_id": row["trigger_event"],
+            "trigger": row["trigger"],
             "status": "requested" if row["status"] == "pending" else row["status"],
             **json.loads(row["result"]),
         }

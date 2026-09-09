@@ -380,6 +380,8 @@ class Action(Record):
 
 class ModelRequest(Record):
     request_id: str = Field(default_factory=new_id)
+    request_kind: Literal["trajectory", "auxiliary"] = "trajectory"
+    reasoning_mode: Literal["inherit", "off"] = "inherit"
     session_id: str
     root_id: str
     parent_id: str | None

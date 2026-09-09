@@ -1,6 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 11
+VERSION = 12
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -142,3 +142,82 @@ def migrate(db, previous, timestamp):
             "CREATE INDEX refinement_run_session ON refinement_runs(session_id,status);"
             f"INSERT INTO schema_migrations VALUES(11,{timestamp}); PRAGMA user_version=11; COMMIT;"
         )
+    if previous < 12:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "ALTER TABLE model_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'trajectory';"
+            "UPDATE model_requests SET request_kind='auxiliary' WHERE purpose NOT IN ('agent','compaction');"
+            "ALTER TABLE refinement_requests ADD COLUMN trigger TEXT NOT NULL DEFAULT 'manual';"
+            "UPDATE refinement_requests SET trigger=COALESCE((SELECT json_extract(e.payload,'$.trigger') "
+            "FROM refinement_runs r JOIN events e ON e.id=json_extract(r.body,'$.marker') "
+            "WHERE r.id=refinement_requests.id),'manual');"
+        )
+        try:
+            _separate_auxiliary_edges(db)
+            db.execute("INSERT INTO schema_migrations VALUES(12,?)", (timestamp,))
+            db.execute("PRAGMA user_version=12")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+
+
+def _separate_auxiliary_edges(db):
+    """Repair v11 continuation chains without discarding call/usage history."""
+    import json
+
+    requests = {
+        row[0]: (row[1], json.loads(row[2]))
+        for row in db.execute("SELECT id,request_kind,inbound FROM model_requests")
+    }
+
+    def sources(source, seen=frozenset()):
+        if source in seen or source not in requests:
+            return []
+        kind, inbound = requests[source]
+        if kind == "trajectory":
+            return [source]
+        return [
+            ancestor for edge in inbound for ancestor in sources(edge["source"], seen | {source})
+        ]
+
+    edges = db.execute("SELECT source,target,kind FROM request_edges").fetchall()
+    for source, target, kind in edges:
+        if requests[source][0] == "auxiliary" or requests[target][0] == "auxiliary":
+            db.execute(
+                "DELETE FROM request_edges WHERE source=? AND target=? AND kind=?",
+                (source, target, kind),
+            )
+            if requests[target][0] == "trajectory":
+                for ancestor in sources(source):
+                    # A committed compaction may already supply a more specific edge.
+                    if not db.execute(
+                        "SELECT 1 FROM request_edges WHERE source=? AND target=?",
+                        (ancestor, target),
+                    ).fetchone():
+                        db.execute(
+                            "INSERT OR IGNORE INTO request_edges VALUES(?,?,?)",
+                            (ancestor, target, kind),
+                        )
+    for rid, (kind, inbound) in requests.items():
+        repaired = (
+            []
+            if kind == "auxiliary"
+            else [
+                {"source": ancestor, "kind": edge["kind"]}
+                for edge in inbound
+                for ancestor in sources(edge["source"])
+            ]
+        )
+        db.execute("UPDATE model_requests SET inbound=? WHERE id=?", (json.dumps(repaired), rid))
+    for sid, source, kind in db.execute("SELECT * FROM pending_request_edges").fetchall():
+        if requests[source][0] == "auxiliary":
+            db.execute(
+                "DELETE FROM pending_request_edges WHERE session_id=? AND source=? AND kind=?",
+                (sid, source, kind),
+            )
+            for ancestor in sources(source):
+                db.execute(
+                    "INSERT OR IGNORE INTO pending_request_edges VALUES(?,?,?)",
+                    (sid, ancestor, kind),
+                )

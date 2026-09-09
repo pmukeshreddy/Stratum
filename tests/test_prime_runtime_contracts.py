@@ -249,8 +249,9 @@ async def test_request_graph_spawn_return_retries_usage_and_restart(tmp_path, co
 
 
 class ReviewingProvider:
-    def __init__(self, *, decision=True, planner=None, review_gate=None):
+    def __init__(self, *, decision=True, planner=None, review_gate=None, planner_gate=None):
         self.decision, self.planner, self.review_gate = decision, planner, review_gate
+        self.planner_gate = planner_gate
         self.requests = []
 
     async def invoke(self, request, emit):
@@ -271,6 +272,9 @@ class ReviewingProvider:
                 )
             )
         assert request.metadata["purpose"] == "refinement"
+        if self.planner_gate:
+            self.planner_gate[0].set()
+            await self.planner_gate[1].wait()
         evidence = json.loads(request.messages[-1]["content"])
         return ModelResponse(
             text=encode(
@@ -304,12 +308,13 @@ def seed(runtime, sid):
 async def test_reviewer_gates_planner_with_broad_trajectory_and_audit(
     tmp_path, config, decision, expected
 ):
+    config.refinement.automatic = True
     provider = ReviewingProvider(decision=decision)
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     try:
         root = runtime.create("learn", tmp_path, config=config)
         seed(runtime, root.id)
-        rid = runtime.request_refinement(root.id, source="test")["request_id"]
+        rid = runtime.request_refinement(root.id, source="test", trigger="completion")["request_id"]
         await runtime.auto_refine(root.id)
         result = runtime.store.refinement_request(root.id, rid)
         assert result["status"] == expected
@@ -320,7 +325,7 @@ async def test_reviewer_gates_planner_with_broad_trajectory_and_audit(
         assert {
             "existing_state",
             "previous_refinements",
-            "state_catalog",
+            "state_overview",
             "trigger",
         } <= review.keys()
         if decision is True:
@@ -342,7 +347,7 @@ async def test_reviewer_gates_planner_with_broad_trajectory_and_audit(
 @pytest.mark.parametrize("same_entry", [True, False])
 async def test_host_baseline_conflicts_without_model_expected_version(tmp_path, config, same_entry):
     entered, release = asyncio.Event(), asyncio.Event()
-    provider = ReviewingProvider(review_gate=(entered, release))
+    provider = ReviewingProvider(planner_gate=(entered, release))
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     try:
         root = runtime.create("learn", tmp_path, config=config)
@@ -555,7 +560,7 @@ async def test_planned_refinement_waits_for_owner_and_recovers_without_duplicate
         await eventually(lambda: root.id not in runtime.tasks)
         entries = runtime.store.states(root.id)
         assert len(entries) == 1 and entries[0]["version"] == 1
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 1
         runtime.apply_pending_refinements(root.id)
         assert runtime.store.states(root.id) == entries
     finally:
@@ -655,7 +660,7 @@ runtime.apply_pending_refinements(sys.argv[2])
         )
         assert runtime.store.states(root.id)[0]["version"] == 1
         assert len(runtime.store.events(root.id, kind="refinement")) == 1
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 1
     finally:
         blocker.cancel()
         await runtime.shutdown()
@@ -774,16 +779,21 @@ async def test_shared_coding_child_preserves_original_baseline_after_parent_edit
 
 
 async def test_failed_review_can_be_retried_on_same_evidence_with_fresh_request(tmp_path, config):
+    config.refinement.automatic = True
     provider = ReviewingProvider(decision="error")
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     try:
         root = runtime.create("learn", tmp_path, config=config)
         seed(runtime, root.id)
-        failed = runtime.request_refinement(root.id, source="test")["request_id"]
+        failed = runtime.request_refinement(root.id, source="test", trigger="completion")[
+            "request_id"
+        ]
         await runtime.auto_refine(root.id)
         assert runtime.store.refinement_request(root.id, failed)["status"] == "failed"
         provider.decision = True
-        retry = runtime.request_refinement(root.id, source="retry")["request_id"]
+        retry = runtime.request_refinement(root.id, source="retry", trigger="completion")[
+            "request_id"
+        ]
         await runtime.auto_refine(root.id)
         assert retry != failed
         assert runtime.store.refinement_request(root.id, retry)["status"] == "applied"
@@ -917,9 +927,10 @@ async def test_evaluation_judge_uses_durable_runtime_retry_path(tmp_path, config
     assert judge.requests[0].request_id == judge.requests[1].request_id
     history = Store(next((tmp_path / "judge-state").iterdir()))
     try:
-        graph = history.request_graph(judge.requests[0].session_id)
-        assert len(graph["requests"]) == 1
-        assert len(graph["requests"][0]["attempts"]) == 2
+        assert history.request_graph(judge.requests[0].session_id) == {"requests": [], "edges": []}
+        calls = history.request_history(judge.requests[0].session_id, kind="auxiliary")
+        assert len(calls) == 1
+        assert len(calls[0]["attempts"]) == 2
         assert sum(u.model_calls for u in usages) == 2
         assert sum(u.retries for u in usages) == 1
     finally:

@@ -281,6 +281,7 @@ class EvidenceProvider:
 
     def __init__(self, *, invalid=False, gate=None):
         self.requests, self.invalid, self.gate = [], invalid, gate
+        self.empty = False
 
     async def invoke(self, request, emit):
         assert request.metadata["purpose"] in {"refinement", "refinement_review"}
@@ -296,6 +297,8 @@ class EvidenceProvider:
                 usage=Usage(input_tokens=40, output_tokens=20),
             )
         evidence = json.loads(request.messages[-1]["content"])["evidence"]
+        if self.empty or not evidence:
+            return ModelResponse(text='{"proposals": []}')
         return ModelResponse(
             text=json.dumps(
                 {
@@ -354,7 +357,7 @@ async def test_idle_chat_refine_applies_once_and_recovers_versioned_state(tmp_pa
         await runtime.start()
         result = await settled_request(runtime, sid, rid)
         assert result["status"] == "applied" and result["applied_count"] == 1
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 1
         assert runtime.store.session(sid).turns == 0
         assert not runtime.store.events(sid, kind="environment_prepared")
         entry = runtime.store.state(sid, result["entry_ids"][0])
@@ -373,6 +376,7 @@ async def test_idle_chat_refine_applies_once_and_recovers_versioned_state(tmp_pa
         assert (
             runtime.request_refinement(sid, source="human", request_id=rid)["status"] == "applied"
         )
+        provider.empty = True  # The manual planner decides there is nothing more to apply.
         rid2 = runtime.request_refinement(sid, source="human")["request_id"]
         assert (await settled_request(runtime, sid, rid2))["status"] == "skipped"
         assert len(provider.requests) == 2
@@ -405,7 +409,7 @@ async def test_refine_honest_terminal_outcomes_without_unwanted_turn(tmp_path, p
         result = await settled_request(runtime, sid, rid)
         assert result["status"] == ("skipped" if case in {"empty", "disabled"} else "failed")
         assert result["reason"]
-        assert len(provider.requests) == (1 if case == "invalid" else 0)
+        assert len(provider.requests) == (1 if case in {"invalid", "empty"} else 0)
         assert not runtime.store.states(sid)
         assert not runtime.store.messages(sid, pending=True)
         assert runtime.store.session(sid).turns == 0
@@ -471,7 +475,7 @@ async def test_python_refine_paused_request_survives_restart(tmp_path, python_co
         assert runtime.store.refinement_request(root.id, rid)["status"] == "requested"
         runtime.resume(root.id)
         assert (await settled_request(runtime, root.id, rid))["status"] == "applied"
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 1
     finally:
         await runtime.shutdown()
 
@@ -591,7 +595,7 @@ async def test_new_refinement_request_during_pass_is_not_lost(tmp_path, python_c
         release.set()
         assert (await settled_request(runtime, root.id, rid1))["status"] == "applied"
         assert (await settled_request(runtime, root.id, rid2))["status"] == "applied"
-        assert len(provider.requests) == 4
+        assert len(provider.requests) == 2
         assert len(runtime.store.states(root.id)) == 2
     finally:
         release.set()

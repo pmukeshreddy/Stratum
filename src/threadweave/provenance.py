@@ -11,7 +11,7 @@ class RequestHistory:
         clause = " AND purpose=?" if purpose else ""
         args = (sid, purpose) if purpose else (sid,)
         if trajectory:
-            clause += " AND purpose IN ('agent','compaction')"
+            clause += " AND request_kind='trajectory'"
         row = self.db.execute(
             "SELECT id FROM model_requests WHERE session_id=? AND status='completed'"
             + clause
@@ -27,7 +27,7 @@ class RequestHistory:
             )
 
     def commit_compaction(self, sid, request_id):
-        if self.last_request(sid) != request_id:
+        if self.last_request(sid, trajectory=True) != request_id:
             return
         for edge in self.db.execute(
             "SELECT source,kind FROM pending_request_edges WHERE session_id=?", (sid,)
@@ -48,7 +48,7 @@ class RequestHistory:
 
         sid, purpose = request.session_id, request.metadata.get("purpose", "agent")
         inbound = []
-        if purpose == "agent":
+        if request.request_kind == "trajectory" and purpose == "agent":
             inbound = [
                 dict(r)
                 for r in self.db.execute(
@@ -58,7 +58,11 @@ class RequestHistory:
             parent = self.session(sid).spawned_by_request_id
             if parent and not self.last_request(sid, purpose="agent"):
                 inbound.append({"source": parent, "kind": "subagent_call"})
-        previous = self.last_request(sid)
+        previous = (
+            self.last_request(sid, trajectory=True)
+            if request.request_kind == "trajectory"
+            else None
+        )
         if previous and not any(e["source"] == previous for e in inbound):
             inbound.append({"source": previous, "kind": "continuation"})
         # Hash the immutable provider-shaped body, including private continuation identity.
@@ -70,7 +74,7 @@ class RequestHistory:
         }
         fingerprint = hashlib.sha256(encode(body).encode()).hexdigest()
         self.db.execute(
-            "INSERT INTO model_requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO model_requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 request.request_id,
                 sid,
@@ -84,6 +88,7 @@ class RequestHistory:
                 None,
                 None,
                 encode(inbound),
+                request.request_kind,
             ),
         )
 
@@ -122,13 +127,17 @@ class RequestHistory:
                         (row["session_id"], edge["source"], edge["kind"]),
                     )
 
-    def request_graph(self, sid):
+    def request_history(self, sid, *, kind=None):
+        """All durable model calls, including auxiliary inference and transport attempts."""
         root = self.session(sid).root_id
+        clause = " AND r.request_kind=?" if kind else ""
         requests = [
             dict(r)
             for r in self.db.execute(
-                "SELECT r.* FROM model_requests r JOIN sessions s ON s.id=r.session_id WHERE s.root_id=? ORDER BY r.started_at,r.rowid",
-                (root,),
+                "SELECT r.* FROM model_requests r JOIN sessions s ON s.id=r.session_id WHERE s.root_id=?"
+                + clause
+                + " ORDER BY r.started_at,r.rowid",
+                (root, kind) if kind else (root,),
             )
         ]
         for request in requests:
@@ -143,10 +152,19 @@ class RequestHistory:
             for attempt in request["attempts"]:
                 attempt["usage"] = json.loads(attempt["usage"])
                 attempt["failure"] = json.loads(attempt["failure"]) if attempt["failure"] else None
+        return requests
+
+    def request_graph(self, sid):
+        """The primary agent/compaction trajectory; auxiliary accounting is in request_history."""
+        root = self.session(sid).root_id
+        requests = self.request_history(sid, kind="trajectory")
         edges = [
             dict(r)
             for r in self.db.execute(
-                "SELECT e.* FROM request_edges e JOIN model_requests r ON r.id=e.target JOIN sessions s ON s.id=r.session_id WHERE s.root_id=? ORDER BY r.started_at,e.source,e.kind",
+                "SELECT e.* FROM request_edges e JOIN model_requests r ON r.id=e.target "
+                "JOIN model_requests source ON source.id=e.source JOIN sessions s ON s.id=r.session_id "
+                "WHERE s.root_id=? AND r.request_kind='trajectory' AND source.request_kind='trajectory' "
+                "ORDER BY r.started_at,e.source,e.kind",
                 (root,),
             )
         ]

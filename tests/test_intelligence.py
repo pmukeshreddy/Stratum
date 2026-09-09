@@ -223,7 +223,7 @@ async def test_explicit_refinement_request_runs_at_boundary_without_periodic_pol
 ):
     runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
     runtime.providers["test"] = ScriptedProvider(
-        {"root": [ModelResponse(text='{"shouldRefine": false, "rationale": "No reusable lesson"}')]}
+        {"root": [ModelResponse(text='{"proposals": []}')]}
     )
     try:
         runtime.message(None, session.id, "/refine")
@@ -231,7 +231,7 @@ async def test_explicit_refinement_request_runs_at_boundary_without_periodic_pol
         await runtime.auto_refine(session.id)
         assert runtime.store.usage(session.id).model_calls == 1
         assert (
-            runtime.store.events(session.id, kind="automatic_refinement")[-1]["payload"]["trigger"]
+            runtime.store.events(session.id, kind="manual_refinement")[-1]["payload"]["trigger"]
             == "manual"
         )
     finally:

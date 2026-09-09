@@ -21,6 +21,7 @@ from ..models import (
     new_id,
 )
 from ..providers import default_providers
+from ..refinement import refinement_provider_config
 from ..runtime import Runtime
 from ..tokenization import estimate
 from ..tools import Tool
@@ -38,15 +39,33 @@ class MatchedProvider:
         self.provider, self.config, self.log = provider, config, Path(log)
         self.gate, self.owner = gate, owner
         self.primary_usages = []
+        self.refinement_config = refinement_provider_config(config)
 
-    async def resolve(self, config):
-        resolved, details = await self.provider.resolve(config)
-        if resolved.model_dump() != self.config.model_dump():
+    async def resolve(self, config, *, reasoning_off=False):
+        expected = refinement_provider_config(self.config) if reasoning_off else self.config
+        if config != expected:
+            raise HarnessError(
+                "provider",
+                "evaluation_settings_changed",
+                "Model/settings changed after comparison was pinned",
+            )
+        if reasoning_off:
+            resolved, details = await self.provider.resolve(config, reasoning_off=True)
+            # Only the catalog-selected effort may differ from the host's off request.
+            compared = resolved.model_copy(
+                update={"parameters": {**resolved.parameters, "reasoning_effort": "none"}}
+            )
+        else:
+            resolved, details = await self.provider.resolve(config)
+            compared = resolved
+        if compared != expected:
             raise HarnessError(
                 "provider",
                 "evaluation_settings_changed",
                 "Subscription model/settings changed after comparison was pinned",
             )
+        if reasoning_off:
+            self.refinement_config = resolved
         return resolved, details
 
     async def invoke(self, request, emit):
@@ -63,7 +82,13 @@ class MatchedProvider:
             return result
 
     async def _invoke(self, request, emit):
-        if request.config.model_dump() != self.config.model_dump():
+        structured = (
+            request.request_kind == "auxiliary"
+            and request.reasoning_mode == "off"
+            and request.metadata.get("purpose") in {"refinement", "refinement_review"}
+        )
+        expected = self.refinement_config if structured else self.config
+        if request.config != expected:
             raise HarnessError(
                 "provider",
                 "evaluation_settings_changed",
@@ -146,6 +171,7 @@ async def invoke_judge(config, request, directory, usages):
         response, _ = await runtime._model_call(
             session.id,
             ModelRequest(
+                request_kind="auxiliary",
                 session_id=session.id,
                 root_id=session.root_id,
                 parent_id=None,
@@ -181,7 +207,7 @@ async def invoke_judge(config, request, directory, usages):
         raise
     finally:
         if session:
-            for logical in runtime.store.request_graph(session.id)["requests"]:
+            for logical in runtime.store.request_history(session.id):
                 usages.extend(
                     Usage.model_validate(attempt["usage"]) for attempt in logical["attempts"]
                 )

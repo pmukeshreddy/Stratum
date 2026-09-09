@@ -1488,8 +1488,14 @@ class Runtime(MemoryServices):
         size, provider = request.input_token_bound, request.config
         if provider.name == "codex_subscription":
             previous = provider
-            provider, _ = await self.providers[provider.name].resolve(provider)
-            self.store.pin_provider(sid, previous, provider)
+            resolver = self.providers[provider.name]
+            provider, _ = (
+                await resolver.resolve(provider, reasoning_off=True)
+                if request.reasoning_mode == "off"
+                else await resolver.resolve(provider)
+            )
+            if request.request_kind == "trajectory":
+                self.store.pin_provider(sid, previous, provider)
             request = request.model_copy(update={"config": provider})
             self.store.event(
                 sid,

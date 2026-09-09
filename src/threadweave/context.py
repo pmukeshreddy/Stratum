@@ -327,7 +327,15 @@ class Context:
             provider = config.models[alias] if alias else config.provider
         return request_estimate(self.store, sid, messages, tools, provider)
 
-    def compact(self, sid: str, *, count: int | None = None, summary=None, provenance=None):
+    def compact(
+        self,
+        sid: str,
+        *,
+        count: int | None = None,
+        summary=None,
+        provenance=None,
+        review_checkpoint=True,
+    ):
         with self.store.transaction():
             session, policy = self.store.session(sid), self.store.config(sid).context
             if not session.context:
@@ -409,6 +417,20 @@ class Context:
                 ).fetchone()
                 if request:
                     self.store.commit_compaction(sid, request[0])
+            config = self.store.config(sid)
+            if (
+                review_checkpoint
+                and config.refinement.enabled
+                and config.refinement.automatic
+                and config.features.automatic_refinement
+            ):
+                self.store.enqueue_refinement_request(
+                    sid,
+                    source="compaction",
+                    source_event=eid,
+                    request_id=f"compaction-{eid}",
+                    trigger="compaction",
+                )
             return eid
 
     def assemble(self, sid: str, tools: list[dict], *, input_budget=None) -> tuple[list[dict], int]:

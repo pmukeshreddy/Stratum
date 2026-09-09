@@ -69,7 +69,7 @@ class SubscriptionProvider:
         # upgrade must not redirect a running daemon to a not-yet-built fingerprint.
         self.executable = executable or client_path()
 
-    async def resolve(self, config):
+    async def resolve(self, config, *, reasoning_off=False):
         async with self.control_factory() as control:
             status = await control.status()
             if not status["logged_in"]:
@@ -102,10 +102,23 @@ class SubscriptionProvider:
                 "UNSUPPORTED_PARAMETER",
                 "Subscription parameters supported: reasoning_effort, reasoning_summary, verbosity, parallel_tool_calls",
             )
+        supported = {item["reasoningEffort"] for item in catalog["supportedReasoningEfforts"]}
+        if reasoning_off:
+            # Catalogs for reasoning-only models may have no off setting. Use the
+            # least supported effort, never the interactive session's default.
+            parameters["reasoning_effort"] = next(
+                (
+                    level
+                    for level in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+                    if level in supported
+                ),
+                "none",
+            )
+            parameters.pop("reasoning_summary", None)
         effort = parameters.setdefault(
             "reasoning_effort", settings["reasoning_effort"] or catalog["defaultReasoningEffort"]
         )
-        if effort not in {item["reasoningEffort"] for item in catalog["supportedReasoningEfforts"]}:
+        if effort not in supported:
             raise HarnessError(
                 "provider",
                 "UNSUPPORTED_REASONING",

@@ -1,5 +1,7 @@
 # Runtime and refinement source review
 
+This is the initial-pass audit. The [focused second-pass audit](prime-refinement-second-pass.md) supersedes its conclusions about manual refinement, compaction review checkpoints, auxiliary graph membership, and refinement state visibility.
+
 This review compares executable paths, not README descriptions. The reference is the September 7, 2026 source in `prime-agent-main (1).zip` (SHA-256 `18edd31aa8bf1bb2765953328c4cffbab56fa56f2783027b2ee80d5d30fc2a86`), extracted at `/tmp/buffalo-prime-reference/prime-agent-main`.
 
 | Area | Classification | Executable basis |
