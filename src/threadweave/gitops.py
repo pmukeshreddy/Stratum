@@ -187,7 +187,9 @@ class GitWorkspace:
             body["patch_artifact"] = self.artifacts.put_bytes(
                 self.context.session_id, patch.encode(), "text/x-diff"
             )
-            self.context.runtime.index(self.context.session_id).refresh(changed)
+            self.context.runtime.environment.capability(self.context.session_id, "coding").index(
+                self.context.session_id
+            ).refresh(changed)
         self.store.event(
             self.context.session_id, "workspace_effects", body, parent=self.context.source_event
         )

@@ -7,6 +7,7 @@ from collections import deque
 import pytest
 
 from threadweave.chat import Chat, chat_config
+from threadweave.coding_config import update_coding_options
 from threadweave.context import FOUNDATION
 from threadweave.daemon import Daemon
 from threadweave.guardrails import observe
@@ -77,8 +78,11 @@ async def test_explicit_coding_greeting_does_not_run_baseline(runtime, repositor
 
 
 async def test_environment_tools_without_coding_task(runtime, repository, config):
+    config.capabilities = ["coding"]
     config.permissions.append("process")
-    config.task.test_commands = [[sys.executable, "-m", "unittest", "discover", "-s", "tests"]]
+    update_coding_options(
+        config.task, test_commands=[[sys.executable, "-m", "unittest", "discover", "-s", "tests"]]
+    )
     runtime.providers["mock"] = ScriptedProvider(
         {
             "root": [

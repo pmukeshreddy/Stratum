@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from threadweave.coding import CodingTask
+from threadweave.coding_config import update_coding_options
 from threadweave.editing import Editor
 from threadweave.gitops import candidate_result
 from threadweave.models import Action, HarnessError, McpServerConfig, Outcome, RunConfig, new_id
@@ -21,8 +22,8 @@ from .fakes import ScriptedProvider
 @pytest.fixture
 async def coding_python(tmp_path, repository, coding_config):
     coding_config.control_plane = "python"
-    coding_config.task.capture_baseline = False
-    coding_config.task.require_clean_baseline = False
+    update_coding_options(coding_config.task, capture_baseline=False)
+    update_coding_options(coding_config.task, require_clean_baseline=False)
     coding_config.permissions.append("mcp")
     coding_config.mcp_servers = {
         "fixture": McpServerConfig(
@@ -113,7 +114,7 @@ async def test_no_net_change_is_not_reported_as_mutation(coding_python, code):
     assert not (await cell(runtime, session, code)).get("error")
     assert not effects(runtime, session.id)
     if code == "x = 123":
-        assert runtime.environment.mutations.stats["hashed_bytes"] == 0
+        assert runtime.environment.adapters["coding"].mutations.stats["hashed_bytes"] == 0
 
 
 async def test_dirty_state_is_compared_to_cell_start_not_git_head(coding_python, repository):
@@ -175,7 +176,7 @@ full = await tools.acall('workspace_read', path='mathops.py')
         runtime.store.events(session.id, kind="environment_action_finished", limit=100)
     ) == len(before)
     assert len(runtime.store.events(session.id, kind="code_edit")) == 1
-    assert not runtime.environment.mutations.active
+    assert not runtime.environment.adapters["coding"].mutations.active
 
 
 @pytest.mark.parametrize("from_python", [False, True])
@@ -296,12 +297,12 @@ async def test_interrupted_cell_retains_partial_mutation_evidence(
         assert (await task).get("error")
     assert (repository / "partial").read_text() == "before interruption"
     assert effects(runtime, session.id)[-1]["files"]["partial"]
-    assert not runtime.environment.mutations.active
+    assert not runtime.environment.adapters["coding"].mutations.active
 
 
 async def test_recovery_observes_open_window_without_replaying_python(coding_python, repository):
     runtime, session, context = coding_python
-    observer = runtime.environment.mutations
+    observer = runtime.environment.adapters["coding"].mutations
     wid = observer.begin(context)
     (repository / "after-crash").write_bytes(b"partial")
     # Persisted open window simulates daemon loss before its after hook.
@@ -344,7 +345,7 @@ async def test_cached_large_files_are_not_rehashed_for_noop_or_small_edit(
     large = repository / "large.bin"
     with large.open("wb") as stream:
         stream.truncate(70 * 1024 * 1024)  # Observer hashes streaming; no 64MB snapshot limit.
-    observer = runtime.environment.mutations
+    observer = runtime.environment.adapters["coding"].mutations
     observer.reconcile(context, reason="test_setup")
     assert observer.stats["hashed_bytes"] >= 70 * 1024 * 1024
     await cell(runtime, session, "x=1")
@@ -442,7 +443,10 @@ async def test_failed_observation_recovers_without_hiding_partial_write(
     coding_python, monkeypatch, repository
 ):
     runtime, session, _ = coding_python
-    observer, original = runtime.environment.mutations, runtime.environment.mutations.report
+    observer, original = (
+        runtime.environment.adapters["coding"].mutations,
+        runtime.environment.adapters["coding"].mutations.report,
+    )
 
     def fail(context, before, after, **kwargs):
         if kwargs.get("reason") == "action":
@@ -463,8 +467,8 @@ async def test_actual_daemon_process_loss_recovers_mutation(tmp_path, repository
     import json
 
     coding_config.control_plane = "python"
-    coding_config.task.capture_baseline = False
-    coding_config.task.require_clean_baseline = False
+    update_coding_options(coding_config.task, capture_baseline=False)
+    update_coding_options(coding_config.task, require_clean_baseline=False)
     data = tmp_path / "crashed-state"
     script = f"""
 import asyncio, os

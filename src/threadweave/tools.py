@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import shutil
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +9,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .artifacts import atomic_write
 from .models import HarnessError, Record, StateEdit
 
 
@@ -34,7 +32,7 @@ class ToolContext:
         )
 
     def path(self, path: str) -> Path:
-        from .repository import confined
+        from .workspace import confined
 
         config = self.runtime.store.config(self.session_id)
         resolved = confined(
@@ -49,6 +47,13 @@ class ToolContext:
             raise PermissionError(
                 "Runtime storage is private; retrieve evidence through artifact/history tools"
             )
+        self.runtime.environment.call(
+            self.session_id,
+            "validate_path",
+            Path(self.session.workspace.path).resolve(),
+            Path(self.session.workspace.path).resolve() / path,
+            resolved,
+        )
         return resolved
 
 
@@ -62,6 +67,9 @@ class Tool:
     python_callable: bool = True
     feature: str | None = None
     model_callable: bool = True
+    capability: str | None = None
+    available: Callable | None = None
+    host_rpc: bool = False
 
     def schema(self):
         def compact(value):
@@ -100,6 +108,8 @@ class ToolRegistry:
         name = tool.name
         return (
             tool
+            and (not tool.capability or tool.capability in config.effective_capabilities)
+            and (not tool.available or tool.available(config))
             and (
                 config.active_tool_names is None
                 or name not in self.entries  # Host RPCs inherit the admitted envelope's scope.
@@ -114,12 +124,6 @@ class ToolRegistry:
                 and "python" in config.tool_allowlist
             )
             and (not tool.feature or getattr(config.features, tool.feature))
-            and (
-                name != "run_profile"
-                or config.task.profiler_command
-                or shutil.which("ncu")
-                or shutil.which("nsys")
-            )
             and (name not in {"agent_spawn", "rlm"} or config.features.subagents)
             and (
                 name not in {"history_read", "history_get", "history_search", "artifact_search"}
@@ -154,7 +158,7 @@ class ToolRegistry:
         if name == "host_request":
             from .host_api import resolve_capability
 
-            tool = resolve_capability(validated)
+            tool = resolve_capability(validated, self)
             # The envelope never grants the permissions of its contained operation.
             # An explicit host_request allowlist entry permits RPC discovery, not
             # bypassing permission/read-only checks on its resolved capability.
@@ -325,13 +329,7 @@ def builtins() -> ToolRegistry:
         }
 
     async def write(c, a):
-        if c.runtime.store.config(c.session_id).task.adapter == "coding":
-            from .editing import Editor
-
-            return Editor(c).apply({a.path: a.content.encode()})
-        path = c.path(a.path)
-        atomic_write(path, a.content.encode())
-        return {"path": str(path), "bytes": len(a.content.encode())}
+        return c.runtime.environment.write(c, a.path, a.content.encode())
 
     async def listing(c, a):
         return [
@@ -603,7 +601,7 @@ def builtins() -> ToolRegistry:
         ScheduleArgs,
         schedule,
     )
-    from .coding_tools import register
+    from .generic_tools import register
 
     register(registry)
     from .host_api import register as register_programmatic

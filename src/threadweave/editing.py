@@ -224,7 +224,9 @@ class Editor:
                 {"edit_id": eid, **body},
                 parent=self.context.source_event,
             )
-        self.context.runtime.index(self.context.session_id).refresh(changes)
+        self.context.runtime.environment.capability(self.context.session_id, "coding").index(
+            self.context.session_id
+        ).refresh(changes)
         return {"edit_id": eid, **body}
 
     def _restore(self, files, *, expected):

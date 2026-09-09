@@ -225,15 +225,17 @@ async def run_buffalo(
     gate=None,
     owner=None,
     controller=None,
+    task_config=None,
+    workspace=None,
 ):
     directory = Path(directory)
-    workspace = directory / "workspace"
+    workspace = Path(workspace) if workspace is not None else directory / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     resolved = config.model_copy(deep=True)
     resolved.control_plane = "python"
     instruction = (
         task["messages"][-1]["content"]
-        if long_context or controller
+        if long_context or controller or task_config is not None
         else "Complete the supplied official task and return its requested final answer."
     )
     resolved.task = TaskConfig(
@@ -241,6 +243,9 @@ async def run_buffalo(
         wait_for_children=True,
         instruction_messages=[] if long_context or controller else task["messages"],
     )
+    if task_config is not None:
+        resolved.task = task_config.model_copy(deep=True)
+        resolved.task.instruction_messages = task["messages"][:-1]
     if controller:
         resolved.task.adapter = "interactive_evaluation"
         resolved.task.verifier = "terminal"

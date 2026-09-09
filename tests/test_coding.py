@@ -8,13 +8,14 @@ import pytest
 
 from threadweave.benchmarks import compare, run_benchmark, summarize
 from threadweave.coding import CodingTask, baseline, run_checks
+from threadweave.coding_config import BenchmarkConfig
 from threadweave.diagnostics import localize
 from threadweave.editing import Editor, recover_edits, unified_changes
 from threadweave.execution import LocalExecutor, environment
 from threadweave.experiments import Experiments
 from threadweave.gitops import GitWorkspace, candidate_result, git
 from threadweave.guardrails import observe
-from threadweave.models import BenchmarkConfig, new_id
+from threadweave.models import new_id
 from threadweave.refinement import validate_skill
 from threadweave.repository import RepositoryIndex, confined, symbols
 from threadweave.retrieval import search
@@ -295,7 +296,11 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
         assert runtime.store.events(root.id, kind="context_compaction")
         assert runtime.store.events(root.id, kind="verifier_result")[-1]["payload"]["passed"]
         assert search(runtime.store, root.id, "arithmetic")
-        assert runtime.index(root.id).symbol_search("add")["matches"]
+        assert (
+            runtime.environment.capability(root.id, "coding")
+            .index(root.id)
+            .symbol_search("add")["matches"]
+        )
         assert runtime.store.messages(root.id)[-1]["received_at"]
         assert provider.peak_active >= 2
         assert "return a + b" in (repository / "mathops.py").read_text()

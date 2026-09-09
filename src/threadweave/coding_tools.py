@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 
 from pydantic import Field
 
 from .coding import baseline, run_checks, run_command
+from .coding_config import BenchmarkConfig, coding_options
 from .diagnostics import localize
 from .editing import Editor
 from .experiments import Experiments
 from .gitops import GitWorkspace, candidate_result, git, revision
-from .models import BenchmarkConfig, Record
-from .retrieval import search
+from .models import Record
 from .tools import Empty, PathArgs, Tool
 
 
@@ -142,6 +141,10 @@ class ProfileArgs(Record):
 
 
 def register(registry):
+    from .coding_host import register as register_host
+
+    register_host(registry)
+
     def add(
         name,
         description,
@@ -161,32 +164,68 @@ def register(registry):
                 permissions,
                 feature=feature,
                 model_callable=model_callable,
+                capability="coding",
+                available=(
+                    lambda config: (
+                        coding_options(config.task).profiler_command
+                        or shutil.which("ncu")
+                        or shutil.which("nsys")
+                    )
+                )
+                if name == "run_profile"
+                else None,
             )
         )
 
     async def repo_map(c, a):
-        return c.runtime.index(c.session_id).repo_map()
+        return (
+            c.runtime.environment.capability(c.session_id, "coding").index(c.session_id).repo_map()
+        )
 
     async def repo_search(c, a):
-        result = c.runtime.index(c.session_id).search(**a.model_dump())
+        result = (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .search(**a.model_dump())
+        )
         if (full := result.pop("all_matches", None)) is not None:
             result["full_results_artifact"] = c.runtime.artifacts.put(c.session_id, full)
         return result
 
     async def symbols(c, a):
-        return c.runtime.index(c.session_id).symbol_search(**a.model_dump())
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .symbol_search(**a.model_dump())
+        )
 
     async def references(c, a):
-        return c.runtime.index(c.session_id).references(a.query, limit=a.limit)
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .references(a.query, limit=a.limit)
+        )
 
     async def outline(c, a):
-        return c.runtime.index(c.session_id).outline(a.path)
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .outline(a.path)
+        )
 
     async def dependencies(c, a):
-        return c.runtime.index(c.session_id).dependencies(a.path)
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .dependencies(a.path)
+        )
 
     async def resolve(c, a):
-        return c.runtime.index(c.session_id).resolve(**a.model_dump())
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .resolve(**a.model_dump())
+        )
 
     async def semantic(c, a):
         from .lsp import query
@@ -246,7 +285,9 @@ def register(registry):
     ):
 
         async def query(c, a, method=method):
-            return getattr(c.runtime.index(c.session_id), method)(a.query, limit=a.limit)
+            return getattr(
+                c.runtime.environment.capability(c.session_id, "coding").index(c.session_id), method
+            )(a.query, limit=a.limit)
 
         add(
             "repo_" + method,
@@ -257,10 +298,18 @@ def register(registry):
         )
 
     async def dependents(c, a):
-        return c.runtime.index(c.session_id).dependents(a.path)
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .dependents(a.path)
+        )
 
     async def changed_symbols(c, a):
-        return c.runtime.index(c.session_id).changed_symbols()
+        return (
+            c.runtime.environment.capability(c.session_id, "coding")
+            .index(c.session_id)
+            .changed_symbols()
+        )
 
     add("repo_dependents", "Likely importing files, with evidence quality.", PathArgs, dependents)
     add("repo_changed_symbols", "Definitions in recently indexed changes.", Empty, changed_symbols)
@@ -375,23 +424,10 @@ def register(registry):
     async def failure(c, a):
         return localize(c, c.runtime.artifacts.load(c.session_id, a.artifact_id))
 
-    async def history(c, a):
-        result = search(c.runtime.store, c.session_id, **a.model_dump())
-        c.runtime.store.event(
-            c.session_id,
-            "history_retrieval",
-            {"query": a.query, "matches": [r["id"] for r in result]},
-            parent=c.source_event,
-        )
-        return result
-
-    async def artifacts(c, a):
-        return search(c.runtime.store, c.session_id, a.query, kind="artifact", limit=a.limit)
-
     async def benchmark(c, a):
         from .benchmarks import run_benchmark
 
-        config = c.runtime.store.config(c.session_id).task.benchmark
+        config = coding_options(c.runtime.store.config(c.session_id).task).benchmark
         if not config:
             raise ValueError("Configure task.benchmark to run measured benchmarks")
         reference = (
@@ -422,13 +458,6 @@ def register(registry):
     async def accept(c, a):
         return candidate_result(c, a.child_id, accept=True)
 
-    async def skill_search(c, a):
-        return [
-            {k: e[k] for k in ("id", "title", "version", "content")}
-            for e in c.runtime.store.states(c.session_id)
-            if e["kind"] == "skill" and a.query.lower() in json.dumps(e).lower()
-        ][: a.limit]
-
     async def capabilities(c, a):
         return {
             name: shutil.which(name)
@@ -436,7 +465,7 @@ def register(registry):
         }
 
     async def profile(c, a):
-        task = c.runtime.store.config(c.session_id).task
+        task = coding_options(c.runtime.store.config(c.session_id).task)
         if a.profiler == "configured":
             if not task.profiler_command:
                 raise ValueError("Configure task.profiler_command or select an installed ncu/nsys")
@@ -455,17 +484,6 @@ def register(registry):
         )
         c.runtime.store.event(c.session_id, "profile_result", result, parent=c.source_event)
         return result
-
-    async def import_artifact(c, a):
-        path = c.path(a.path)
-        with path.open("rb") as stream:
-            aid = c.runtime.artifacts.put_stream(
-                c.session_id,
-                stream,
-                source_event=c.source_event,
-                media_type="application/octet-stream",
-            )
-        return c.runtime.artifacts.metadata(c.session_id, aid)
 
     for name, desc, args, handler in [
         (
@@ -573,28 +591,7 @@ def register(registry):
         profile,
         ("process",),
     )
-    add(
-        "artifact_import",
-        "Retain an exact workspace file or binary profiler report as an artifact.",
-        PathArgs,
-        import_artifact,
-    )
-    add(
-        "history_search",
-        "Search durable trajectory events and observations with FTS.",
-        HistorySearchArgs,
-        history,
-        (),
-        feature="history_retrieval",
-    )
-    add(
-        "artifact_search",
-        "Search indexed artifact excerpts in this trajectory.",
-        QueryArgs,
-        artifacts,
-        (),
-        feature="history_retrieval",
-    )
+
     for name, args, handler in [
         ("experiment_create", ExperimentCreateArgs, experiment_create),
         ("experiment_run", ExperimentRunArgs, experiment_run),
@@ -623,11 +620,4 @@ def register(registry):
         CandidateArgs,
         accept,
         ("agents", "workspace.write"),
-    )
-    add(
-        "skill_search",
-        "Search validated reusable procedures.",
-        QueryArgs,
-        skill_search,
-        ("state",),
     )

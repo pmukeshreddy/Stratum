@@ -86,11 +86,11 @@ class Runtime(MemoryServices):
             self.store.close()
             raise RuntimeError("A runtime already owns this data directory") from exc
         self.artifacts = Artifacts(self.store)
-        self.context = Context(self.store, index_provider=self.index)
+        self.context = Context(self.store, environment=lambda: self.environment)
         self.providers = providers if providers is not None else default_providers()
+        self.tools = tools if tools is not None else builtins()
         self.environment = Environment(self, adapters)
         self.adapters = self.environment.adapters  # Extension registration remains compatible.
-        self.tools = tools if tools is not None else builtins()
         self.concurrency, self.idle_seconds = concurrency, idle_seconds
         self.kernels: dict[str, Kernel] = {}
         self.tasks: dict[str, asyncio.Task] = {}
@@ -114,6 +114,7 @@ class Runtime(MemoryServices):
     def validate_config(self, config):
         RunConfig.model_validate(config.model_dump())
         self.load_extensions(config)
+        self.environment.configure(config, defaults=False)
         providers = list(config.models.values()) + (
             [config.provider] if not config.routing.default else []
         )
@@ -154,6 +155,7 @@ class Runtime(MemoryServices):
     ):
         config = config or RunConfig()
         config = config.model_copy(deep=True)
+        self.load_extensions(config)
         self.environment.configure(config)
         self.validate_config(config)
         path = Path(workspace).resolve()
@@ -165,7 +167,7 @@ class Runtime(MemoryServices):
             session = self.store.create(
                 instruction, Workspace(path=str(path)), config, name=name, mode=mode
             )
-            self.load_repository_instructions(session.id)
+            self.load_adapter_context(session.id)
             session = self.store.session(session.id)
             self.store.event(
                 session.id,
@@ -218,52 +220,23 @@ class Runtime(MemoryServices):
         config.active_tool_names = [
             name for name in self.tools.entries if self.tools.allowed(name, config)
         ]
-        if purpose not in {
-            None,
-            "research",
-            "review",
-            "shared",
-            "candidate",
-            "test",
-            "performance",
-        }:
-            raise ValueError(
-                "Child purpose must be research, review, shared, candidate, test, or performance"
-            )
-        if purpose in {"candidate", "test", "performance"} and isolate is False:
-            raise ValueError(
-                "Candidate, test, and performance children require isolated workspaces"
-            )
-        if purpose and isolate is None:
-            isolate = purpose in {"candidate", "test", "performance"}
-        if purpose in {"research", "review"}:
+        if adapter is not None and adapter != config.task.adapter:
+            config.task.adapter = adapter
+            config.task.verifier = "none"
+            config.task.require_verifier = False
+            config.active_tool_names = None
+            self.environment.configure(config)
+        profile, isolate = self.environment.child_policy(config, purpose, isolate)
+        if profile.read_only:
             config.execution.read_only = True
             from .isolation import readonly_worker
 
-            readonly_worker(self.store.directory)  # Check support before admitting the child.
-            instruction += "\nRead-only investigation. Return findings with source locations, evidence and remaining uncertainty; do not implement changes."
-        if purpose in {"candidate", "test", "performance"}:
-            config.task.adapter = "coding"
-            self.environment.configure(config)
-        if adapter is not None:
-            if (
-                adapter != "coding"
-                and config.task.adapter == "coding"
-                and config.task.verifier == "coding"
-            ):
-                config.task.verifier = "none"
-                config.task.require_verifier = False
-            config.task.adapter = adapter
-            self.environment.configure(config)
-        if purpose in {"research", "review"}:
-            # Investigation retains coding tools but does not launch writable
-            # baseline/test processes or assert that a code patch was completed.
-            config.task.verifier = "none"
-            config.task.require_verifier = False
-            config.task.capture_baseline = False
-            config.task.require_tests = False
-            config.task.require_clean_baseline = False
-            config.task.require_change = False
+            readonly_worker(self.store.directory)
+            instruction += "\nRead-only investigation. Return findings, evidence and remaining uncertainty; do not make changes."
+        if profile.instruction:
+            instruction += "\n" + profile.instruction
+        if profile.configure:
+            profile.configure(config)
         # Snapshot the parent's effective agent route, including a role-based model.
         effective = route(self.store, parent_id, parent.role).model_copy(deep=True)
         if provider is not None:
@@ -284,24 +257,22 @@ class Runtime(MemoryServices):
         config.routing.default = None
         config.routing.roles.pop(role, None)
         self.validate_config(config)
-        if isolate is None:
-            isolate = config.control_plane == "direct" and config.task.adapter == "coding"
         if _defer_workspace:
             workspace, checkpoint = parent.workspace.model_copy(deep=True), None
-            workspace.metadata["candidate_pending"] = True
+            workspace.metadata["admission_pending"] = True
         else:
             workspace, checkpoint = self.environment.continuation_workspace(
                 parent, config, child=True, isolate=isolate
             )
-        focus = self.store.events(parent_id, kind="working_focus", limit=1)
         evidence = self.store.events(parent_id, kind="verifier_result", limit=1)
         package = {
             "parent_objective": parent.instruction[:1500],
             "assignment": instruction,
-            "focus": focus[0]["payload"] if focus else None,
             "verifier_event": evidence[0]["id"] if evidence else None,
-            "test_commands": config.task.test_commands,
-            "result_contract": "Report source locations, findings, executed test evidence, uncertainty; candidate patches require explicit parent acceptance.",
+            "result_contract": "Return findings, supporting evidence and remaining uncertainty.",
+            **getattr(
+                self.environment.adapters[config.task.adapter], "delegation", lambda *args: {}
+            )(parent, config),
         }
         if config.control_plane == "python":
             instruction += "\nDelegation context: " + encode(package)
@@ -321,8 +292,8 @@ class Runtime(MemoryServices):
             mode="autonomous" if config.control_plane == "python" else "goal",
         )
         if not isolate:
-            self.environment.inherit_shared_admission(parent, session)
-        self.load_repository_instructions(session.id)
+            self.environment.call(session.id, "inherit_shared_admission", parent, session)
+        self.load_adapter_context(session.id)
         self.store.event(
             session.id,
             "task_admitted",
@@ -332,7 +303,7 @@ class Runtime(MemoryServices):
             session.id,
             "child_purpose",
             {
-                "purpose": purpose or ("candidate" if isolate else "shared"),
+                "purpose": purpose or "shared",
                 "workspace_mode": "isolated" if isolate else "shared",
                 "base": workspace.metadata.get("base_revision"),
                 "parent": parent_id,
@@ -340,23 +311,7 @@ class Runtime(MemoryServices):
                 "kernel_write_policy": "os_read_only" if config.execution.read_only else "writable",
             },
         )
-        if checkpoint:
-            self.store.db.execute(
-                "INSERT INTO candidates VALUES(?,?,?,?)",
-                (
-                    session.id,
-                    parent_id,
-                    checkpoint,
-                    encode(
-                        {
-                            "instruction": instruction,
-                            "start_time": session.created_at,
-                            "consumed": False,
-                            "accepted": False,
-                        }
-                    ),
-                ),
-            )
+        self.environment.call(session.id, "child_admitted", parent, session, checkpoint)
         self.store.update(session.id, role=role)
         if _defer_workspace:
             self.store.update(session.id, paused=True, runnable=False)
@@ -371,52 +326,37 @@ class Runtime(MemoryServices):
         shared between threads. Cancellation waits for the owned preparation to
         settle, preventing an untracked checkout from appearing after shutdown.
         """
-        purpose = options.get("purpose")
-        isolate = options.get("isolate")
-        if isolate is None:
-            parent_config = self.store.config(parent_id)
-            isolate = (
-                purpose in {"candidate", "test", "performance"}
-                if purpose
-                else parent_config.control_plane == "direct"
-                and parent_config.task.adapter == "coding"
-            )
+        parent_config = self.store.config(parent_id).model_copy(deep=True)
+        if options.get("adapter"):
+            parent_config.task.adapter = options["adapter"]
+        _, isolate = self.environment.child_policy(
+            parent_config, options.get("purpose"), options.get("isolate")
+        )
         if not isolate:
             return self.spawn(parent_id, instruction, **options)
         child = self.spawn(parent_id, instruction, _defer_workspace=True, **options)
         job = asyncio.create_task(
-            asyncio.to_thread(self.environment.candidate_workspace, parent_id, child.id)
+            asyncio.to_thread(self.environment.isolated_child_workspace, parent_id, child.id)
         )
         try:
             workspace, checkpoint = await asyncio.shield(job)
             self._check_limits(parent_id)
             if self.store.session(child.id).outcome != Outcome.ACTIVE:
-                raise ValueError("Candidate was stopped during admission")
+                raise ValueError("Child was stopped during admission")
             config = self.store.config(child.id).model_copy(deep=True)
-            config.task.repository = workspace.path
-            config.task.base_commit = None
-            config.task.require_change = False
+            self.environment.call(child.id, "workspace_admitted", config, workspace, child=True)
             self.store.reconfigure(child.id, config)
             self.store.update(child.id, workspace=workspace, paused=False, runnable=True)
-            self.store.db.execute(
-                "INSERT INTO candidates VALUES(?,?,?,?)",
-                (
-                    child.id,
-                    parent_id,
-                    checkpoint,
-                    encode(
-                        {
-                            "instruction": instruction,
-                            "start_time": child.created_at,
-                            "accepted": False,
-                            "consumed": False,
-                        }
-                    ),
-                ),
+            self.environment.call(
+                child.id,
+                "child_admitted",
+                self.store.session(parent_id),
+                self.store.session(child.id),
+                checkpoint,
             )
             self.store.event(
                 child.id,
-                "candidate_ready",
+                "workspace_ready",
                 {"workspace": workspace.model_dump(), "checkpoint": checkpoint},
             )
             self._wake.set()
@@ -428,7 +368,7 @@ class Runtime(MemoryServices):
                 self.store.update(child.id, outcome=Outcome.FAILED, paused=True, runnable=False)
             self.store.event(
                 child.id,
-                "candidate_admission_failed",
+                "workspace_admission_failed",
                 {
                     "workspace_retained": str(result[0][0].path)
                     if result and isinstance(result[0], tuple)
@@ -853,6 +793,15 @@ class Runtime(MemoryServices):
         self._scheduler_task = asyncio.create_task(self._scheduler(), name="session-scheduler")
 
     async def recover(self):
+        for session in self.store.sessions():
+            config = self.store.config(session.id)
+            try:
+                self.validate_config(config)
+                if config != self.store.config(session.id):
+                    self.store.reconfigure(session.id, config)
+            except Exception as exc:
+                self.store.update(session.id, runnable=False)
+                self.store.event(session.id, "configuration_recovery_failed", {"reason": str(exc)})
         await self.environment.recover()
         if (
             not hasattr(self, "background")
@@ -928,7 +877,10 @@ class Runtime(MemoryServices):
             if session.lifecycle != Lifecycle.INACTIVE:
                 self.store.transition(session.id, Lifecycle.INACTIVE)
             try:
-                self.validate_config(self.store.config(session.id))
+                config = self.store.config(session.id)
+                self.validate_config(config)
+                if config != self.store.config(session.id):
+                    self.store.reconfigure(session.id, config)
             except Exception as exc:
                 failure = HarnessError("environment", "extension_unavailable", str(exc)).failure
                 self.store.update(session.id, last_error=failure, runnable=False)
@@ -993,7 +945,7 @@ class Runtime(MemoryServices):
             self._wake.clear()
             try:
                 self._schedules_due()
-                self.environment.mutations.poll()
+                self.environment.poll()
                 for root in self.store.sessions(roots_only=True):
                     if root.started_at and (
                         root.outcome == Outcome.ACTIVE or self._active_descendants(root.id)
@@ -1341,51 +1293,16 @@ class Runtime(MemoryServices):
             if self.store.session(sid).outcome != Outcome.ACTIVE or self._closing:
                 await self._close_kernel(sid)
                 self.store.transition(sid, Lifecycle.INACTIVE)
-                self._candidate_accounting(sid)
+                self._adapter_completed(sid)
 
-    def _candidate_accounting(self, sid):
-        row = self.store.db.execute(
-            "SELECT body FROM candidates WHERE child_id=?", (sid,)
-        ).fetchone()
-        if not row:
-            return
-        session = self.store.session(sid)
-        body = json.loads(row[0])
-        body.update(
-            end_time=session.updated_at if session.outcome != Outcome.ACTIVE else None,
-            usage=self.store.usage(sid).model_dump(),
-            outcome=session.outcome,
-            tools_used=sorted(
-                {e["payload"]["name"] for e in self.store.events(sid, kind="tool_call", limit=500)}
-            ),
-            verifier=[
-                e["payload"] for e in self.store.events(sid, kind="verifier_result", limit=1)
-            ],
-        )
-        try:
-            from .gitops import GitWorkspace
-
-            patch = GitWorkspace(ToolContext(self, sid, new_id(), "candidate-accounting")).diff()
-            body["patch_artifact"] = self.artifacts.put_bytes(sid, patch.encode(), "text/x-diff")
-            body["patch_produced"] = bool(patch)
-        except (ValueError, OSError) as exc:
-            body["patch_error"] = str(exc)
-        self.store.db.execute("UPDATE candidates SET body=? WHERE child_id=?", (encode(body), sid))
+    def _adapter_completed(self, sid):
+        self.environment.call(sid, "completed", sid)
 
     async def _prepare(self, sid):
         await self.environment.prepare(sid)
 
-    def load_repository_instructions(self, sid):
-        from .repository_instructions import discover_instructions
-
-        files = discover_instructions(Path(self.store.session(sid).workspace.path))
-        self.store.update(sid, repository_instructions=files)
-        if files:
-            self.store.event(
-                sid,
-                "repository_instructions_loaded",
-                {"files": [{k: v for k, v in item.items() if k != "content"} for item in files]},
-            )
+    def load_adapter_context(self, sid):
+        self.environment.call(sid, "admitted", sid)
 
     async def _invoke(self, sid):
         config = self.store.config(sid)
@@ -1911,6 +1828,9 @@ class Runtime(MemoryServices):
                     "messages_path": str(self.context.history_file(sid)),
                     "control_plane": self.store.config(sid).control_plane,
                     "research_read_only": self.store.config(sid).execution.read_only,
+                    "namespace_factories": self.environment.namespace_factories(
+                        self.store.config(sid)
+                    ),
                     "argument_schemas": {
                         name: tool.arguments.model_json_schema()
                         for name, tool in self.tools.entries.items()
@@ -1929,21 +1849,11 @@ class Runtime(MemoryServices):
         return self.kernels[sid]
 
     async def execute_python(self, context, code):
-        observation = None
-        if self.store.config(context.session_id).task.adapter == "coding":
-            await self.environment.prepare(context.session_id, force=True)
-            observation = self.environment.mutations.begin(context)
+        observation = await self.environment.before_python(context)
         try:
             return await self._execute_python(context, code)
         finally:
-            if observation:
-                try:
-                    self.environment.mutations.end(context, observation)
-                except Exception as exc:
-                    self.environment.mutations.failed(context, exc)
-                    raise HarnessError(
-                        "environment", "observation_failed", str(exc), uncertain=True
-                    ) from exc
+            self.environment.after_python(context, observation)
 
     async def _execute_python(self, context, code):
         sid = context.session_id
@@ -2151,7 +2061,7 @@ class Runtime(MemoryServices):
                 branch.id,
                 context=source.context,
                 summary=source.summary,
-                repository_instructions=source.repository_instructions,
+                adapter_context=source.adapter_context,
                 selected_state=[],
                 turns=turn_index,
             )
@@ -2244,8 +2154,6 @@ class Runtime(MemoryServices):
         for session in self.store.sessions():
             if session.lifecycle != Lifecycle.INACTIVE:
                 self.store.transition(session.id, Lifecycle.INACTIVE)
-        self.environment.mutations.close()
-        for index in getattr(self, "_repository_indexes", {}).values():
-            index.close()
+        self.environment.close()
         self.store.close()
         self._owner_lock.close()

@@ -265,13 +265,7 @@ class BackgroundProcesses:
                     }
                 ),
             )
-        if self.runtime.store.config(context.session_id).task.adapter == "coding":
-            try:
-                self.runtime.environment.mutations.reconcile(
-                    context, reason="background_process_exit"
-                )
-            except Exception as exc:
-                self.runtime.environment.mutations.failed(context, exc)
+        self.runtime.environment.call(context.session_id, "process_completed", context)
         self.processes.pop(body["id"], None)
 
     def recover(self):

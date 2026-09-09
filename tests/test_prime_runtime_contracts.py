@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from threadweave.coding_config import coding_options
 from threadweave.host_api import Request, dispatch
 from threadweave.models import Action, HarnessError, ModelResponse, StateEdit, Usage, new_id
 from threadweave.runtime import Runtime
@@ -769,7 +770,7 @@ async def test_shared_coding_child_preserves_original_baseline_after_parent_edit
         ).fetchone()[0]
         assert inherited == original
         assert runtime.store.config(child.id).task.require_verifier
-        assert runtime.store.config(child.id).task.protect_tests
+        assert coding_options(runtime.store.config(child.id).task).protect_tests
         assert runtime.store.events(child.id, kind="coding_baseline_inherited")
         event = runtime.store.event(child.id, "test_verify", {})
         verification, error = await runtime._verify(child.id, event)

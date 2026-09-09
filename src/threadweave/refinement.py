@@ -9,8 +9,7 @@ import json
 from pydantic import Field, StrictBool
 
 from .context import token_bound
-from .models import ModelRequest, Outcome, Record, StateEdit, new_id, now
-from .repository import RepositoryIndex
+from .models import ModelRequest, Outcome, Record, StateEdit, new_id
 from .routing import route
 from .storage import encode
 
@@ -239,21 +238,6 @@ async def run_skill(context, entry_id, inputs):
 
 class MemoryServices:
     """Runtime auxiliary calls use the same provider retry/reservation/accounting path."""
-
-    def index(self, sid):
-        config = self.store.config(sid)
-        if not hasattr(self, "_repository_indexes"):
-            self._repository_indexes = {}
-        key = (sid, self.store.session(sid).workspace.path)
-        if key not in self._repository_indexes:
-            self._repository_indexes[key] = RepositoryIndex(
-                self.store,
-                self.store.session(sid).workspace.path,
-                enhanced=config.features.enhanced_code_index,
-                allowed=config.task.allowed_paths,
-                forbidden=config.task.forbidden_paths,
-            )
-        return self._repository_indexes[key]
 
     async def auxiliary(self, sid, role, instruction, evidence):
         if sid in getattr(self, "_automatic_refinement_active", ()) and role in {
@@ -894,8 +878,7 @@ class MemoryServices:
                 or r["type"]
                 in {
                     "verifier_result",
-                    "code_edit",
-                    "experiment_conclusion",
+                    *self.environment.call(sid, "evidence_signals", default=()),
                     "completion_attempt",
                     "agent_message_received",
                 }
@@ -1039,12 +1022,10 @@ class MemoryServices:
                 if e["type"]
                 in {
                     "verifier_result",
-                    "code_edit",
-                    "coding_command",
-                    "experiment_conclusion",
                     "python_result",
                     "agent_message_received",
                     "completion_attempt",
+                    *self.environment.call(sid, "evidence_signals", default=()),
                 }
                 and e["seq"] < self.store.event_by_id(marker)["seq"]
             ]
@@ -1118,27 +1099,4 @@ class MemoryServices:
             finish("failed", reason=str(exc)[:1000])
 
     def retain_failure(self, sid, event, verification):
-        if self.store.config(sid).task.adapter != "coding":
-            return
-        details = verification.details or {}
-        edits = self.store.events(sid, kind="code_edit", limit=5)
-        body = {
-            "task_pattern": self.store.session(sid).instruction[:1000],
-            "attempted_strategy": "Recent actions: "
-            + encode(
-                [
-                    e["payload"].get("name")
-                    for e in self.store.events(sid, kind="tool_call", limit=5)
-                ]
-            ),
-            "evidence": [event, *[e["id"] for e in edits]],
-            "failure_reason": details.get("violations", ["Independent verifier failed"]),
-            "affected_files": sorted({p for e in edits for p in e["payload"].get("files", {})}),
-            "verifier_output": details,
-            "recommendation": "Retrieve this evidence before repeating the same approach.",
-        }
-        identifier = new_id()
-        self.store.db.execute(
-            "INSERT INTO failure_memories VALUES(?,?,?,?)", (identifier, sid, now(), encode(body))
-        )
-        self.store.event(sid, "failure_memory", {"memory_id": identifier, **body}, parent=event)
+        self.environment.call(sid, "retain_failure", sid, event, verification)

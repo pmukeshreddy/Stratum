@@ -4,8 +4,9 @@ import json
 
 from .benchmarks import compare, run_benchmark
 from .coding import run_command
+from .coding_config import BenchmarkConfig
 from .gitops import GitWorkspace
-from .models import BenchmarkConfig, new_id, now
+from .models import new_id, now
 from .storage import encode
 
 

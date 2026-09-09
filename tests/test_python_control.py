@@ -34,7 +34,8 @@ def test_default_schema_has_one_control_plane():
     direct_config = RunConfig(control_plane="direct")
     direct_config.permissions.append("process")
     direct = builtins().schemas(direct_config)
-    assert {"repo_search", "python", "rlm", "run_tests"} <= {s["function"]["name"] for s in direct}
+    assert {"python", "rlm"} <= {s["function"]["name"] for s in direct}
+    assert not {"repo_search", "run_tests"} & {s["function"]["name"] for s in direct}
 
 
 async def test_provider_boundary_rejects_direct_model_tool(tmp_path, python_config):

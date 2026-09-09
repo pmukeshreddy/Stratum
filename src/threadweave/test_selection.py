@@ -9,7 +9,9 @@ from .repository import is_test
 def related(context, files=(), symbols=(), tier="related", limit=20):
     if tier not in {"failing", "related", "module", "full"}:
         raise ValueError("tier must be failing, related, module, or full")
-    index = context.runtime.index(context.session_id)
+    index = context.runtime.environment.capability(context.session_id, "coding").index(
+        context.session_id
+    )
     index.ensure_current()
     symbol_definitions = [m for symbol in symbols for m in index.definition(symbol)["matches"]]
     files = sorted(set(files) | {m["path"] for m in symbol_definitions})

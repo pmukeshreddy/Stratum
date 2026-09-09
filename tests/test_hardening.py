@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from threadweave.coding_config import coding_options
 from threadweave.gitops import GitWorkspace, git
 from threadweave.kernel import Kernel
 from threadweave.models import new_id
@@ -22,7 +23,7 @@ from .test_python_environment import cell, coding_python, effects  # noqa: F401 
 async def test_warm_observation_no_enumeration_and_overflow_reconciles(coding_python, monkeypatch):  # noqa: F811
     runtime, session, context = coding_python
     await cell(runtime, session, "x = 1")
-    observer = runtime.environment.mutations
+    observer = runtime.environment.adapters["coding"].mutations
     tracker = next(iter(observer.trackers.values()))
     import threadweave.mutations as module
 
@@ -214,7 +215,8 @@ async def test_related_tests_have_evidence_and_verifier_remains_full(
         )
         assert result["final_verifier_unchanged"]
         assert (
-            runtime.store.config(session.id).task.test_commands == coding_config.task.test_commands
+            coding_options(runtime.store.config(session.id).task).test_commands
+            == coding_options(coding_config.task).test_commands
         )
     finally:
         await runtime.shutdown()
@@ -386,7 +388,7 @@ def test_distribution_and_failed_correctness_cannot_claim_improvement():
     import statistics
 
     from threadweave.benchmarks import compare, summarize
-    from threadweave.models import BenchmarkConfig
+    from threadweave.coding_config import BenchmarkConfig
 
     values = list(range(1, 101))
     result = summarize(values)

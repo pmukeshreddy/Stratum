@@ -459,3 +459,50 @@ async def test_real_official_manyih_if_inputs_are_unchanged(tmp_path):
         assert "constraints" not in task
     finally:
         await worker.close()
+
+
+async def test_evaluation_can_use_production_coding_adapter_without_rewriting_task(
+    tmp_path, repository, monkeypatch
+):
+    from threadweave.coding_config import update_coding_options
+
+    provider = ScriptedProvider(
+        {
+            "root": [
+                ModelResponse(
+                    text="exact generated answer", usage=Usage(input_tokens=13, output_tokens=7)
+                )
+            ]
+        }
+    )
+    monkeypatch.setattr("threadweave.evals.harness.default_providers", lambda: {"chat": provider})
+    config = eval_config()
+    config.permissions.append("process")
+    config.task.adapter = "coding"
+    update_coding_options(
+        config.task, capture_baseline=False, require_change=False, require_tests=False
+    )
+    result = await run_buffalo(
+        config,
+        {
+            "messages": [
+                {"role": "system", "content": "Official system instruction"},
+                {"role": "user", "content": "Official task verbatim"},
+            ]
+        },
+        tmp_path / "run",
+        workspace=repository,
+        task_config=config.task,
+    )
+    assert result["response"] == "exact generated answer"
+    request = provider.requests[0]
+    assert any(
+        m["role"] == "system" and m["content"] == "Official system instruction"
+        for m in request.messages
+    )
+    assert "Official task verbatim" in json.dumps(request.messages)
+    assert "Coding APIs" in json.dumps(request.messages)
+    sessions = json.loads((tmp_path / "run/sessions.json").read_text())
+    assert sessions[0]["instruction"] == "Official task verbatim"
+    saved = RunConfig.model_validate_json((tmp_path / "run/buffalo-config.json").read_text())
+    assert saved.task.adapter == "coding"

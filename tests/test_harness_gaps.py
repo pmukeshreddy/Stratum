@@ -149,6 +149,7 @@ async def test_response_beyond_16384_bytes_is_not_a_terminal_failure():
 
 @pytest.mark.parametrize("leaf", ["src", "src/foo"])
 async def test_repository_instructions_are_loaded_in_hierarchy(tmp_path, config, leaf):
+    config.task.adapter = "coding"
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
     (repo / "src/foo").mkdir(parents=True)

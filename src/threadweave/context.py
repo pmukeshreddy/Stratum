@@ -28,7 +28,7 @@ L1 is selected active context. L2 is your persistent REPL and concurrent child h
 not become model context unless explicitly printed, returned, summarized or retrieved. L3 is the
 disk-backed history, artifacts, messages and versioned reusable state. Compaction affects only L1.
 The Environment exposes capabilities, not a required sequence of actions. Ordinary conversation
-needs no repository, test baseline or code change. Never invent observations or measurements.
+needs no domain-specific preparation. Never invent observations or measurements.
 """
 
 
@@ -45,7 +45,7 @@ variables and print only relevant evidence. Preloaded: Path, pathlib, os, asynci
 workspace (Path), session (metadata), context['task'] (complete instruction).
 Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.
 await bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without
-await returns a background handle with poll(), tail(), kill(). Use the repository's environment.
+await returns a background handle with poll(), tail(), kill(). Use the workspace environment.
 Never claim execution results you did not observe. A normal final text reply requests completion;
 the independently configured verifier remains authoritative and may return failure evidence.
 L1 is selected context, L2 is Python state, L3 is durable history/artifacts. Compaction does not
@@ -59,35 +59,24 @@ instructions through supplemental state. Disabled capabilities must not be invok
         config.execution.read_only and config.execution.backend == "local"
     ):
         text = text.replace(
-            "Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.\nawait bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without\nawait returns a background handle with poll(), tail(), kill(). Use the repository's environment.",
+            "Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.\nawait bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without\nawait returns a background handle with poll(), tail(), kill(). Use the workspace environment.",
             "Use Path.read_text() and ordinary Python for inspection. Host shell execution is not\navailable with this session's permissions/backend. Do not invoke bash.start to bypass that policy.",
         )
     if config.execution.read_only:
-        text += "This session is OS read-only outside its private kernel state. Do not attempt repository writes.\n"
-    if config.features.enhanced_code_index:
-        text += """Coding APIs: repo, tests, context, verify, git, edit. Their help() gives short signatures.
-Prefer repo.context_for_symbol(name) for precise evidence; tests.related_to(files=[...]) explains
-test selection. context.focus(files=[...],hypothesis='...') retains your investigation.
-await edit(path,old_str,new_str) edits a unique match. Raw Python remains available.
-"""
+        text += "This session is OS read-only outside its private kernel state. Do not attempt workspace writes.\n"
     if config.features.subagents:
-        text += """await rlm('assignment',name='...',purpose='research'|'candidate'|'shared') returns a
-persistent HANDLE asynchronously, not an answer. Research is OS read-only; candidates have isolated
-worktrees. agents.help() explains messaging and explicit patch acceptance. Delegate with purpose.
-"""
+        text += "await rlm('assignment', name='...', purpose='shared', isolate=False) returns a persistent child handle. agents.help() explains communication and observation.\n"
     if config.features.history_retrieval:
         text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"
-    if config.features.experiments:
-        text += "experiment.help() lists durable experiment/measurement procedures.\n"
     if config.tool_allowlist is None:
         text += "harness, skills, mcp expose versioned state, executable skills and configured servers; inspect their methods/help as needed. tools.catalog() returns schemas into Python, not L1. await refine() requests evidence-based refinement; await compact() compacts context.\n"
     return text
 
 
 class Context:
-    def __init__(self, store: Store, index_provider=None):
+    def __init__(self, store: Store, environment=None):
         self.store = store
-        self.index_provider = index_provider
+        self.environment = environment
         self._export_cursors = {}
 
     def history_file(self, sid):
@@ -210,16 +199,10 @@ class Context:
             },
             {"role": "user", "content": "Session: " + encode(metadata) + "\nTask: " + task},
         ]
-        if (
-            self.store.config(sid).task.adapter == "coding"
-            and self.store.config(sid).features.enhanced_code_index
-        ):
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "Coding decision support: reuse observed failures and exact source evidence. State a hypothesis when debugging; prefer focused definitions/callers and related failing tests over repeatedly reading full files. Use repo.help()/tests.help() to discover APIs. Make small evidence-supported changes; escalate tests when warranted. Delegation must have a distinct purpose and a bounded evidence request. Repeated unchanged reads/searches/tests are a signal to revise the hypothesis, not proof of progress. These are cost-aware guidelines, not a mandatory workflow; the independent final verifier still decides correctness.",
-                }
-            )
+        if self.environment:
+            instructions = self.environment().instructions(self.store.config(sid))
+            if instructions:
+                messages.append({"role": "system", "content": instructions})
         if session.mode == "interactive" and self.store.config(sid).control_plane == "direct":
             messages.insert(
                 1,
@@ -237,16 +220,6 @@ class Context:
                 },
             )
         messages.extend(self.store.config(sid).task.instruction_messages)
-        for instruction in session.repository_instructions:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"Repository instructions from {instruction['path']} (scope {instruction['scope']}):\n"
-                        + instruction["content"]
-                    ),
-                }
-            )
         supplemental = self.supplemental(sid)
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking
@@ -302,11 +275,8 @@ class Context:
                         message["provider_items"] = json.loads(row["items"])
                         message["provider_identity"] = [row["provider"], row["model"]]
                 messages.append(message)
-        from .retrieval import coding_focus
-
-        focus = coding_focus(self.store, sid, index_provider=self.index_provider)
-        if focus:
-            messages.append({"role": "user", "content": "Current coding evidence: " + focus})
+        if self.environment:
+            messages.extend(self.environment().call(sid, "context_messages", sid, default=[]))
         messages.append(
             {
                 "role": "developer",
@@ -470,7 +440,7 @@ class Context:
                 "evidence_tokens": sum(
                     estimate(m, config.provider.model)
                     for m in messages
-                    if (m.get("content") or "").startswith("Current coding evidence:")
+                    if (m.get("content") or "").startswith("Current adapter evidence:")
                 ),
             },
         )

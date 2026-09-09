@@ -1,78 +1,136 @@
-"""Environment policies and capabilities, separate from session strategy.
-
-The default environment is an ordinary workspace. Coding admission, checkpoints,
-candidate isolation and completion gates are opt-in environment policy, not stages
-of the agent loop. Third-party TaskAdapters retain their prepare/verify interface.
-"""
+"""Adapter composition and generic capability, preparation and isolation lifecycle."""
 
 from __future__ import annotations
 
 import asyncio
+import shutil
+from pathlib import Path
 
-from .coding import CodingTask
-from .models import HarnessError, Workspace, new_id
-from .mutations import MutationObserver
+from .artifacts import atomic_write
+from .capabilities import ChildProfile, default_adapters
+from .models import HarnessError, Outcome, Workspace, new_id
 from .storage import encode
-from .tasks import WorkspaceTask
 from .tools import ToolContext
 
 
 class Environment:
     def __init__(self, runtime, adapters=None):
         self.runtime = runtime
-        self.mutations = MutationObserver(runtime)
-        self.adapters = (
-            adapters
-            if adapters is not None
-            else {"workspace": WorkspaceTask(), "coding": CodingTask()}
+        self.adapters = adapters if adapters is not None else default_adapters()
+        self.providers = {}
+        self._registered = set()
+        self._bound = set()
+        self.refresh()
+
+    def refresh(self):
+        for adapter in self.adapters.values():
+            if id(adapter) in self._bound:
+                continue
+            self._bound.add(id(adapter))
+            if hasattr(adapter, "bind"):
+                adapter.bind(self.runtime)
+            for provider in getattr(adapter, "providers", lambda: ())():
+                self.register_capability(provider)
+
+    def register_capability(self, provider):
+        if provider.name in self.providers and self.providers[provider.name] != provider:
+            raise ValueError(f"Capability already registered: {provider.name}")
+        self.providers[provider.name] = provider
+
+    def capability(self, sid, name):
+        if name not in self.runtime.store.config(sid).effective_capabilities:
+            raise PermissionError(f"Capability not admitted: {name}")
+        return self.providers[name].service
+
+    def adapter(self, sid):
+        return self.adapters[self.runtime.store.config(sid).task.adapter]
+
+    def call(self, sid, hook, *args, default=None, **kwargs):
+        function = getattr(self.adapter(sid), hook, None)
+        return function(*args, **kwargs) if function else default
+
+    def configure(self, config, *, defaults=True):
+        self.refresh()
+        adapter = self.adapters[config.task.adapter]
+        if hasattr(adapter, "validate"):
+            adapter.validate(config)
+        if defaults and hasattr(adapter, "configure"):
+            adapter.configure(config)
+        effective = set(getattr(adapter, "capabilities", ())) | set(config.capabilities)
+        effective -= set(config.disabled_capabilities)
+        missing = effective - self.providers.keys()
+        if missing:
+            raise ValueError(f"Unknown capabilities: {sorted(missing)}")
+        config.effective_capabilities = sorted(effective)
+        for name in config.effective_capabilities:
+            if name not in self._registered:
+                before = set(self.runtime.tools.entries)
+                self.providers[name].register_tools(self.runtime.tools)
+                for tool_name in self.runtime.tools.entries.keys() - before:
+                    tool = self.runtime.tools.entries[tool_name]
+                    if tool.capability not in (None, name):
+                        raise ValueError(
+                            f"Capability provider {name} registered foreign capability {tool.capability}"
+                        )
+                    tool.capability = name
+                self._registered.add(name)
+
+    def namespace_factories(self, config):
+        return [
+            self.providers[n].namespace_factory
+            for n in config.effective_capabilities
+            if self.providers[n].namespace_factory
+        ]
+
+    def instructions(self, config):
+        return "\n".join(
+            self.providers[n].instructions(config)
+            for n in config.effective_capabilities
+            if self.providers[n].instructions
         )
 
-    def configure(self, config):
-        if config.task.adapter == "coding":
-            config.task.verifier = "coding"
-            config.task.require_verifier = True
-            config.task.verify_each_turn = False
+    def profiles(self, config):
+        return {
+            "shared": ChildProfile(isolate=False),
+            **getattr(self.adapters[config.task.adapter], "profiles", {}),
+        }
 
-    def inherit_shared_admission(self, parent, child):
-        store = self.runtime.store
-        if (
-            parent.workspace.path != child.workspace.path
-            or store.config(child.id).task.adapter != "coding"
-        ):
-            return
-        row = store.db.execute(
-            "SELECT body FROM coding_baselines WHERE session_id=?", (parent.id,)
-        ).fetchone()
-        if row:
-            # A shared child observes the SAME workspace changes against the
-            # original verified baseline; it must not establish a new dirty baseline.
-            with store.transaction():
-                store.db.execute("INSERT INTO coding_baselines VALUES(?,?)", (child.id, row[0]))
-                store.event(
-                    child.id,
-                    "coding_baseline_inherited",
-                    {"parent_id": parent.id, "workspace": child.workspace.path},
+    def child_policy(self, config, purpose, isolate):
+        if purpose is not None:
+            profiles = self.profiles(config)
+            if purpose not in profiles:
+                raise ValueError(
+                    f"Unknown child profile {purpose!r} for {config.task.adapter}; available: {sorted(profiles)}"
                 )
+            profile = profiles[purpose]
+            if profile.require_isolation and isolate is False:
+                raise ValueError(f"Child profile {purpose} requires an isolated workspace")
+            if isolate is None:
+                isolate = profile.isolate
+        else:
+            profile = ChildProfile()
+        if isolate is None:
+            adapter = self.adapters[config.task.adapter]
+            isolate = getattr(adapter, "default_isolation", lambda c, **kw: False)(
+                config, child=True
+            )
+        return profile, isolate
 
     async def prepare(self, sid, *, force=False):
         runtime, store = self.runtime, self.runtime.store
         config, session = store.config(sid), store.session(sid)
-        if session.workspace.metadata.get("candidate_pending"):
+        if session.workspace.metadata.get("admission_pending"):
             raise HarnessError(
-                "environment",
-                "candidate_not_ready",
-                "Candidate workspace admission has not completed",
+                "environment", "workspace_not_ready", "Workspace admission has not completed"
             )
         if store.events(sid, kind="environment_prepared", limit=1):
             return
-        # Even an explicitly coding-configured interactive conversation may greet,
-        # ask questions and inspect files without running a test/build baseline.
-        if config.task.adapter == "coding" and session.mode == "interactive" and not force:
+        if not force and self.call(sid, "defer_prepare", session, default=False):
             return
         event = store.event(sid, "environment_prepare", {"adapter": config.task.adapter})
         try:
             async with asyncio.timeout(config.limits.tool_timeout_seconds):
-                result = await self.adapters[config.task.adapter].prepare(
+                result = await self.adapter(sid).prepare(
                     ToolContext(runtime, sid, new_id(), event), config.task
                 )
         except Exception as exc:
@@ -84,162 +142,100 @@ class Environment:
         )
 
     async def before_action(self, context, name):
-        runtime, sid = self.runtime, context.session_id
-        config = runtime.store.config(sid)
-        if config.task.adapter != "coding":
-            return None
-        tool = context.capability or runtime.tools.entries[name]
-        if name in {"finish", "rlm", "rlm.run", "agent_spawn"} or set(tool.permissions) & {
-            "workspace.write",
-            "python",
-            "ipython",
-            "process",
-        }:
-            await self.prepare(sid, force=True)
-        if "process" in tool.permissions:
-            # A preceding Path.write_text in the SAME cell must be visible to tests,
-            # including same-size writes with timestamp-based Python bytecode.
-            self.mutations.reconcile(context, reason="before_process")
-        # The executable capability, not its origin/envelope, determines policy.
-        # Keep explicit legacy snapshot behavior; Python-first cells use incremental
-        # metadata observation rather than copying all content for every invocation.
-        token = {"window": None, "checkpoint": None}
-        if name not in {"python", "ipython", "skill_run"}:
-            token["window"] = self.mutations.begin(context)
-        if config.control_plane != "direct" or name not in {
-            "python",
-            "skill_run",
-            "process_run",
-            "run_tests",
-            "run_targeted_tests",
-            "run_build",
-            "run_lint",
-            "run_typecheck",
-            "run_benchmark",
-            "run_profile",
-            "experiment_run",
-        }:
-            return token
-        from .gitops import GitWorkspace
-
-        checkpoint = GitWorkspace(context).snapshot("before-external-action")
-        runtime.store.event(
-            sid,
-            "workspace_observation_started",
-            {"action_id": context.action_id, "checkpoint_id": checkpoint},
-            parent=context.source_event,
-        )
-        token["checkpoint"] = checkpoint
-        return token
+        function = getattr(self.adapter(context.session_id), "before_action", None)
+        return await function(context, name) if function else None
 
     def after_action(self, context, token):
-        if not token:
-            return
-        from .gitops import GitWorkspace
+        return self.call(context.session_id, "after_action", context, token)
 
-        try:
-            self.mutations.end(context, token["window"])
-            if token["checkpoint"]:
-                GitWorkspace(context).observe_effects(token["checkpoint"], context.action_id)
-        except Exception as exc:
-            self.mutations.failed(context, exc)
-            raise HarnessError(
-                "environment", "observation_failed", str(exc), uncertain=True
-            ) from exc
+    async def before_python(self, context):
+        function = getattr(self.adapter(context.session_id), "before_python", None)
+        return await function(context) if function else None
+
+    def after_python(self, context, token):
+        return self.call(context.session_id, "after_python", context, token)
+
+    def write(self, context, path, content):
+        function = getattr(self.adapter(context.session_id), "write", None)
+        if function:
+            return function(context, path, content)
+        target = context.path(path)
+        atomic_write(target, content)
+        return {"path": str(target), "bytes": len(content)}
 
     def continuation_workspace(self, source, config, *, child=False, isolate=None):
-        """Explicit coding environments isolate writable continuations; others share metadata."""
+        adapter = self.adapters[config.task.adapter]
         if isolate is None:
-            isolate = config.task.adapter == "coding"
+            isolate = getattr(adapter, "default_isolation", lambda c, **kw: False)(
+                config, child=child
+            )
         if not isolate:
             return source.workspace.model_copy(deep=True), None
-        from .gitops import GitWorkspace
+        if hasattr(adapter, "continuation_workspace"):
+            return adapter.continuation_workspace(source, config, child=child, isolate=True)
+        return self.copy_workspace(source)
 
-        event = self.runtime.store.event(
-            source.id, "candidate_preparing" if child else "fork_workspace", {}
-        )
-        git = GitWorkspace(ToolContext(self.runtime, source.id, new_id(), event))
-        checkpoint = git.snapshot_tree("candidate-source" if child else "fork-source")
-        isolated = git.isolate(checkpoint)
-        workspace = Workspace(
-            path=str(isolated),
-            metadata={
-                "source_session": source.id,
-                "source_checkpoint": checkpoint,
-                "isolation": "git_worktree",
-                "base_revision": git.checkpoint(checkpoint)["head"],
-            },
-        )
-        config.task.repository = str(isolated)
-        config.task.base_commit = None
-        if child:
-            config.task.require_change = False
-        return workspace, checkpoint
+    def copy_workspace(self, source):
+        destination = self.runtime.store.directory / "workspaces" / new_id()
+        private = self.runtime.store.directory.resolve()
+
+        def ignore(directory, names):
+            return [
+                name for name in names if (Path(directory) / name).resolve().is_relative_to(private)
+            ]
+
+        shutil.copytree(source.workspace.path, destination, symlinks=True, ignore=ignore)
+        return Workspace(
+            path=str(destination),
+            metadata={"source_session": source.id, "isolation": "workspace_copy"},
+        ), None
+
+    def isolated_child_workspace(self, parent_id, child_id):
+        from .storage import Store
+
+        store = Store(self.runtime.store.directory)
+        try:
+            adapter = self.adapters[store.config(child_id).task.adapter]
+            if hasattr(adapter, "isolated_child_workspace"):
+                return adapter.isolated_child_workspace(parent_id, child_id)
+            workspace, checkpoint = self.copy_workspace(store.session(parent_id))
+            store.event(
+                child_id,
+                "workspace_lease",
+                {"workspace": workspace.model_dump(), "checkpoint": checkpoint},
+            )
+            return workspace, checkpoint
+        finally:
+            store.close()
+
+    def poll(self):
+        for adapter in self.adapters.values():
+            if hasattr(adapter, "poll"):
+                adapter.poll()
+
+    def close(self):
+        for adapter in self.adapters.values():
+            if hasattr(adapter, "runtime_close"):
+                adapter.runtime_close()
 
     async def recover(self):
-        from .editing import recover_edits
         from .execution import recover_containers
-        from .gitops import recover_workspace_effects
         from .process_family import cleanup_registry
 
-        recover_edits(self.runtime)
         for session in self.runtime.store.sessions():
             kernel = self.runtime.kernels.get(session.id)
             if not kernel or not kernel.process or kernel.process.returncode is not None:
                 cleanup_registry(self.runtime.store.directory / "kernels" / session.kernel_id)
-        await recover_containers(self.runtime)
-        await recover_workspace_effects(self.runtime)
-        self.mutations.recover()
-        for session in self.runtime.store.sessions():
-            if session.workspace.metadata.get("candidate_pending"):
-                from .models import Outcome
-
+            if session.workspace.metadata.get("admission_pending"):
                 self.runtime.store.update(
                     session.id, outcome=Outcome.FAILED, paused=True, runnable=False
                 )
                 self.runtime.store.event(
                     session.id,
-                    "candidate_recovery",
-                    {
-                        "status": "admission_interrupted",
-                        "workspace_leases_retained": True,
-                        "replayed": False,
-                    },
+                    "workspace_recovery",
+                    {"status": "admission_interrupted", "replayed": False},
                 )
-        self.runtime.store.db.execute(
-            "UPDATE experiments SET status='interrupted' WHERE status='running'"
-        )
-
-    def candidate_workspace(self, parent_id, child_id):
-        """Thread-local connection around immutable Git capture and worktree admission."""
-        from types import SimpleNamespace
-
-        from .artifacts import Artifacts
-        from .gitops import GitWorkspace
-        from .storage import Store
-
-        store = Store(self.runtime.store.directory)
-        try:
-            runtime = SimpleNamespace(store=store, artifacts=Artifacts(store))
-            event = store.event(child_id, "candidate_workspace_started", {"parent": parent_id})
-            workspace = GitWorkspace(ToolContext(runtime, parent_id, new_id(), event))
-            checkpoint = workspace.snapshot_tree("candidate-source")
-            isolated = workspace.isolate(checkpoint)
-            result = Workspace(
-                path=str(isolated),
-                metadata={
-                    "source_session": parent_id,
-                    "source_checkpoint": checkpoint,
-                    "isolation": "git_worktree",
-                    "base_revision": workspace.checkpoint(checkpoint)["head"],
-                },
-            )
-            # Persist the lease even if the daemon exits before admission completes.
-            store.event(
-                child_id,
-                "candidate_workspace_lease",
-                {"workspace": result.model_dump(), "checkpoint": checkpoint},
-            )
-            return result, checkpoint
-        finally:
-            store.close()
+        await recover_containers(self.runtime)
+        for adapter in self.adapters.values():
+            if hasattr(adapter, "recover"):
+                await adapter.recover()

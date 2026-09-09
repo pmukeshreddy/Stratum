@@ -42,6 +42,7 @@ async def test_complete_history_pagination_and_readable_log(tmp_path, python_con
 
 
 async def test_edit_uses_kernel_cwd_and_stop_cleans_background(tmp_path, python_config):
+    python_config.capabilities = ["coding"]
     (tmp_path / "nested").mkdir()
     (tmp_path / "nested/source.txt").write_text("unique line\n")
     runtime = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})

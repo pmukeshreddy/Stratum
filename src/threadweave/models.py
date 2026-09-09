@@ -150,19 +150,6 @@ class ExecutionConfig(Record):
     cpus: float = Field(default=2, gt=0)
 
 
-class BenchmarkConfig(Record):
-    command: list[str] = Field(min_length=1)
-    correctness_commands: list[list[str]] = Field(default_factory=list)
-    repetitions: int = Field(default=10, ge=1, le=1000)
-    warmups: int = Field(default=3, ge=0, le=100)
-    metric_regex: str
-    direction: Literal["lower_is_better", "higher_is_better"] = "lower_is_better"
-    required_improvement: float = Field(default=0, ge=0)
-    noise_tolerance: float = Field(default=0.01, ge=0)
-    timeout_seconds: float = Field(default=60, gt=0)
-    outlier_policy: Literal["retain", "iqr"] = "retain"
-
-
 class RoutingConfig(Record):
     policy: Literal["fixed", "role_based"] = "fixed"
     default: str | None = None
@@ -201,25 +188,16 @@ class TaskConfig(Record):
     require_verifier: bool = False
     wait_for_children: bool = True
     success_metrics: dict[str, Any] = Field(default_factory=dict)
-    repository: str | None = None
-    base_commit: str | None = None
     allowed_paths: list[str] = Field(default_factory=lambda: ["**"])
     forbidden_paths: list[str] = Field(default_factory=list)
-    test_commands: list[list[str]] = Field(default_factory=list)
-    build_commands: list[list[str]] = Field(default_factory=list)
-    lint_commands: list[list[str]] = Field(default_factory=list)
-    typecheck_commands: list[list[str]] = Field(default_factory=list)
-    benchmark_commands: list[list[str]] = Field(default_factory=list)
-    benchmark: BenchmarkConfig | None = None
-    profiler_command: list[str] | None = None
-    require_clean_baseline: bool = True
-    capture_baseline: bool = True
-    require_tests: bool = True
-    prohibit_test_deletion: bool = True
-    protect_tests: bool = False
-    require_change: bool = True
-    required_files: list[str] = Field(default_factory=list)
-    allow_baseline_failures: bool = False
+    options: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_adapter_options(cls, value):
+        from .task_options import migrate_options
+
+        return migrate_options(value, cls.model_fields)
 
 
 class McpServerConfig(Record):
@@ -273,6 +251,9 @@ class RunConfig(Record):
     )
     tool_allowlist: list[str] | None = None
     active_tool_names: list[str] | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    disabled_capabilities: list[str] = Field(default_factory=list)
+    effective_capabilities: list[str] = Field(default_factory=list)
     allow_sibling_messages: bool = True
     extensions: list[str] = Field(default_factory=list)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -293,7 +274,7 @@ class RunConfig(Record):
         if (
             self.task.require_verifier
             and self.task.verifier == "none"
-            and self.task.adapter != "coding"
+            and self.task.adapter == "workspace"
         ):
             raise ValueError("require_verifier needs a configured verifier")
         priced = list(self.models.values()) + ([self.provider] if not self.routing.default else [])
@@ -344,7 +325,15 @@ class Session(Record):
     context: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
     selected_state: list[str] = Field(default_factory=list)
-    repository_instructions: list[dict[str, Any]] = Field(default_factory=list)
+    adapter_context: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_adapter_context(cls, value):
+        from .task_options import migrate_session
+
+        return migrate_session(value)
+
     pending_turn: dict[str, Any] | None = None
     wake_at: float | None = None
     created_at: float

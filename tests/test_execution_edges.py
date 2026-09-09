@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from threadweave.coding import CodingTask, run_checks
+from threadweave.coding_config import update_coding_options
 from threadweave.diagnostics import parse_diagnostics, profiler_metrics
 from threadweave.editing import Editor, make_diff, unified_changes
 from threadweave.execution import ContainerExecutor, recover_containers
@@ -125,9 +126,15 @@ async def test_real_c_build_typecheck_and_python_lint_commands(tmp_path, reposit
         "-qm",
         "C source",
     )
-    coding_config.task.build_commands = [[compiler, "-c", "compute.c", "-o", "compute.o"]]
-    coding_config.task.typecheck_commands = [[compiler, "-Werror", "-fsyntax-only", "compute.c"]]
-    coding_config.task.lint_commands = [[sys.executable, "-m", "ruff", "check", "mathops.py"]]
+    update_coding_options(
+        coding_config.task, build_commands=[[compiler, "-c", "compute.c", "-o", "compute.o"]]
+    )
+    update_coding_options(
+        coding_config.task, typecheck_commands=[[compiler, "-Werror", "-fsyntax-only", "compute.c"]]
+    )
+    update_coding_options(
+        coding_config.task, lint_commands=[[sys.executable, "-m", "ruff", "check", "mathops.py"]]
+    )
     runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
     try:
         for kind in ("build", "lint", "typecheck"):
@@ -220,9 +227,10 @@ async def test_optional_real_container_execution(tmp_path, repository, coding_co
     coding_config.permissions.remove("python")
     coding_config.execution.image = "python:3.12-slim"
     coding_config.execution.backend = "container"
-    coding_config.task.test_commands = [
-        ["python", "-c", "import mathops; assert mathops.add(2,3) == 5"]
-    ]
+    update_coding_options(
+        coding_config.task,
+        test_commands=[["python", "-c", "import mathops; assert mathops.add(2,3) == 5"]],
+    )
     runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
     try:
         result = await ContainerExecutor(coding_config.execution).run(

@@ -14,6 +14,7 @@ from rich.console import Console
 
 from threadweave.chat import Chat, chat_config, data_directory, most_recent
 from threadweave.cli import execute, parser
+from threadweave.coding_config import coding_options, update_coding_options
 from threadweave.daemon import Daemon
 from threadweave.gitops import git
 from threadweave.models import ModelResponse, Outcome, now
@@ -46,7 +47,7 @@ async def chat_setup(tmp_path, repository, coding_config):
     daemon = Daemon(tmp_path / "state")
     runtime = daemon.runtime
     coding_config.provider.name = "mock"
-    coding_config.task.capture_baseline = False
+    update_coding_options(coding_config.task, capture_baseline=False)
     coding_config.refinement.enabled = False
     runtime.providers["mock"] = ScriptedProvider({})
     terminal = InputTerminal(tmp_path / "ui")
@@ -295,8 +296,8 @@ async def test_dirty_continue_preserves_user_changes_and_config(chat_setup):
         terminal.inputs.put_nowait(item)
     assert await client.open(config=config)
     sid = client.session["id"]
-    assert not runtime.store.config(sid).task.require_clean_baseline
-    assert config.task.require_clean_baseline
+    assert not coding_options(runtime.store.config(sid).task).require_clean_baseline
+    assert coding_options(config.task).require_clean_baseline
     assert "user-note" in terminal.output.getvalue()
     assert git(client.workspace, "status", "--porcelain=v1") == before
     assert path.read_text() == "unrelated user content"
@@ -318,8 +319,8 @@ async def test_resume_a_session_blocked_by_old_dirty_gate(chat_setup):
     terminal.inputs.put_nowait("1")
     assert await client.open(resume_id=old.id)
     assert client.session["id"] == old.id
-    assert not runtime.store.config(old.id).task.require_clean_baseline
-    assert runtime.store.config(old.config_id).task.require_clean_baseline
+    assert not coding_options(runtime.store.config(old.id).task).require_clean_baseline
+    assert coding_options(runtime.store.config(old.config_id).task).require_clean_baseline
     assert runtime.store.events(old.id, kind="dirty_baseline_consent")
 
 
@@ -517,8 +518,8 @@ async def test_inspection_without_tests_does_not_weaken_finish_gate(chat_setup, 
         return metadata
 
     monkeypatch.setattr(coding, "detect", no_test_detection)
-    config.task.test_commands = []
-    config.task.require_change = False
+    update_coding_options(config.task, test_commands=[])
+    update_coding_options(config.task, require_change=False)
     runtime.providers["mock"] = ScriptedProvider(
         {"root": [ModelResponse(text="Inspection is allowed")]}
     )

@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from .artifacts import atomic_write
+from .coding_config import update_coding_options
 from .models import RunConfig, StateEdit
 from .runtime import Runtime
 
@@ -180,7 +181,7 @@ class Daemon:
                         "Cannot change the baseline policy of a prepared/running session"
                     )
                 config = store.config(sid).model_copy(deep=True)
-                config.task.require_clean_baseline = False
+                update_coding_options(config.task, require_clean_baseline=False)
                 body = json.dumps(config.model_dump(mode="json"), sort_keys=True)
                 config_id = hashlib.sha256(body.encode()).hexdigest()
                 with store.transaction():

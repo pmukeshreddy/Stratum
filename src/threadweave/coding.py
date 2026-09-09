@@ -6,6 +6,7 @@ import fnmatch
 import json
 from pathlib import Path
 
+from .coding_config import coding_options
 from .execution import executor
 from .gitops import GitWorkspace
 from .models import Verification, new_id, now
@@ -81,7 +82,7 @@ async def run_checks(context, kind, *, targets=None):
     commands = (
         baseline(context)["commands"].get(kind, [])
         if config.task.adapter == "coding"
-        else getattr(config.task, KINDS[kind])
+        else getattr(coding_options(config.task), KINDS[kind])
         or detect(context.path("."))["suggested_commands"].get(kind, [])
     )
     if not commands:
@@ -102,6 +103,7 @@ async def run_checks(context, kind, *, targets=None):
 
 class CodingTask:
     async def prepare(self, context, task):
+        options = coding_options(task)
         store = context.runtime.store
         row = store.db.execute(
             "SELECT body FROM coding_baselines WHERE session_id=?", (context.session_id,)
@@ -110,30 +112,30 @@ class CodingTask:
             return json.loads(row[0])
         git = GitWorkspace(context)
         status = git.status()
-        if task.repository and Path(task.repository).resolve() != git.root.resolve():  # noqa: ASYNC240 - bounded local admission metadata
-            raise ValueError("task.repository must match the admitted workspace")
-        if task.base_commit:
+        if options.repository and Path(options.repository).resolve() != git.root.resolve():  # noqa: ASYNC240 - bounded local admission metadata
+            raise ValueError("options.repository must match the admitted workspace")
+        if options.base_commit:
             from .gitops import git as git_command
             from .gitops import revision
 
             expected = git_command(
-                git.root, "rev-parse", "--verify", revision(task.base_commit) + "^{commit}"
+                git.root, "rev-parse", "--verify", revision(options.base_commit) + "^{commit}"
             ).strip()
             if status["head"] != expected:
                 raise ValueError(
-                    "Repository is not at task.base_commit; prepare the checkout explicitly"
+                    "Repository is not at options.base_commit; prepare the checkout explicitly"
                 )
-        if task.require_clean_baseline and status["status"].strip():
+        if options.require_clean_baseline and status["status"].strip():
             raise ValueError(
                 "Repository is dirty and require_clean_baseline is true; commit/stash yourself or explicitly disable this gate"
             )
         metadata = detect(git.root)
         commands = {
-            kind: getattr(task, field) or metadata["suggested_commands"].get(kind, [])
+            kind: getattr(options, field) or metadata["suggested_commands"].get(kind, [])
             for kind, field in KINDS.items()
         }
-        if task.require_tests and not commands["test"] and context.session.mode != "interactive":
-            raise ValueError("Coding tasks require test commands: configure task.test_commands")
+        if options.require_tests and not commands["test"] and context.session.mode != "interactive":
+            raise ValueError("Coding tasks require test commands: configure options.test_commands")
         if any(commands.values()) and "process" not in store.config(context.session_id).permissions:
             raise PermissionError("Coding baseline/verification requires process permission")
         checkpoint = git.snapshot("coding-baseline")
@@ -156,18 +158,18 @@ class CodingTask:
             "results": {},
             "benchmark": None,
         }
-        if task.capture_baseline:
+        if options.capture_baseline:
             for kind, configured in commands.items():
                 result["results"][kind] = [
                     await run_command(context, cmd, kind="baseline_" + kind) for cmd in configured
                 ]
-            if task.benchmark:
+            if options.benchmark:
                 from .benchmarks import run_benchmark
 
                 correctness = result["results"].get("test", [])
                 result["benchmark"] = await run_benchmark(
                     context,
-                    task.benchmark,
+                    options.benchmark,
                     label="baseline",
                     correctness_passed=all(r["passed"] for r in correctness)
                     if correctness
@@ -176,7 +178,9 @@ class CodingTask:
         store.db.execute(
             "INSERT INTO coding_baselines VALUES(?,?)", (context.session_id, encode(result))
         )
-        _, manifest, artifact, _, _ = context.runtime.environment.mutations.scan(context)
+        _, manifest, artifact, _, _ = context.runtime.environment.adapter(
+            context.session_id
+        ).mutations.scan(context)
         result["mutation_baseline"] = {
             "artifact": artifact,
             "owner": context.session_id,
@@ -186,13 +190,14 @@ class CodingTask:
             "UPDATE coding_baselines SET body=? WHERE session_id=?",
             (encode(result), context.session_id),
         )
-        context.runtime.index(context.session_id).refresh()
+        context.runtime.environment.adapter(context.session_id).index(context.session_id).refresh()
         store.event(context.session_id, "coding_baseline", result, parent=context.source_event)
         return result
 
     async def verify(self, context, task):
+        options = coding_options(task)
         original = baseline(context)
-        observer = context.runtime.environment.mutations
+        observer = context.runtime.environment.adapter(context.session_id).mutations
         observer.reconcile(context, reason="before_verifier")
         git = GitWorkspace(context)
         _, observed = observer.previous(str(git.root.resolve()))
@@ -224,10 +229,10 @@ class CodingTask:
         governed_paths = set(git.files()) | set(prior)
         if changed_paths is not None:
             changed_paths &= governed_paths
-        if task.require_tests and not original["commands"]["test"]:
+        if options.require_tests and not original["commands"]["test"]:
             violations.append("No test commands configured; coding completion cannot be verified")
         patch = git.diff(original["checkpoint_id"], paths=changed_paths)
-        if task.require_change and not patch.strip():
+        if options.require_change and not patch.strip():
             violations.append("A nonempty change is required")
         if observed["head"] != original["git"]["head"]:
             violations.append("Repository HEAD changed; automatic commits are not permitted")
@@ -254,14 +259,14 @@ class CodingTask:
             if changed_paths is not None and relative not in changed_paths:
                 continue
             path = confined(git.root, relative)
-            if task.prohibit_test_deletion and not path.is_file():
+            if options.prohibit_test_deletion and not path.is_file():
                 violations.append(f"Test file deleted: {relative}")
             elif path.is_file():
                 from .repository import digest
 
-                if task.protect_tests and digest(path.read_bytes()) != recorded["hash"]:
+                if options.protect_tests and digest(path.read_bytes()) != recorded["hash"]:
                     violations.append(f"Protected test modified: {relative}")
-                if task.prohibit_test_deletion:
+                if options.prohibit_test_deletion:
                     old = {s["name"] for s in recorded["symbols"]}
                     current = {
                         s["name"]
@@ -273,7 +278,7 @@ class CodingTask:
                         violations.append(
                             f"Test definitions deleted: {relative}: {sorted(old - current)}"
                         )
-        for required in task.required_files:
+        for required in options.required_files:
             if not confined(git.root, required).is_file():
                 violations.append(f"Required file missing: {required}")
         for kind, commands in original["commands"].items():
@@ -287,7 +292,7 @@ class CodingTask:
                     old_names = {f["name"] for f in old["failures"] if f["name"]} if old else set()
                     names = {f["name"] for f in result["failures"] if f["name"]}
                     known = bool(old and not old["passed"] and names and names <= old_names)
-                    if not (task.allow_baseline_failures and known):
+                    if not (options.allow_baseline_failures and known):
                         violations.append(f"{kind} command failed: {command}")
                     if old and old["passed"] or old and names - old_names:
                         regressions.append(
@@ -298,10 +303,10 @@ class CodingTask:
                             }
                         )
         measured = None
-        if task.benchmark:
+        if options.benchmark:
             from .benchmarks import run_benchmark
 
-            if task.benchmark.required_improvement and not (original.get("benchmark") or {}).get(
+            if options.benchmark.required_improvement and not (original.get("benchmark") or {}).get(
                 "passed"
             ):
                 violations.append(
@@ -309,7 +314,7 @@ class CodingTask:
                 )
             measured = await run_benchmark(
                 context,
-                task.benchmark,
+                options.benchmark,
                 reference=original["benchmark"],
                 correctness_passed=all(
                     r["passed"] for k, rows in results.items() if k != "benchmark" for r in rows

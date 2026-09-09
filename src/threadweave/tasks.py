@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .capabilities import ChildProfile
 from .models import HarnessError, TaskConfig, Verification
 from .tools import ProcessArgs, ToolContext, run_process
 
@@ -14,7 +15,17 @@ class TaskAdapter(Protocol):
     async def verify(self, context: ToolContext, config: TaskConfig) -> Verification | None: ...
 
 
+def readonly_task(config):
+    config.task.verifier = "none"
+    config.task.require_verifier = False
+
+
 class WorkspaceTask:
+    profiles = {
+        name: ChildProfile(isolate=False, read_only=True, configure=readonly_task)
+        for name in ("readonly", "research", "review")
+    }
+
     async def prepare(self, context, config):
         path = context.path(".")
         if not path.is_dir():

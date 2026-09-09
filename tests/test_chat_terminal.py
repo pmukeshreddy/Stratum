@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pexpect
 
+from threadweave.coding_config import update_coding_options
 from threadweave.daemon import request
 from threadweave.storage import Store
 
@@ -52,7 +53,7 @@ async def test_terminal_multiturn_ctrl_c_detach_daemon_restart_and_continue(
     config = coding_config.model_copy(deep=True)
     config.provider.name = "chat_scenario"
     config.extensions = ["tests.chat_plugin:install"]
-    config.task.capture_baseline = False
+    update_coding_options(config.task, capture_baseline=False)
     config.refinement.enabled = False
     path = tmp_path / "config.json"
     path.write_text(config.model_dump_json())

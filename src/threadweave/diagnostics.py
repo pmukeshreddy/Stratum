@@ -35,7 +35,9 @@ def parse_diagnostics(text, *, limit=30):
 
 
 def localize(context, result):
-    index = context.runtime.index(context.session_id)
+    index = context.runtime.environment.capability(context.session_id, "coding").index(
+        context.session_id
+    )
     evidence = []
     edits = context.runtime.store.events(
         context.session_id, kind="code_edit", limit=20

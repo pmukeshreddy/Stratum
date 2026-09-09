@@ -175,7 +175,12 @@ async def test_ablation_flags_disable_capabilities_and_persistent_working_values
             and "history_search" not in names
             and "experiment_create" not in names
         )
-        assert runtime.index(session.id).outline("mathops.py")["parser"] == "disabled"
+        assert (
+            runtime.environment.capability(session.id, "coding")
+            .index(session.id)
+            .outline("mathops.py")["parser"]
+            == "disabled"
+        )
         assert not (await runtime.execute_python(context, "value = 42"))["error"]
         context.action_id = new_id()
         assert (await runtime.execute_python(context, "value"))["error"]["code"] == "NameError"

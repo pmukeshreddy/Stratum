@@ -7,6 +7,7 @@ import contextlib
 import os
 from pathlib import Path
 
+from .coding_config import coding_options, update_coding_options
 from .configuration import load_config
 from .daemon import request
 from .gitops import git
@@ -110,12 +111,15 @@ class Chat:
             await self.terminal.write(text)
 
     async def dirty_consent(self, config):
-        if config.task.adapter != "coding" or not config.task.require_clean_baseline:
+        if (
+            config.task.adapter != "coding"
+            or not coding_options(config.task).require_clean_baseline
+        ):
             return True
         status = await asyncio.to_thread(
             git, self.workspace, "status", "--porcelain=v1", "--untracked-files=all"
         )
-        if not config.task.require_clean_baseline or not status.strip():
+        if not coding_options(config.task).require_clean_baseline or not status.strip():
             return True
         await self.notice(
             "Repository has existing changes.\n[1] Continue using current repository state\n[2] Exit\n[3] Show git status"
@@ -137,7 +141,7 @@ class Chat:
             except EOFError:
                 return False
             if choice == "1":
-                config.task.require_clean_baseline = False
+                update_coding_options(config.task, require_clean_baseline=False)
                 await self.notice(
                     "Using current files as this session's baseline. Nothing was committed or stashed."
                 )
@@ -159,10 +163,12 @@ class Chat:
             self.config = RunConfig.model_validate(await self.call("config", session_id=resume_id))
             consent = False
             if not status.get("environment_prepared") and session["lifecycle"] != "RUNNING":
-                clean_required = self.config.task.require_clean_baseline
+                clean_required = coding_options(self.config.task).require_clean_baseline
                 if not await self.dirty_consent(self.config):
                     return False
-                consent = clean_required and not self.config.task.require_clean_baseline
+                consent = (
+                    clean_required and not coding_options(self.config.task).require_clean_baseline
+                )
             self.session = await self.call(
                 "chat_open", session_id=resume_id, accept_current_baseline=consent
             )
@@ -181,7 +187,10 @@ class Chat:
                 name="root",
                 mode="interactive",
             )
-            if config.task.require_clean_baseline and not self.config.task.require_clean_baseline:
+            if (
+                coding_options(config.task).require_clean_baseline
+                and not coding_options(self.config.task).require_clean_baseline
+            ):
                 self.session = await self.call(
                     "chat_open", session_id=self.session["id"], accept_current_baseline=True
                 )

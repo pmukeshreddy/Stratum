@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+from threadweave.coding_config import update_coding_options
 from threadweave.kernel import Kernel
 from threadweave.models import new_id
 from threadweave.repository import RepositoryIndex
@@ -356,7 +357,7 @@ async def test_parallel_candidate_admission_real_worktrees(
 
     runtime, parent, _ = await setup_runtime(tmp_path, repository, coding_config)
     barrier = threading.Barrier(2, timeout=10)
-    original = runtime.environment.candidate_workspace
+    original = runtime.environment.adapters["coding"].isolated_child_workspace
     entered = []
 
     def coordinated(*args):
@@ -364,7 +365,9 @@ async def test_parallel_candidate_admission_real_worktrees(
         barrier.wait()  # Both real admissions must be in-flight, not timing luck.
         return original(*args)
 
-    monkeypatch.setattr(runtime.environment, "candidate_workspace", coordinated)
+    monkeypatch.setattr(
+        runtime.environment.adapters["coding"], "isolated_child_workspace", coordinated
+    )
     try:
         children = await asyncio.gather(
             *(
@@ -508,8 +511,8 @@ async def test_verifier_cached_identity_does_not_hide_external_test_tampering(
 
     from .test_coding import setup_runtime
 
-    coding_config.task.capture_baseline = False
-    coding_config.task.protect_tests = True
+    update_coding_options(coding_config.task, capture_baseline=False)
+    update_coding_options(coding_config.task, protect_tests=True)
     runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
     try:
         source = repository / "mathops.py"
@@ -519,7 +522,7 @@ async def test_verifier_cached_identity_does_not_hide_external_test_tampering(
         assert (await task.verify(context, coding_config.task)).passed
         # Deliberately lose watcher events: a verifier trust boundary still checks
         # metadata and must invalidate its cached changed-path set.
-        observer = runtime.environment.mutations
+        observer = runtime.environment.adapters["coding"].mutations
         observer.trackers[str(repository.resolve())].close()
         (repository / "tests/test_mathops.py").write_text("def test_add():\n    assert True\n")
         verdict = await task.verify(context, coding_config.task)

@@ -320,7 +320,7 @@ class MutationObserver:
             except (OSError, ValueError, PermissionError):
                 continue  # Record forbidden/outside mutations without reading/indexing them.
         invalidate_bytecode(Path(context.session.workspace.path) / p for p in safe)
-        self.runtime.index(context.session_id).refresh(safe)
+        self.runtime.environment.adapter(context.session_id).index(context.session_id).refresh(safe)
 
     def begin(self, context):
         if context.session_id in self.active:
