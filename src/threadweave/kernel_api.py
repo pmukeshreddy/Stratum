@@ -44,6 +44,17 @@ class AgentHandle:
         return self.session_id
 
 
+@dataclass(frozen=True)
+class TaskState:
+    """Original task data reloaded from durable session state on every worker start."""
+
+    instructions: str
+    messages: tuple
+    assignment: str
+    context: Record
+    workspace: Path
+
+
 class Host:
     def __init__(self, bridge):
         self.bridge = bridge
@@ -64,7 +75,9 @@ class Harness:
 
     def get(self, kind, id, *, global_=False, version=None):
         value = self.host.call("harness.get", kind=kind, id=id, global_=global_, version=version)
-        return Record(value) if value else None
+        if value is None:
+            raise KeyError(f"Harness entry not found: {kind}/{id}")
+        return Record(value)
 
     def create(self, kind, title, content, **options):
         return Record(
@@ -79,7 +92,7 @@ class Harness:
         )
 
     def delete(self, kind, id, **options):
-        return self.host.call("harness.delete", kind=kind, id=id, **options)
+        return Record(self.host.call("harness.delete", kind=kind, id=id, **options))
 
     def rollback(self, kind, id, version, **options):
         return Record(
@@ -87,7 +100,7 @@ class Harness:
         )
 
     def select(self, ids):
-        return self.host.bridge.call("state_select", entry_ids=ids)
+        return Record(self.host.bridge.call("state_select", entry_ids=ids))
 
     def __getattr__(self, name):
         # Explicit category CRUD shares validation/provenance, not arbitrary host dispatch.
@@ -121,6 +134,8 @@ class Recursive:
         purpose="shared",
         isolate=None,
         adapter=None,
+        spec_id=None,
+        requirement=None,
     ):
         if not isinstance(prompt, str) or not prompt.strip() or args:
             raise ValueError(self.help())
@@ -132,10 +147,12 @@ class Recursive:
             purpose=purpose,
             isolate=isolate,
             adapter=adapter,
+            spec_id=spec_id,
+            requirement=requirement,
         )
 
     def help(self):
-        return 'await rlm("assignment", name="child", purpose="shared", isolate=False) returns a persistent handle. await agents.wait(seconds=30) waits for a message or timeout. agent_message sends/receives messages; agent_observe reads child trajectories.'
+        return 'await rlm("assignment", name="child") returns a persistent handle at admission. Put prose in the prompt or requirement. Optional purpose selects a registered child workspace/capability profile (default shared), not a description. Optional spec_id applies a subagent specification. await agents.wait(seconds=30) returns a receipt immediately and defers the next model turn; end the cell afterward. agent_message sends/receives messages; agent_observe reads child trajectories.'
 
     def __repr__(self):
         return self.help()
@@ -150,6 +167,8 @@ class Recursive:
         purpose="shared",
         isolate=None,
         adapter=None,
+        spec_id=None,
+        requirement=None,
     ):
         result = await self.host.acall(
             "rlm.run",
@@ -160,6 +179,8 @@ class Recursive:
             purpose=purpose,
             isolate=isolate,
             adapter=adapter,
+            spec_id=spec_id,
+            requirement=requirement,
         )
         return AgentHandle(**result)
 
@@ -502,11 +523,24 @@ def bootstrap(bridge, values, metadata):
         pathlib=pathlib,
         Path=Path,
         json=json,
+        task=TaskState(
+            instructions=metadata.get("original_task", {}).get(
+                "instructions", metadata.get("task", "")
+            ),
+            messages=tuple(metadata.get("original_task", {}).get("messages", [])),
+            assignment=metadata.get("task", ""),
+            context=Record(metadata.get("original_task", {}).get("context", {})),
+            workspace=values["workspace"],
+        ),
         context=ContextView(
             host, task=metadata.get("task", ""), messages_path=metadata.get("messages_path")
         ),
         session=Record(
-            {k: v for k, v in metadata.items() if k not in {"task", "skills", "argument_schemas"}}
+            {
+                k: v
+                for k, v in metadata.items()
+                if k not in {"task", "original_task", "skills", "argument_schemas"}
+            }
         ),
         rlm=recursive,
         agents=recursive,

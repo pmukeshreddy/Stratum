@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from .models import HarnessError
+from .models import HarnessError, now
 from .storage import Store, encode
 from .tokenization import estimate, method
 
@@ -11,7 +11,7 @@ FOUNDATION = """You operate a persistent agent session. Decide your own strategy
 Use the provided tools to compute, inspect evidence, delegate, communicate, and finish.
 When enabled, python executes in your own Python worker with top-level await. Variables are retained
 only when the session's persistent_repl feature is enabled; inspect the capability metadata.
-Python helpers: rlm(instruction, name=None), tools.call(name, **arguments), await tools.acall(name, **arguments),
+Python helpers: await rlm(instruction, name=None), tools.call(name, **arguments), await tools.acall(name, **arguments),
 workspace (Path), forget(*names), remember_recipe(name, reconstruction_code).
 Tool calls in Python return full structured results; keep large results in variables.
 Use artifacts and history retrieval to inspect omitted details. Context is a bounded cache.
@@ -37,12 +37,34 @@ def token_bound(value, model=None) -> int:
     return estimate(value, model)
 
 
-def python_instructions(config):
+def python_instructions(config, *, child=False, specifications=()):
     """Expose only usable capabilities; compact help remains in the live namespace."""
-    text = """You control a persistent agent session through the sole tool ipython(code).
-Choose your strategy. Python supports top-level await and retains variables; keep large data in
-variables and print only relevant evidence. Preloaded: Path, pathlib, os, asyncio, json,
-workspace (Path), session (metadata), context['task'] (complete instruction).
+    text = """You are Buffalo, a code-using agent that solves tasks by reasoning, executing code when useful,
+observing results, and iterating.
+Your persistent IPython environment is your primary, long-lived working environment for computation,
+tool use, task state and recursive orchestration. Work through the sole tool ipython(code).
+Use code when it adds value: decompose problems, inspect task data, observe results and iterate.
+Direct reasoning and a direct answer are valid when computation or delegation would add no value.
+Retain intermediate variables, functions, candidate artifacts and child handles across turns.
+The original user instruction is available as task.instructions. task.messages contains the complete
+original message contract in order; respect its system, developer and user roles. task.assignment
+is your own assignment, task.context contains task metadata, and task.workspace is a Path.
+All execution surfaces are preloaded: tools, harness, skills, rlm, agent_message, agent_observe,
+workspace, bash, compact and refine. Top-level await works. rlm() is recursive computation inside Python.
+Delegate useful independent work through await rlm(...); admission immediately returns a stable child
+handle. The persistent child runs asynchronously in its own IPython environment and active model
+context. Continue complementary computation while it runs; receive evidence through messaging and
+observation, evaluate it and synthesize. A child uses the same execution model and inherited capabilities.
+Compaction reduces model context without destroying persistent computational state, task data,
+child handles, versioned harness state or retrievable history. Print or retrieve relevant evidence
+for the next model turn; retaining a Python value alone does not expose it to the model.
+"""
+    if not config.features.subagents:
+        begin = text.index("Delegate useful independent work")
+        end = text.index("Compaction reduces", begin)
+        text = text[:begin] + "Recursive delegation is unavailable in this session.\n" + text[end:]
+    text += """\nPython API guide: Path, pathlib, os, asyncio, json, workspace (Path), session (metadata),
+task (original task and current assignment), context['task'] (current complete assignment).
 Use Path.read_text()/write_text(), ordinary Python, or await bash(command) for execution.
 await bash returns exit_code, stdout, stderr, duration and artifact IDs. bash(command) without
 await returns a background handle with poll(), tail(), kill(). Use the workspace environment.
@@ -65,11 +87,72 @@ instructions through supplemental state. Disabled capabilities must not be invok
     if config.execution.read_only:
         text += "This session is OS read-only outside its private kernel state. Do not attempt workspace writes.\n"
     if config.features.subagents:
-        text += "await rlm('assignment', name='...', purpose='shared', isolate=False) returns a persistent child handle. agents.help() explains communication and observation.\n"
+        text += """\nRecursive mechanics:\nRLM is recursive orchestration through this persistent REPL. When delegation is useful,
+give independent, self-contained work to children and continue your own useful work in parallel.
+handle = await rlm('assignment', name='worker') returns at admission,
+not completion; it returns a stable session_id, name, session_dir and model, never the child's answer.
+Put the work description in the prompt. Optional purpose selects a registered child workspace/capability
+profile, not a prose description; omit it for the default shared profile. Inspect agents.help() for profiles.
+Children inherit the effective model, reasoning, capabilities and limits; they can recursively delegate
+within the shared task budget and depth limit. Each child has its own persistent Python namespace.
+Keep handles in variables. Receive results through messages or inspect committed child trajectories:
+await agent_message.send('findings', receiver_role='parent') in a child;
+await agent_message.send('follow-up', receiver_role='child', receiver_name='worker') in the parent.
+await agent_message.receive(); await agent_observe.recent_messages(handle.session_id).
+await agents.wait(seconds=10) requests a pause before the next model turn and returns a receipt
+immediately. End the cell afterward; the scheduler wakes you on a message or timeout.
+agents.help(), agent_message.help() and agent_observe.help() describe the live APIs.
+Choose complementary, substantive child assignments; avoid duplicating work without a verification purpose.
+"""
+        text += """\nIndependent work:
+For a candidate solution with distinct specification risks, a child can investigate edge cases while
+you develop and test the candidate. Evaluate its evidence before incorporating it.
+For separable investigations, start independent children without waiting for each to finish:
+left = await rlm('Investigate the first component against its specification.', name='left')
+right = await rlm('Investigate the second component against its specification.', name='right')
+Then continue complementary local work. Use these patterns only when they add useful evidence;
+a small local task needs no child. Optional requirement= describes the task requirement being investigated.
+"""
+        text += "\nAvailable subagent specifications:\n" + encode(list(specifications)) + "\n"
+        text += "Inspect full instructions with harness.get('subagent_spec', id); await rlm(assignment, spec_id=id) applies the retrieved specification through the canonical runtime.\n"
     if config.features.history_retrieval:
         text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"
     if config.tool_allowlist is None:
-        text += "harness, skills, mcp expose versioned state, executable skills and configured servers; inspect their methods/help as needed. tools.catalog() returns schemas into Python, not L1. await refine() requests evidence-based refinement; await compact() compacts context.\n"
+        text += """\nHarness state:\nHarness state contains versioned memory, prompt_note, skill and subagent_spec entries.
+harness.list() retrieves the state overview; harness.get(kind, id) retrieves full content/version.
+harness.create(kind, title, content, select=True) and harness.update(kind, id, title, content)
+save task-local supplemental state; harness.select([id]) selects it for subsequent model turns.
+Harness CRUD/list/select are synchronous host operations: entry = harness.get(...), without await.
+They return records (list returns a list); invalid arguments or denied operations raise an error.
+Missing entries raise KeyError. skills.list() is immediate; skills.load(name) synchronously loads
+a module or entry, while await skills.run(...) executes it. Long-running operations are async.
+Memory stores durable facts, prompt notes store narrow behavioral guidance, skills store validated
+executable procedures, and subagent specifications store reusable delegation instructions.
+rlm.harness is the same state API. State supplements the task and never overrides its instructions.
+Create reusable checks only when you will run them on distinct candidates or stages; give them explicit inputs.
+Retain task-local facts and operating constraints when subsequent work will use them; do not invent entries.
+Skills and project context:
+skills.list() discovers procedures; skills.load(name) loads their module or state entry;
+await skills.run(name, **inputs) executes a validated skill. Read the matching SKILL.md or
+entry instructions before executing it. tools.catalog() returns tool schemas
+into Python, not active model context. mcp exposes configured external servers.
+The runtime automatically reviews meaningful progress, failures, child findings, compaction and
+completion at bounded safe checkpoints. The reviewer may decline; no edit is required.
+You do not need to call refine() for automatic review. await refine() optionally requests manual
+evidence-based planning at a safe boundary. Applied edits are retrieved into later turns of this task.
+Validate useful lessons on subsequent work. await compact() compacts active context while retaining
+Python state, artifacts and durable history. Retrieve omitted details explicitly as needed.
+Use meaningful mechanisms within the task's resource budget; never manufacture activity.
+"""
+    text += """\nAction patterns:
+If additional execution is unlikely to provide useful evidence, solve and answer directly.
+For structured inspection, computation or testing, use IPython and retain useful intermediate values.
+After a failed check or a new finding, inspect the actual evidence and choose the next useful action:
+another local check, a correction, more context, or independent investigation. Failure alone does not
+require delegation. Your next action follows from the task and observed trajectory.
+"""
+    if child:
+        text += "You are a persistent child. Complete your delegated assignment within the original task contract; send useful partial findings to your parent when they can inform ongoing work.\n"
     return text
 
 
@@ -78,6 +161,52 @@ class Context:
         self.store = store
         self.environment = environment
         self._export_cursors = {}
+        self.state_presentations = {}
+
+    def original_task(self, sid):
+        """The immutable role-bearing task contract, separate from accumulated work."""
+        session = self.store.session(sid)
+        root = self.store.session(session.root_id)
+        task = self.store.config(root.id).task
+        messages = task.original_messages or [
+            *task.instruction_messages,
+            {"role": "user", "content": root.instruction},
+        ]
+        return {
+            "instructions": next(
+                (m["content"] for m in reversed(messages) if m["role"] == "user"),
+                root.instruction,
+            ),
+            "messages": messages,
+            "current_assignment": session.instruction,
+            "context": {
+                "root_id": root.id,
+                "adapter": task.adapter,
+                "specification": task.specification,
+            },
+        }
+
+    def execution_inputs(self, sid, messages):
+        """Record source references actually retained in this invocation's context."""
+        children = {s.id for s in self.store.sessions() if s.parent_id == sid}
+        visible = encode(messages)
+        evidence = {}
+        for row in self.store.db.execute(
+            "SELECT sender_id,source_event FROM messages WHERE recipient_id=? AND received_at IS NOT NULL",
+            (sid,),
+        ):
+            if row["sender_id"] in children and row["source_event"] in visible:
+                evidence.setdefault(row["sender_id"], []).append(row["source_event"])
+        for event in self.store.events(sid, kind="child_observation", limit=100):
+            data = event["payload"]
+            if data["child_id"] in children:
+                sources = [source for source in data["source_events"] if source in visible]
+                if sources:
+                    evidence.setdefault(data["child_id"], []).extend(sources)
+        return {
+            "child_evidence": {k: list(dict.fromkeys(v)) for k, v in evidence.items()},
+            "harness_state": self.state_presentations.get(sid, []),
+        }
 
     def history_file(self, sid):
         """Materialized, readable conversation/event log; SQLite remains authoritative.
@@ -147,6 +276,10 @@ class Context:
             remaining -= token_bound(record, model)
             used.append({"id": entry["id"], "version": entry["version"]})
         entries = [encode(record) for record in records]
+        self.state_presentations[sid] = [
+            {**entry, "kind": self.store.state(sid, entry["id"], entry["version"])["kind"]}
+            for entry in used
+        ]
         previous = self.store.events(sid, kind="state_retrieved", limit=1)
         if used and (not previous or previous[0]["payload"]["entries"] != used):
             self.store.event(
@@ -165,6 +298,9 @@ class Context:
             "root_id": session.root_id,
             "parent_id": session.parent_id,
             "name": session.name,
+            "depth": session.depth,
+            "max_depth": self.store.config(session.root_id).limits.max_depth,
+            "max_subagents": self.store.config(session.root_id).limits.max_subagents,
             "role": session.role,
             "workspace": session.workspace.path,
             "features": self.store.config(sid).features.model_dump(),
@@ -181,6 +317,10 @@ class Context:
             "root_turns": max(0, limits.max_turns - usage.turns),
             "session_turns": max(0, limits.max_turns - session.turns),
         }
+        root = self.store.session(session.root_id)
+        if root.mode != "interactive":
+            elapsed = max(0, now() - root.started_at) if root.started_at else 0
+            status["resources_remaining"]["wall_seconds"] = max(0, limits.wall_seconds - elapsed)
         if session.parent_id:
             metadata["delegation_budget_note"] = (
                 "All siblings share root_turns and tokens. Send useful partial evidence promptly; do not consume the shared budget polishing a report."
@@ -193,11 +333,19 @@ class Context:
         messages = [
             {
                 "role": "system",
-                "content": python_instructions(self.store.config(sid))
+                "content": python_instructions(
+                    self.store.config(sid),
+                    child=bool(session.parent_id),
+                    specifications=[
+                        {k: e[k] for k in ("id", "title", "version")}
+                        for e in self.store.states(sid)
+                        if e["kind"] == "subagent_spec"
+                    ][:20],
+                )
                 if self.store.config(sid).control_plane == "python"
                 else FOUNDATION,
             },
-            {"role": "user", "content": "Session: " + encode(metadata) + "\nTask: " + task},
+            {"role": "user", "content": "Session: " + encode(metadata)},
         ]
         if self.environment:
             instructions = self.environment().instructions(self.store.config(sid))
@@ -220,6 +368,15 @@ class Context:
                 },
             )
         messages.extend(self.store.config(sid).task.instruction_messages)
+        if session.parent_id:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Original root task (complete contract: task.messages):\n"
+                    + self.context_task_excerpt(root.instruction, cap),
+                }
+            )
+        messages.append({"role": "user", "content": task})
         supplemental = self.supplemental(sid)
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking
@@ -285,6 +442,12 @@ class Context:
             }
         )
         return messages
+
+    @staticmethod
+    def context_task_excerpt(instruction, cap):
+        return instruction[:cap] + (
+            "\n[Excerpt; full task in task.messages.]" if len(instruction) > cap else ""
+        )
 
     def request_estimate(self, sid, messages, tools, provider=None):
         from .request_context import request_estimate
@@ -403,7 +566,9 @@ class Context:
                 )
             return eid
 
-    def assemble(self, sid: str, tools: list[dict], *, input_budget=None) -> tuple[list[dict], int]:
+    def assemble(
+        self, sid: str, tools: list[dict], *, input_budget=None, proactive=True
+    ) -> tuple[list[dict], int]:
         config = self.store.config(sid)
         available = config.context.max_tokens - max(
             p.max_output_tokens for p in [config.provider, *config.models.values()]
@@ -412,7 +577,7 @@ class Context:
             available = min(available, input_budget)
         messages = self.messages(sid)
         size, estimation = self.request_estimate(sid, messages, tools)
-        threshold = int(available * config.context.compact_at)
+        threshold = int(available * config.context.compact_at) if proactive else available
         while size > threshold and self.store.session(sid).context:
             if (
                 len(self.store.session(sid).context) <= config.context.recent_blocks

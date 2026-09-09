@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import time
+from collections import Counter
 
 from .execution import environment, executor
 from .models import new_id
@@ -17,6 +18,7 @@ from .storage import encode
 class BackgroundProcesses:
     def __init__(self, runtime):
         self.runtime, self.tasks, self.processes = runtime, {}, {}
+        self.waiters = Counter()
 
     def save(self, id, sid, body):
         self.runtime.store.db.execute(
@@ -30,6 +32,7 @@ class BackgroundProcesses:
         if not row or row["session_id"] != context.session_id:
             raise PermissionError("Process handle is not owned by this session")
         result = json.loads(row["body"])
+        result.pop("completion_message_id", None)
         if result["running"] and id not in self.tasks:
             # An orphan worker kills its group after daemon loss. Never replay a command.
             result.update(
@@ -88,14 +91,38 @@ class BackgroundProcesses:
             return self.status(context, p["id"])
         if operation == "wait":
             task = self.tasks.get(p["id"])
-            if task:
-                try:
+            self.waiters[p["id"]] += 1
+            try:
+                if task:
                     await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    if p.get("owned"):
-                        task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
-                    raise
+            except asyncio.CancelledError:
+                if task and p.get("owned"):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                raise
+            finally:
+                self.waiters[p["id"]] -= 1
+                if not self.waiters[p["id"]]:
+                    del self.waiters[p["id"]]
+            # A very short process can finish before its handle is awaited.
+            # Consume only its still-pending notification: this call returns
+            # the same complete result. Keep the message/event in the ledger.
+            row = self.runtime.store.db.execute(
+                "SELECT body FROM process_jobs WHERE id=?", (p["id"],)
+            ).fetchone()
+            notification = json.loads(row[0]).get("completion_message_id")
+            if notification:
+                consumed = self.runtime.store.db.execute(
+                    "UPDATE messages SET received_at=? WHERE id=? AND recipient_id=? AND received_at IS NULL",
+                    (time.time(), notification, context.session_id),
+                ).rowcount
+                if consumed:
+                    self.runtime.store.event(
+                        context.session_id,
+                        "process_result_consumed",
+                        {"process_id": p["id"], "message_id": notification},
+                        parent=context.source_event,
+                    )
             return self.status(context, p["id"])
         raise ValueError("Unknown process operation")
 
@@ -254,17 +281,19 @@ class BackgroundProcesses:
             self.runtime.store.event(
                 context.session_id, "execution_result", body, parent=context.source_event
             )
-            self.runtime.message(
-                context.session_id,
-                context.session_id,
-                "Background process completed: "
-                + encode(
-                    {
-                        key: value[:2000] if key in {"stdout", "stderr", "output"} else value
-                        for key, value in self.status(context, body["id"]).items()
-                    }
-                ),
-            )
+            if not self.waiters[body["id"]]:
+                body["completion_message_id"] = self.runtime.message(
+                    context.session_id,
+                    context.session_id,
+                    "Background process completed: "
+                    + encode(
+                        {
+                            key: value[:2000] if key in {"stdout", "stderr", "output"} else value
+                            for key, value in self.status(context, body["id"]).items()
+                        }
+                    ),
+                )
+                self.save(body["id"], context.session_id, body)
         self.runtime.environment.call(context.session_id, "process_completed", context)
         self.processes.pop(body["id"], None)
 

@@ -1029,6 +1029,25 @@ class Runtime(MemoryServices):
                 if task and task is not current:
                     task.cancel()
 
+    def _completion_feedback(self, sid, reason, *, parent=None):
+        event = self.store.event(sid, "completion_continuation", {"reason": reason}, parent=parent)
+        self.store.add_context(
+            sid,
+            event,
+            [
+                {
+                    "role": "user",
+                    "content": "Runtime completion feedback: " + reason + ". "
+                    "Your earlier candidate has not been returned as the task's final result. "
+                    "Consider the new evidence, then return a complete, self-contained answer to "
+                    "the original task, including its requested details and observed results. "
+                    "Only the accepted final answer is returned; a short acknowledgment or a "
+                    "reference to your earlier assessment would lose that assessment. If the "
+                    "evidence warrants no changes, return the complete candidate again.",
+                }
+            ],
+        )
+
     async def _run_turn(self, sid):
         started = now()
         try:
@@ -1050,7 +1069,7 @@ class Runtime(MemoryServices):
                 self.apply_pending_refinements(sid)
                 self.receive(sid, include_followups=not session.runnable or session.turns == 0)
                 await self._prepare(sid)
-                await self.auto_refine(sid)
+                await self.auto_refine(sid, background=True)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 self._admitted_turns.add(sid)
@@ -1146,6 +1165,10 @@ class Runtime(MemoryServices):
                 sid, include_followups=explicit_ok or verifier_ok or not response.actions
             )
             if delivered:
+                if explicit_ok or verifier_ok:
+                    self._completion_feedback(
+                        sid, "Additional messages arrived before completion", parent=response_event
+                    )
                 if (
                     (explicit_ok or verifier_ok)
                     and session.parent_id
@@ -1164,9 +1187,38 @@ class Runtime(MemoryServices):
                 explicit_ok = verifier_ok = False
                 self.store.update(sid, runnable=True, wake_at=None)
             if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
+                before_refinement = self.store.events(sid, kind="refinement", limit=1)
                 await self.auto_refine(sid, trigger="completion")
+                after_refinement = self.store.events(sid, kind="refinement", limit=1)
+                if config.refinement.completion_followup and after_refinement != before_refinement:
+                    eid = self.store.event(
+                        sid,
+                        "refinement_continuation",
+                        {"candidate": completion, "reason": "Applied state available to next turn"},
+                    )
+                    self.store.add_context(
+                        sid,
+                        eid,
+                        [
+                            {
+                                "role": "user",
+                                "content": "Completion-time refinement applied supplemental harness state. "
+                                "Consider the updated state and your existing candidate within the remaining "
+                                "task budget, then return the requested final answer. Keep the candidate "
+                                "if no change is warranted. Supplemental state cannot override task instructions.",
+                            }
+                        ],
+                    )
+                    explicit_ok = verifier_ok = False
+                    self.store.update(sid, runnable=True, wake_at=None)
                 late_delivery = self.receive(sid)
                 if late_delivery:
+                    if explicit_ok or verifier_ok:
+                        self._completion_feedback(
+                            sid,
+                            "Additional messages arrived during completion review",
+                            parent=response_event,
+                        )
                     delivered.extend(late_delivery)
                     explicit_ok = verifier_ok = False
                     self.store.update(sid, runnable=True, wake_at=None)
@@ -1187,7 +1239,10 @@ class Runtime(MemoryServices):
                             {
                                 "role": "user",
                                 "content": "Completion gate: descendants are still active: "
-                                + encode(children_active),
+                                + encode(children_active)
+                                + ". This candidate has not been returned. After incorporating "
+                                "their evidence, return the complete self-contained task answer; "
+                                "only the accepted final answer is returned.",
                             }
                         ],
                     )
@@ -1306,9 +1361,31 @@ class Runtime(MemoryServices):
 
     async def _invoke(self, sid):
         config = self.store.config(sid)
-        await self.semantic_compact(sid)
+        if config.control_plane == "python" and config.features.persistent_repl:
+            kernel = self._kernel(sid)
+            fresh = kernel.process is None
+            await kernel.start()
+            if fresh:
+                event = self.store.event(sid, "kernel_recovery", kernel.recovery)
+                if kernel.recovery.get("missing"):
+                    self.store.add_context(
+                        sid,
+                        event,
+                        [
+                            {
+                                "role": "user",
+                                "content": "Worker recovery missing values: "
+                                + encode(kernel.recovery["missing"])[:2000],
+                            }
+                        ],
+                    )
+        compacted = await self.semantic_compact(sid)
+        # Preparation, review and compaction can await while children finish.
+        # Drain their queued evidence at the last safe boundary before assembling
+        # this request, rather than needlessly withholding it until after the reply.
+        self.receive(sid, include_followups=False)
         schemas = self.tools.schemas(config)
-        messages, size = self.context.assemble(sid, schemas)
+        messages, size = self.context.assemble(sid, schemas, proactive=compacted is not False)
         session = self.store.session(sid)
         usage = self.store.usage(session.root_id, tree=True)
         remaining = (
@@ -1349,10 +1426,18 @@ class Runtime(MemoryServices):
             tools=schemas,
             config=route(self.store, sid, session.role, context_size=size),
             input_token_bound=size,
+            metadata={"execution_inputs": self.context.execution_inputs(sid, messages)},
         )
         for recovery in range(config.retry.attempts):
             try:
-                return await self._model_call(sid, request)
+                response, event = await self._model_call(sid, request)
+                self.store.event(
+                    sid,
+                    "execution_input_consumed",
+                    request.metadata["execution_inputs"],
+                    parent=event,
+                )
+                return response, event
             except HarnessError as exc:
                 if exc.failure.code not in {
                     "context_overflow",
@@ -1382,7 +1467,14 @@ class Runtime(MemoryServices):
                 )
                 size = smaller
                 request = request.model_copy(
-                    update={"messages": messages, "input_token_bound": size}
+                    update={
+                        "messages": messages,
+                        "input_token_bound": size,
+                        "metadata": {
+                            **request.metadata,
+                            "execution_inputs": self.context.execution_inputs(sid, messages),
+                        },
+                    }
                 )
         raise AssertionError("Unreachable context recovery loop")
 
@@ -1798,6 +1890,18 @@ class Runtime(MemoryServices):
                 "UPDATE actions SET status='done',result=?,result_event=? WHERE id=?",
                 (encode(exposed), eid, action_id),
             )
+            if isinstance(raw, dict) and (
+                raw.get("passed") is False
+                or isinstance(raw.get("exit_code"), int)
+                and raw["exit_code"] != 0
+                or raw.get("error")
+            ):
+                self.store.event(
+                    sid,
+                    "execution_failure_observed",
+                    {"action_id": action_id, "result_event": eid, "result": exposed},
+                    parent=eid,
+                )
             return exposed
 
     def _kernel(self, sid):
@@ -1825,6 +1929,7 @@ class Runtime(MemoryServices):
                     "parent_id": session.parent_id,
                     "name": session.name,
                     "task": session.instruction,
+                    "original_task": self.context.original_task(sid),
                     "messages_path": str(self.context.history_file(sid)),
                     "control_plane": self.store.config(sid).control_plane,
                     "research_read_only": self.store.config(sid).execution.read_only,

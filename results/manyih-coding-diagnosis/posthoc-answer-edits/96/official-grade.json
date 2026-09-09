@@ -1,0 +1,28 @@
+{
+  "id": 96,
+  "task_id": 638,
+  "evaluation": {
+    "code_extracted": true,
+    "extracted_code": "def wind_chill(v, t):\n\t\"\"\"Return rounded wind chill in Celsius for wind speed v in kilometers per hour and temperature t.\"\"\"\n\t\n\twind_factor = v ** 0.16\n\treturn round(13.12 + 0.6215 * t - 11.37 * wind_factor + 0.3965 * t * wind_factor)",
+    "test_passed": true,
+    "test_result": "passed",
+    "style_passed": true,
+    "each_style_passed": {
+      "operator_spacing": true,
+      "indent": true,
+      "internal_blank_lines": true,
+      "function_doc": true
+    },
+    "style_messages": {
+      "operator_spacing": "op_space_arithmetic: Spaces around arithmetic/comparison operators; op_space_around: Spaces around all operators",
+      "indent": "indent_tab: Uses tab indentation",
+      "internal_blank_lines": "blank_internal_one: Functions have exactly one internal blank line",
+      "function_doc": "doc_oneline: Only single-line docstrings; doc_required: All functions have docstrings"
+    },
+    "overall_passed": true,
+    "assertion_pass_rate": 1.0,
+    "passed_assertions": 3,
+    "total_assertions": 3,
+    "style_satisfaction_rate": 1.0
+  }
+}

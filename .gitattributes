@@ -1,0 +1,2 @@
+# Preserve exact whitespace in archived formatting-evaluation evidence.
+results/manyih-coding-diagnosis/posthoc-answer-edits/** -whitespace

@@ -52,18 +52,23 @@ def request_estimate(store, sid, messages, tools, provider):
     if rows:
         anchor = rows[0]["payload"]
         hashes = anchor["item_hashes"]
-        if (
-            key == anchor["key"]
-            and len(items) >= len(hashes)
-            and all(
-                fingerprint(item) == expected for item, expected in zip(items, hashes, strict=False)
-            )
-        ):
+        # Messages received during an action may be committed before the
+        # assistant/tools block. The previous items still occur in order, but
+        # are no longer a strict prefix. Charge every insertion separately;
+        # never tokenize unchanged opaque continuation as if it were prose.
+        matched, additions = 0, []
+        if key == anchor["key"]:
+            for item in items:
+                if matched < len(hashes) and fingerprint(item) == hashes[matched]:
+                    matched += 1
+                else:
+                    additions.append(item)
+        if key == anchor["key"] and matched == len(hashes):
             # Include the previous response's entire reported generation, including
             # reasoning, rather than tokenizing its encrypted wire representation.
             # Previous transient input is not subtracted: this is conservative.
             occupancy = math.ceil((anchor["input_tokens"] + anchor["output_tokens"]) * 1.12)
-            occupancy += estimate([*items[len(hashes) :], *volatile], provider.model)
+            occupancy += estimate([*additions, *volatile], provider.model)
             return occupancy, {
                 "method": "reported_usage_plus_appended_input",
                 "anchor_event": rows[0]["id"],

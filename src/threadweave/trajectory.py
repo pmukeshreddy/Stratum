@@ -4,7 +4,9 @@ import json
 
 
 class TrajectoryHistory:
-    def trajectory(self, sid, *, limit=1000, max_chars=None, char_budget=80000):
+    def trajectory(
+        self, sid, *, limit=1000, max_chars=None, char_budget=80000, include_bookkeeping=True
+    ):
         from .storage import encode
 
         session = self.session(sid)
@@ -34,6 +36,28 @@ class TrajectoryHistory:
             "user_intervention",
             "refinement_evidence_chunk",
         }
+        if not include_bookkeeping:
+            # These receipts duplicate the committed work below. Keep them in the ledger,
+            # but do not spend reviewer context on scheduling and accounting machinery.
+            ignored.update(
+                {
+                    "action_fingerprint",
+                    "environment_action_started",
+                    "environment_action_finished",
+                    "session_transition",
+                    "mutation_observation_started",
+                    "mutation_observation_finished",
+                    "execution_input_consumed",
+                    "turn_completed",
+                    "environment_prepare",
+                    "environment_prepared",
+                    "refinement_requested",
+                    "refinement_status",
+                    "refinement_trigger",
+                    "automatic_refinement",
+                    "manual_refinement",
+                }
+            )
         records = []
         rows = self.db.execute(
             "SELECT e.*,b.messages AS committed_messages FROM events e LEFT JOIN conversation_blocks b "

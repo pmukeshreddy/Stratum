@@ -35,11 +35,12 @@ class EnvironmentAction(Record):
 
 
 class MatchedProvider:
-    def __init__(self, provider, config, log, gate=None, owner=None):
+    def __init__(self, provider, config, log, gate=None, owner=None, request_validator=None):
         self.provider, self.config, self.log = provider, config, Path(log)
         self.gate, self.owner = gate, owner
         self.primary_usages = []
         self.refinement_config = refinement_provider_config(config)
+        self.request_validator = request_validator
 
     async def resolve(self, config, *, reasoning_off=False):
         expected = refinement_provider_config(self.config) if reasoning_off else self.config
@@ -82,6 +83,8 @@ class MatchedProvider:
             return result
 
     async def _invoke(self, request, emit):
+        if self.request_validator:
+            self.request_validator(request)
         structured = (
             request.request_kind == "auxiliary"
             and request.reasoning_mode == "off"
@@ -227,6 +230,7 @@ async def run_buffalo(
     controller=None,
     task_config=None,
     workspace=None,
+    request_validator=None,
 ):
     directory = Path(directory)
     workspace = Path(workspace) if workspace is not None else directory / "workspace"
@@ -246,6 +250,7 @@ async def run_buffalo(
     if task_config is not None:
         resolved.task = task_config.model_copy(deep=True)
         resolved.task.instruction_messages = task["messages"][:-1]
+    resolved.task.original_messages = task["messages"]
     if controller:
         resolved.task.adapter = "interactive_evaluation"
         resolved.task.verifier = "terminal"
@@ -264,6 +269,7 @@ async def run_buffalo(
         directory / "provider-calls.jsonl",
         gate=gate,
         owner=owner,
+        request_validator=request_validator,
     )
     runtime = Runtime(
         directory / "state",
@@ -292,6 +298,15 @@ async def run_buffalo(
     begin, started = time.monotonic(), timestamp()
     try:
         session = runtime.create(instruction, workspace, config=resolved)
+        save(
+            directory / "initial-harness-state.json",
+            {
+                "session_id": session.id,
+                "states": runtime.store.states(session.id),
+                "selected_state": session.selected_state,
+                "state_directory": str(runtime.store.directory.resolve()),
+            },
+        )
         if controller:
             controller.identity["session_id"] = session.id
 
@@ -341,6 +356,12 @@ async def run_buffalo(
         active = list(runtime.tasks.values())
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+        # Background reviews share the same ledger. Settle cancellation before
+        # reporting usage, including uncertain provider usage on interruption.
+        refinements = list(runtime._active_refinements)
+        for task in refinements:
+            task.cancel()
+        await asyncio.gather(*refinements, return_exceptions=True)
         session = runtime.store.session(session.id)
         usage = runtime.store.usage(session.id, tree=True)
         result = {

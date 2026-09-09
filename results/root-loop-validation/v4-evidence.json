@@ -1,0 +1,156 @@
+{
+  "component_audit": {
+    "root_id": "f9a0299280f94282a69c8d4191b38d27",
+    "children": [
+      {
+        "id": "20912cf18e6b46ec8a655a212a526e7b",
+        "name": "records-audit",
+        "outcome": "completed",
+        "turns": 7
+      },
+      {
+        "id": "f3e12d867ccd4fd3be2a0a2777d17aa8",
+        "name": "ledger-audit",
+        "outcome": "completed",
+        "turns": 5
+      },
+      {
+        "id": "184d2a0033044576a08d69db20fc4bc1",
+        "name": "ordering-audit",
+        "outcome": "completed",
+        "turns": 6
+      }
+    ],
+    "parent_execution_during_child_inference": [
+      {
+        "root_event": "b3be6e705e954184b8aee020e1f6a3ac",
+        "root_code": "import sys, importlib.util, copy, itertools\nsys.dont_write_bytecode = True\n# Load directly from the audited workspace without writing bytecode or altering files.\ndef load_local(name):\n    spec = importlib.util.spec_from_file_location(name, workspace / (name + '.py'))\n    module = importlib.util.module_from_spec(spec)\n    spec.loader.exec_module(module)\n    return module\nintervals = load_local('intervals')\ninterval_cases = [[], [[1, 2], [2, 3]], [[2, 2]], [[1, 10], [2, 3]], [[1, 10], [2, 2]], [[1, 10], [2, 3], [4, 5]], [[3, 1]], [[4, 6], [1, 3]], [[-3, -1], [-2, 2]]]\nfor inp in interval_cases:\n    saved = copy.deepcopy(inp)\n    try:\n        out = intervals.merge_intervals(inp)\n        length = intervals.covered_length(inp)\n        print(f'{inp!r}: merge={out!r}, covered_length={length!r}; unchanged={inp == saved}')\n    except Exception as exc:\n        print(f'{inp!r}: {type(exc).__name__}({str(exc)!r}); unchanged={inp == saved}')\n# Independent oracle: union of integer unit cells, reconstructed into maximal runs.\ndef interval_cell_oracle(rows):\n    if any(a > b for a, b in rows):\n        raise ValueError('reversed interval')\n    cells = set().union(*(set(range(a, b)) for a,b in rows)",
+        "inflight_child_requests": [
+          "b37feebad23443278efa763c7fdae4a5",
+          "4d73ae94f8b1425d9f7a0a0ad89180ef",
+          "0444547d8eff4ad0a34012698bce83c3"
+        ]
+      },
+      {
+        "root_event": "affbf910523340d2b5d711c89125c346",
+        "root_code": "# Capture tracked-file fingerprints for final read-only verification.\nimport hashlib\nsource_fingerprints = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in workspace.iterdir() if p.is_file()}\nprint('Top-level files:', sorted(source_fingerprints))\nprint('Tracked files:')\nresult = await bash('git ls-files; git diff --exit-code; git status --short')\nprint(result['stdout'])\nprint('exit_code:', result['exit_code'])\nprint(await agent_message.receive())",
+        "inflight_child_requests": [
+          "0444547d8eff4ad0a34012698bce83c3",
+          "de08204e75e34051b94b6d1ad042ba3b",
+          "3cdfce5b997946e2bf100f0d80c10441"
+        ]
+      },
+      {
+        "root_event": "7fc4e738aa254539bb9874be828af668",
+        "root_code": "print(await agent_message.send('Important audit distinction: duplicate edges increment/decrement symmetrically, so do not call multiplicity itself an observable defect without counterexample. Check dynamic eligibility tie-breaking and duplicate-edge order interactions; report passing behavior where appropriate. Root has intervals exhaustive oracle and will integrate.', receiver_role='child', receiver_name='ordering-audit'))\nprint(await agent_message.send('Please separate malformed-quoting/multi-record behavior from any unspecified input-type or zero-field record assumptions. Recommend safe csv writer terminator handling (full terminator then remove exactly generated suffix, not lineterminator=\"\" / rstrip). Root integrating.', receiver_role='child', receiver_name='records-audit'))\n# Focused additional interval contracts: reversed intervals anywhere and tuple/list input preservation.\ninterval_extra = [((4, 6), (1, 3)), [[1, 10], [7, 6]], [[1, 4], [1, 4]], [[1, 4], [1, 2]]]\nfor value in interval_extra:\n    before = copy.deepcopy(value)\n    try:\n        output = intervals.merge_intervals(value)\n        print(repr(value), '->', repr(output), 'all output lists:', all(type(x) is list for ",
+        "inflight_child_requests": [
+          "bc70175d73cb44e4ba47762669580c82",
+          "57968a7d231943c5bb6e53dcefb29a7b",
+          "671dff6e6d9a4c02aecad9adf54c52f0"
+        ]
+      },
+      {
+        "root_event": "797cb68db4374592bb3df8e747532184",
+        "root_code": "print(await agent_message.receive())\n# Verify the concrete integration examples directly in the parent.\nledger = load_local('ledger')\nrecords = load_local('records')\nordering = load_local('ordering')\ndef E(account, identity, status='settled', amount=3):\n    return dict(account=account, id=identity, status=status, amount=amount)\ndef observe_call(label, fn, *args):\n    try:\n        value = fn(*args)\n        print(f'{label} -> {value!r}')\n    except Exception as ex:\n        print(f'{label} -> {type(ex).__name__}: {ex}')\nprint('LEDGER')\nfor label, events in [\n    ('cross-account', [E('A','x'), E('B','x',amount=5)]),\n    ('pending-then-settled', [E('A','x','pending'), E('A','x')]),\n    ('cancelled-then-settled', [E('A','x','cancelled'), E('A','x')]),\n    ('settled-conflict', [E('A','x'), E('A','x',amount=4)]),\n    ('same-settled-repeat', [E('A','x'), E('A','x')]),\n    ('zero-retained', [E('A','x',amount=0)]),\n    ('offset-zero', [E('A','x',amount=3), E('A','y',amount=-3)]),\n]:\n    observe_call(label, ledger.reconcile, events)\nfor amount in [True, '7', 2.9]:\n    observe_call(f'amount {amount!r}', ledger.reconcile, [E('A','x', amount=amount)])\nprint('RECORDS')\nfor fields in [['a,b'], ['\"'",
+        "inflight_child_requests": [
+          "671dff6e6d9a4c02aecad9adf54c52f0",
+          "c8db7857ca304e048a1679d8ccf3257d",
+          "ab07b17cc4f64fb9a9a1f3d43ce3c0fa"
+        ]
+      }
+    ],
+    "validated_child_use": [
+      {
+        "id": "969cbe84a15d4dcb8c5be50fbb8c1698",
+        "child_id": "f3e12d867ccd4fd3be2a0a2777d17aa8",
+        "evidence_events": [
+          "a73367388bc44a74931a42f03d8aca29"
+        ],
+        "root_action_events": [
+          "cfbb8d35be2b484987c15ade3cd10188",
+          "ab0f3f0db298456baed1b557ee9b833c"
+        ],
+        "effect": "The root turned the child's ledger findings and passing controls into direct integration checks and reproduced their observed outputs."
+      },
+      {
+        "id": "4d7de109565e48c895caf7a607ba40df",
+        "child_id": "20912cf18e6b46ec8a655a212a526e7b",
+        "evidence_events": [
+          "b9d149e388144f0695649d788662fec7"
+        ],
+        "root_action_events": [
+          "cfbb8d35be2b484987c15ade3cd10188",
+          "ab0f3f0db298456baed1b557ee9b833c"
+        ],
+        "effect": "The root directly rechecked the child's comma, quote, malformed-quoting, and passing preservation examples. Its attempted newline corroboration used different input bytes, so this use does not establish parent verification of actual-newline behavior."
+      },
+      {
+        "id": "15fa2375038243379e92556ec693c545",
+        "child_id": "184d2a0033044576a08d69db20fc4bc1",
+        "evidence_events": [
+          "65fdc73d611547ccb171caac40ebf4b1",
+          "672d9422ebae40dfb5efdedff5cb4612"
+        ],
+        "root_action_events": [
+          "a76115ed61444dd195dc5e6bbac4fedc",
+          "0333e71be50e416db878fa028ca5b86a"
+        ],
+        "effect": "The root reproduced the child's ordering counterexamples, including dynamic tie-breaking, duplicate-edge sensitivity, wrong endpoint exceptions, accepted duplicate nodes, and silently accepted cycles. It also verified the passing sole-duplicated-edge control and unchanged integration inputs. The child's exhaustive graph enumeration was not rerun here."
+      },
+      {
+        "id": "4bac78dbaeed48318d2abcac000a32cd",
+        "child_id": "20912cf18e6b46ec8a655a212a526e7b",
+        "evidence_events": [
+          "adeea65fa2144d6d888f2a0ccad6f04c"
+        ],
+        "root_action_events": [
+          "a76115ed61444dd195dc5e6bbac4fedc",
+          "0333e71be50e416db878fa028ca5b86a"
+        ],
+        "effect": "The root used the child's independent CSV cross-check and strict-parser caveat. Its stdout reports two rows from the encoded newline field, correct stdlib interpretation of quoted delimiters and doubled quotes, rejection of the two malformed quoted examples, and acceptance of a bare interior quote despite strict=True. This was not a complete rerun of the records audit."
+      }
+    ]
+  },
+  "optimality_review": {
+    "root_id": "417bf312e59d4d19afa3bab105448ad6",
+    "children": [
+      {
+        "id": "2fd66ef59b0f4c60a025d7a345d9444f",
+        "name": "math-review",
+        "outcome": "completed",
+        "turns": 4
+      }
+    ],
+    "parent_execution_during_child_inference": [
+      {
+        "root_event": "9497e0db1e3b428ba1301150459ff186",
+        "root_code": "from collections import Counter\nfrom fractions import Fraction\nchecked = 0\nsuboptimal = 0\nworst_ratio = Fraction(0)\nworst_jobs = None\nfor n in range(7):\n    for sequence in product(range(1, 5), repeat=n):\n        jobs = list(sequence)\n        original = jobs.copy()\n        cost, groups = allocator.least_loaded(jobs)\n        optimum, _ = exact_partition(jobs)\n        assert jobs == original\n        assert len(groups) == 2\n        assert Counter(groups[0] + groups[1]) == Counter(jobs)\n        assert cost == max(map(sum, groups))\n        assert optimum <= cost\n        assert 2 * cost <= 3 * optimum\n        checked += 1\n        suboptimal += cost > optimum\n        if optimum and Fraction(cost, optimum) > worst_ratio:\n            worst_ratio = Fraction(cost, optimum)\n            worst_jobs = jobs.copy()\nprint({'exhaustive_domain': 'length 0..6, durations 1..4', 'checked': checked, 'suboptimal': suboptimal, 'max_ratio': str(worst_ratio), 'first_maximizer': worst_jobs, 'all_feasibility_and_bound_checks_passed': True})\nprint('source unchanged:', hashlib.sha256(allocator_path.read_bytes()).hexdigest() == allocator_hash_before)\nprint('Source with line numbers:')\nfor i, line in enumerate(allo",
+        "inflight_child_requests": [
+          "4796351a6c0b48d18ce9090c34c3d277"
+        ]
+      },
+      {
+        "root_event": "eb813b41a9c54a3f96c32bd2dca5581a",
+        "root_code": "print(await agent_observe.recent_messages(reviewer.session_id))\n# Source-level invariant and repository cleanliness check, without editing allocator.py.\nimport subprocess\nstatus = subprocess.run(['git','status','--short'], cwd=workspace, text=True, capture_output=True, check=True)\nprint('git status --short:', repr(status.stdout))\nprint('allocator.py SHA-256 unchanged:', hashlib.sha256(allocator_path.read_bytes()).hexdigest() == allocator_hash_before)",
+        "inflight_child_requests": [
+          "4796351a6c0b48d18ce9090c34c3d277"
+        ]
+      }
+    ],
+    "validated_child_use": [
+      {
+        "id": "25b064c4b10e46fd9feac26fb52c0e76",
+        "child_id": "2fd66ef59b0f4c60a025d7a345d9444f",
+        "evidence_events": [
+          "2d14dbd3beb54b1abb64f7a2c67afeb5",
+          "43ea72609911416cacac1a2d8102b43e",
+          "cf46cc4c5fcf4a3f9286cd157ee1726d"
+        ],
+        "root_action_events": [
+          "4b8386543837447cac01a8e4d2a02e17"
+        ],
+        "effect": "The root synthesizes the child's feasibility argument, sufficient-versus-necessary optimality distinction, exact subset-sum criterion, tight 3/2 proof, and qualified time/space analysis alongside the root's empirical counterexamples."
+      }
+    ]
+  }
+}

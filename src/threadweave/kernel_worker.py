@@ -145,7 +145,6 @@ class Worker:
             "workspace": workspace,
             "remember_recipe": self.remember_recipe,
             "forget": self.forget,
-            "rlm": self.rlm,
         }
         metadata_path = directory / "bootstrap.json"
         metadata = json.loads(metadata_path.read_text()) if metadata_path.is_file() else {}
@@ -155,8 +154,6 @@ class Worker:
         from .kernel_api import bootstrap
 
         self.host = bootstrap(self.values["tools"], self.values, metadata)
-        if metadata.get("control_plane", "direct") == "direct":
-            self.values["rlm"] = self.rlm
         self.values["get_ipython"] = lambda: self.shell
         self.shell.user_ns = self.values
         self.protected = set(self.values)
@@ -253,10 +250,6 @@ class Worker:
             raise ValueError("Recipe needs a non-reserved Python variable name")
         compile(code, "<recovery-recipe>", "exec")
         self.recipes[name] = code
-
-    def rlm(self, instruction: str = "", name: str | None = None, **options):
-        """Create/schedule a persistent child, returning JSON-safe handle metadata, not an answer."""
-        return self.values["tools"].call("rlm", instruction=instruction, name=name, **options)
 
     def forget(self, *names):
         for name in names:

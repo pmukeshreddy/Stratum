@@ -343,26 +343,22 @@ def builtins() -> ToolRegistry:
         return c.runtime.artifacts.load(c.session_id, a.artifact_id)
 
     async def spawn(c, a):
-        instruction = a.instruction
-        if a.spec_id:
-            entry = c.runtime.store.state(c.session_id, a.spec_id)
-            if entry["kind"] != "subagent_spec" or entry["deleted"]:
-                raise ValueError("A live subagent_spec entry is required")
-            instruction = entry["content"]["instruction"] + "\n" + instruction
-        if not instruction.strip():
-            raise ValueError("An instruction or subagent specification is required")
-        session = c.runtime.spawn(
-            c.session_id,
-            instruction,
-            name=a.name,
-            role=a.role,
-            isolate=a.isolate,
-            model=a.model,
-            thinking=a.thinking,
-            adapter=a.adapter,
-            purpose=a.purpose,
-        )
-        return {"session_id": session.id, "name": session.name, "parent_id": session.parent_id}
+        # The explicit-tool control plane adapts to the same admission implementation
+        # as Python's rlm(). It does not own a second child runtime.
+        from .host_api import Request, dispatch
+
+        payload = a.model_dump(exclude_none=True)
+        payload["purpose"] = a.purpose
+        payload["prompt"] = payload.pop("instruction")
+        if a.model:
+            config = c.runtime.store.config(c.session_id)
+            provider = config.models.get(a.model)
+            if provider:
+                payload["model"] = provider.name + "/" + provider.model
+            elif "/" not in a.model:
+                payload["model"] = config.provider.name + "/" + a.model
+        handle = await dispatch(c, Request(operation="rlm.run", payload=payload))
+        return {**handle, "parent_id": c.session_id}
 
     async def message(c, a):
         return {

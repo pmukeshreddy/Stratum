@@ -151,6 +151,10 @@ class EvidenceReducer:
 async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config, sizes):
     config.provider.model = "gpt-6-astra"
     config.context.max_tokens = 4096
+    config.task.instruction_messages = [
+        {"role": "system", "content": "Use the original task contract when assessing a candidate."},
+        {"role": "developer", "content": "Preserve evidence in order."},
+    ]
     provider = EvidenceReducer()
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     root = runtime.create("Learn from observed failures", tmp_path, config=config)
@@ -171,6 +175,12 @@ async def test_refinement_chunks_complete_records_and_accounts(tmp_path, config,
         await runtime._refinement_pass(root.id, "completion")
         assert len(provider.requests) > 1
         assert all(request.input_token_bound <= 4096 - 128 for request in provider.requests)
+        for request in provider.requests:
+            assert json.loads(request.messages[-1]["content"])["original_task"][
+                "messages"
+            ] == config.task.instruction_messages + [
+                {"role": "user", "content": "Learn from observed failures"}
+            ]
         final = provider.requests[-1].messages[-1]["content"]
         assert "EARLY-LESSON" in final and "LATE-LESSON" in final
         assert all(eid in final for eid in ids)

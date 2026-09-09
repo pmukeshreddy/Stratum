@@ -1,0 +1,28 @@
+{
+  "id": 40,
+  "task_id": 557,
+  "evaluation": {
+    "code_extracted": true,
+    "extracted_code": "# Licensed under the MIT License.\ndef toggle_string(string: str)->str:\n    \"\"\"Swap the case of each letter.\"\"\"\n\n    return string.swapcase()",
+    "test_passed": true,
+    "test_result": "passed",
+    "style_passed": true,
+    "each_style_passed": {
+      "internal_blank_lines": true,
+      "type_hints": true,
+      "operator_spacing": true,
+      "license": true
+    },
+    "style_messages": {
+      "internal_blank_lines": "blank_internal_one: Functions have exactly one internal blank line; blank_internal_required: Functions have internal blank lines",
+      "type_hints": "types_full: Full type hints on all functions; types_args_required: Type hints on arguments required",
+      "operator_spacing": "op_space_minimal: Spaces around = only",
+      "license": "license_mit: Has MIT license"
+    },
+    "overall_passed": true,
+    "assertion_pass_rate": 1.0,
+    "passed_assertions": 3,
+    "total_assertions": 3,
+    "style_satisfaction_rate": 1.0
+  }
+}

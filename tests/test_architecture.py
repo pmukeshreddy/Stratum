@@ -161,9 +161,9 @@ async def test_root_rlm_messages_layers_refinement_detach_recovery(tmp_path, con
                 response(
                     "python",
                     code=(
-                        "assert x == 123\nleft = rlm('Left work', name='left')\n"
-                        "right = rlm('Right work', name='right')\n"
-                        "assert left['session_id'] != right['session_id']\n"
+                        "assert x == 123\nleft = await rlm('Left work', name='left')\n"
+                        "right = await rlm('Right work', name='right')\n"
+                        "assert left.session_id != right.session_id\n"
                         "tools.call('workspace_write', path='root-continued', content='continued immediately')\nprint(x)"
                     ),
                 )
@@ -385,7 +385,7 @@ async def test_rlm_recurses_and_can_message_sibling(runtime, tmp_path, config):
         return response(
             "python",
             code=(
-                "leaf = rlm('Nested objective', name='leaf')\n"
+                "leaf = await rlm('Nested objective', name='leaf')\n"
                 "sibling = next(s['id'] for s in tools.call('agent_sessions') if s['name'] == 'right')\n"
                 "tools.call('agent_message', recipient_id=sibling, body='persistent sibling message')"
             ),

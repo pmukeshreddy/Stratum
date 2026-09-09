@@ -1,0 +1,28 @@
+{
+  "id": 21,
+  "task_id": 395,
+  "evaluation": {
+    "code_extracted": true,
+    "extracted_code": "def first_non_repeating_character(str1: str) -> str | None:\n\tcounts = {}\n\tfor character in str1:\n\t\tcounts[character] = counts.get(character, 0) + 1\n\n\tfor character in str1:\n\t\tif counts[character] == 1:\n\t\t\treturn character\n\treturn None",
+    "test_passed": true,
+    "test_result": "passed",
+    "style_passed": true,
+    "each_style_passed": {
+      "type_hints": true,
+      "line_length": true,
+      "indent": true,
+      "internal_blank_lines": true
+    },
+    "style_messages": {
+      "type_hints": "types_args_required: Type hints on arguments required; types_full: Full type hints on all functions",
+      "line_length": "line_120: All lines <= 120 chars",
+      "indent": "indent_tab: Uses tab indentation",
+      "internal_blank_lines": "blank_internal_required: Functions have internal blank lines; blank_internal_one: Functions have exactly one internal blank line"
+    },
+    "overall_passed": true,
+    "assertion_pass_rate": 1.0,
+    "passed_assertions": 3,
+    "total_assertions": 3,
+    "style_satisfaction_rate": 1.0
+  }
+}

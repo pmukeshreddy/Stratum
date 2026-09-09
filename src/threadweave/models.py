@@ -115,6 +115,11 @@ class RefinementPolicy(Record):
     verifier_failures: int = Field(default=3, ge=1)
     max_proposals: int = Field(default=3, ge=1, le=10)
     skill_failure_limit: int = Field(default=3, ge=1)
+    automatic_budget_seconds: float = Field(default=120, gt=0)
+    continuation_reserve_seconds: float = Field(default=60, ge=0)
+    reasoning: Literal["off", "inherit"] = "off"
+    completion_followup: bool = False
+    root_only: bool = True
 
 
 class Features(Record):
@@ -181,6 +186,8 @@ class TaskConfig(Record):
     adapter: str = "workspace"
     # Verbatim role-bearing task instructions survive trajectory compaction.
     instruction_messages: list[dict[str, Any]] = Field(default_factory=list)
+    # Optional immutable source contract when an adapter wraps the current assignment.
+    original_messages: list[dict[str, Any]] = Field(default_factory=list)
     specification: dict[str, Any] = Field(default_factory=dict)
     verifier: str = Field(default="none", min_length=1)
     verifier_options: dict[str, Any] = Field(default_factory=dict)

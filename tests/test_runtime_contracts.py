@@ -497,6 +497,12 @@ async def test_background_completion_queues_result_and_idle_followup_waits(tmp_p
 
 
 async def test_compaction_request_edges_and_committed_summaries(tmp_path, config):
+    config.task.instruction_messages = [
+        {"role": "system", "content": "Verify claims against the source."},
+        {"role": "developer", "content": "Keep evidence references."},
+    ]
+    original = config.task.instruction_messages + [{"role": "user", "content": "work"}]
+
     class Provider:
         def __init__(self):
             self.requests = []
@@ -504,6 +510,10 @@ async def test_compaction_request_edges_and_committed_summaries(tmp_path, config
         async def invoke(self, request, emit):
             self.requests.append(request)
             if request.metadata.get("purpose") == "compaction":
+                assert (
+                    json.loads(request.messages[-1]["content"])["original_task"]["messages"]
+                    == original
+                )
                 return ModelResponse(
                     text=encode(
                         {
@@ -983,5 +993,44 @@ async def test_idle_followup_is_in_first_request_when_session_is_already_idle(tm
         assert len(provider.requests) == 2
         assert "IDLE-FOLLOWUP" in encode(provider.requests[-1].messages)
         assert not runtime.store.session(root.id).runnable
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize("finish_before_wait", [False, True])
+async def test_awaited_shell_result_does_not_enqueue_duplicate_notification(
+    tmp_path, config, finish_before_wait
+):
+    from threadweave.background import BackgroundProcesses
+
+    config.permissions.append("process")
+    runtime = Runtime(tmp_path / "state", providers={"mock": object()})
+    try:
+        root = runtime.create("Inspect output", tmp_path, config=config)
+        runtime.background = BackgroundProcesses(runtime)
+        source = runtime.store.event(root.id, "test_shell", {})
+        context = ToolContext(runtime, root.id, new_id(), source)
+        handle = await runtime.background.start(context, "sleep 0.05; printf OBSERVED_OUTPUT")
+        job = handle["id"]
+        unrelated = runtime.message(None, root.id, "New requirement")
+        if finish_before_wait:
+            await runtime.background.tasks[job]
+            assert any(
+                "Background process completed" in m["body"]
+                for m in runtime.store.messages(root.id, pending=True)
+            )
+        result = await runtime.background.call(context, "wait", {"id": job, "owned": True})
+        assert result["exit_code"] == 0 and result["stdout"] == "OBSERVED_OUTPUT"
+        assert [m["id"] for m in runtime.store.messages(root.id, pending=True)] == [unrelated]
+        assert runtime.store.events(root.id, kind="execution_result")
+        assert not runtime.background.waiters
+        if finish_before_wait:
+            assert runtime.store.events(root.id, kind="process_result_consumed")
+        # Unawaited jobs retain asynchronous delivery, including the same output.
+        next_job = await runtime.background.start(context, "printf BACKGROUND_OUTPUT")
+        await runtime.background.tasks[next_job["id"]]
+        assert any(
+            "BACKGROUND_OUTPUT" in m["body"] for m in runtime.store.messages(root.id, pending=True)
+        )
     finally:
         await runtime.shutdown()

@@ -64,6 +64,11 @@ auth logout signs out of the shared Codex login.
 
 ## Architecture
 
+The root's ordinary action loop chooses how to solve each task. See the
+[execution architecture and Python API](docs/adaptive-orchestration.md),
+[exact root foundation](docs/root-foundation.txt), and
+[targeted validation](docs/adaptive-validation.md).
+
 ```text
 Human ↔ Agents View ↔ Root Session ↔ Environment
                           ↕ rlm / messages    ↕

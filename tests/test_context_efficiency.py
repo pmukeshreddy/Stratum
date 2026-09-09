@@ -250,7 +250,8 @@ def test_reported_occupancy_anchor_restores_and_preserves_opaque_state(tmp_path,
         _, items = responses_input(
             context.messages(root.id), provider=[config.provider.name, config.provider.model]
         )
-        assert items[1:3] == [opaque, native]
+        offset = items.index(opaque)
+        assert items[offset : offset + 2] == [opaque, native]
         # Any rewritten prefix or changed tool contract invalidates the anchor.
         messages = context.messages(root.id)
         messages[1]["content"] += " Changed objective."
@@ -325,3 +326,117 @@ async def test_interrupted_compaction_does_not_commit_partial_state(tmp_path, co
         assert runtime.store.usage(root.id).estimated_calls == 1
     finally:
         await runtime.shutdown()
+
+
+@pytest.mark.parametrize("input_size,needs_compaction", [(9000, False), (11000, True)])
+async def test_late_compaction_keeps_fitting_evidence_but_enforces_capacity(
+    tmp_path, config, monkeypatch, input_size, needs_compaction
+):
+    config.context.max_tokens = 10000
+    config.context.recent_blocks = 1
+    config.limits.wall_seconds = 300
+    config.refinement.automatic = False
+    responses = [ModelResponse(text="Verified conclusion.")]
+    if needs_compaction:
+        responses.insert(
+            0,
+            ModelResponse(
+                text=encode(
+                    {
+                        "unresolved_requirements": ["Retain the constraint."],
+                        "established_facts": ["Old evidence verified."],
+                    }
+                )
+            ),
+        )
+    provider = ScriptedProvider({"root": responses})
+    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
+    try:
+        root = runtime.create("Retain the constraint.", tmp_path, config=config)
+        add_block(runtime.store, root.id, "OLD_FULL_EVIDENCE")
+        add_block(runtime.store, root.id, "RECENT_FULL_EVIDENCE")
+        runtime.store.update(root.id, started_at=now())
+        monkeypatch.setattr(runtime, "_elapsed", lambda sid: 200)
+        monkeypatch.setattr(
+            runtime.context,
+            "request_estimate",
+            lambda sid, *args, **kwargs: (
+                1000 if runtime.store.session(sid).summary else input_size,
+                {},
+            ),
+        )
+        await runtime._invoke(root.id)
+        assert bool(runtime.store.events(root.id, kind="context_compaction")) is needs_compaction
+        assert (
+            bool(runtime.store.events(root.id, kind="compaction_deferred")) is not needs_compaction
+        )
+        assert len(provider.requests) == (2 if needs_compaction else 1)
+        assert "RECENT_FULL_EVIDENCE" in encode(provider.requests[-1].messages)
+        if not needs_compaction:
+            assert "OLD_FULL_EVIDENCE" in encode(provider.requests[-1].messages)
+        assert provider.requests[-1].input_token_bound < 10000 - config.provider.max_output_tokens
+    finally:
+        await runtime.shutdown()
+
+
+def test_usage_anchor_counts_messages_inserted_before_committed_response(tmp_path, config):
+    from threadweave.request_context import record_usage
+
+    config.provider.name = "codex_subscription"
+    config.provider.model = "gpt-6-astra"
+    with closing(Store(tmp_path / "state")) as store:
+        root = store.create("Inspect all evidence", Workspace(path=str(tmp_path)), config)
+        context = Context(store)
+        request = ModelRequest(
+            session_id=root.id,
+            root_id=root.id,
+            parent_id=None,
+            name="root",
+            turn=0,
+            messages=context.messages(root.id),
+            tools=[],
+            config=config.provider,
+            input_token_bound=2000,
+        )
+        opaque = {
+            "type": "reasoning",
+            "id": "private",
+            "encrypted_content": "opaque-123-" * 12000,
+            "summary": [],
+        }
+        response = ModelResponse(
+            text="Candidate checked.",
+            provider_items=[
+                opaque,
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Candidate checked."}],
+                },
+            ],
+            usage=Usage(input_tokens=1000, output_tokens=500),
+        )
+        event = store.event(root.id, "model_response", {})
+        store.db.execute(
+            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
+            (event, config.provider.name, config.provider.model, encode(response.provider_items)),
+        )
+        record_usage(store, root.id, request, response, event)
+        add_block(store, root.id, "Child found a boundary failure while the action was executing.")
+        store.add_context(
+            root.id,
+            event,
+            [{"role": "assistant", "content": response.text, "provider_response_event": event}],
+        )
+        add_block(store, root.id, "Action result: verified input.")
+        messages = context.messages(root.id)
+        size, method = context.request_estimate(root.id, messages, [])
+        assert method["method"] == "reported_usage_plus_appended_input"
+        assert 1500 < size < 5000 and method["projection_tokens"] > 15000
+        # Additional inserted evidence is charged, even before the old response.
+        messages.insert(-2, {"role": "user", "content": "Additional child evidence. " * 100})
+        larger, method = context.request_estimate(root.id, messages, [])
+        assert larger > size and method["method"] == "reported_usage_plus_appended_input"
+        # Rewriting/removing an old item invalidates the reported occupancy.
+        messages[1]["content"] = "Different task"
+        assert context.request_estimate(root.id, messages, [])[1]["method"] == "provider_projection"

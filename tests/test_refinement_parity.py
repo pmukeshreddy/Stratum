@@ -1,4 +1,4 @@
-"""Second-pass Prime contracts through runtime triggers, model calls and durable state."""
+"""Refinement contracts through runtime triggers, model calls and durable state."""
 
 import asyncio
 import json
@@ -15,7 +15,7 @@ from threadweave.storage import Store, encode
 from threadweave.subscription import SubscriptionProvider
 
 from .conftest import eventually, response
-from .test_prime_runtime_contracts import ReviewingProvider, seed
+from .test_runtime_contracts import ReviewingProvider, seed
 
 
 def add_state(runtime, sid, source, *, kind="memory", title="existing", content=None):

@@ -215,9 +215,11 @@ async def test_buffalo_recursive_usage_is_settled_and_counted(tmp_path, monkeypa
 
 async def test_cancelled_buffalo_run_counts_inflight_child_usage(tmp_path, monkeypatch):
     child_started = asyncio.Event()
+    invocations = []
 
     class Provider:
         async def invoke(self, request, emit):
+            invocations.append(request.parent_id)
             if request.parent_id:
                 child_started.set()
                 await asyncio.Future()
@@ -242,7 +244,8 @@ async def test_cancelled_buffalo_run_counts_inflight_child_usage(tmp_path, monke
     with pytest.raises(asyncio.CancelledError):
         await task
     usage = json.loads((tmp_path / "usage.json").read_text())
-    assert usage["model_calls"] == 2
+    assert usage["model_calls"] == len(invocations)
+    assert sum(parent is not None for parent in invocations) == 1
     assert usage["estimated_calls"] == 1
     assert usage["subagent_count"] == 1
     sessions = json.loads((tmp_path / "sessions.json").read_text())

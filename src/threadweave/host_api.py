@@ -94,16 +94,32 @@ def harness(context, operation, payload):
     p = dict(payload)
     kind, global_ = p.pop("kind", None), p.pop("global_", False)
     if operation == "list":
-        return [
+        entries = [
             e
             for e in store.states(sid)
             if (kind is None or e["kind"] == kind_name(kind)) and (e["owner_id"] is None) == global_
         ]
+        for entry in entries:
+            store.event(
+                sid,
+                "harness_state_retrieved",
+                {"entry_id": entry["id"], "kind": entry["kind"], "version": entry["version"]},
+                parent=context.source_event,
+            )
+        return entries
     kind = kind_name(kind)
     identifier = p.pop("id", None)
     current = state_entry(context, kind, identifier, global_) if identifier else None
     if operation == "get":
-        return state_entry(context, kind, identifier, global_, p.get("version"))
+        entry = state_entry(context, kind, identifier, global_, p.get("version"))
+        if entry:
+            store.event(
+                sid,
+                "harness_state_retrieved",
+                {"entry_id": entry["id"], "kind": entry["kind"], "version": entry["version"]},
+                parent=context.source_event,
+            )
+        return entry
     if operation == "create" and current:
         raise ValueError("Harness entry already exists")
     if operation in {"update", "delete", "rollback"} and not current:
@@ -232,6 +248,16 @@ async def dispatch(context, request):
             ]
         if op == "rlm.run":
             name = p.get("name")
+            prompt = p["prompt"]
+            requirement = p.get("requirement") or session.instruction
+            spec = None
+            if p.get("spec_id"):
+                spec = store.state(sid, p["spec_id"])
+                if spec["kind"] != "subagent_spec" or spec["deleted"]:
+                    raise ValueError("A live subagent_spec entry is required")
+                prompt = spec["content"]["instruction"] + "\n" + prompt
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("A nonempty assignment is required")
             if name and any(
                 s["name"] == name and s["parent_id"] == sid for s in runtime.related(sid)
             ):
@@ -261,13 +287,32 @@ async def dispatch(context, request):
                 provider, _ = await runtime.providers[provider.name].resolve(provider)
             child = await runtime.spawn_async(
                 sid,
-                p["prompt"],
+                prompt,
                 name=name,
+                role=p.get("role", "agent"),
                 isolate=p.get("isolate"),
                 provider=provider if p.get("model") or p.get("thinking") else None,
                 adapter=p.get("adapter"),
                 purpose=p.get("purpose", "shared"),
             )
+            store.event(
+                sid,
+                "rlm_admitted",
+                {
+                    "child_id": child.id,
+                    "assignment": prompt,
+                    "depth": child.depth,
+                    "originating_task_requirement": requirement,
+                },
+                parent=context.source_event,
+            )
+            if spec:
+                store.event(
+                    sid,
+                    "subagent_spec_used",
+                    {"entry_id": spec["id"], "version": spec["version"], "child_id": child.id},
+                    parent=context.source_event,
+                )
             return {
                 "session_id": child.id,
                 "name": child.name,
@@ -370,9 +415,16 @@ async def dispatch(context, request):
                 or not 80 <= chars <= 2000
             ):
                 raise ValueError("limit must be 1..50 and max_chars 80..2000")
+            messages = store.trajectory(observed, limit=limit, max_chars=chars)
+            store.event(
+                sid,
+                "child_observation",
+                {"child_id": observed, "source_events": [m["id"] for m in messages]},
+                parent=context.source_event,
+            )
             return {
                 "session_id": observed,
-                "messages": store.trajectory(observed, limit=limit, max_chars=chars),
+                "messages": messages,
             }
     if op.startswith("bash."):
         permission(context, "process")
@@ -479,9 +531,20 @@ def skill_operation(context, operation, p):
     if not file and not entry:
         raise KeyError(f"Skill not found: {p['name']}")
     if operation == "load":
+        if file and not set(file.get("required_permissions", ["python"])) <= set(
+            config.permissions
+        ):
+            raise PermissionError("Skill requires unavailable permissions")
+        store.event(
+            sid,
+            "skill_loaded",
+            {
+                "entry_id": entry["id"] if entry else file["path"],
+                "version": entry["version"] if entry else file["sha256"],
+            },
+            parent=context.source_event,
+        )
         if file:
-            if not set(file.get("required_permissions", ["python"])) <= set(config.permissions):
-                raise PermissionError("Skill requires unavailable permissions")
             return {**file, "text": Path(file["path"]).read_text()}
         return entry
     if operation != "prepare":
@@ -499,6 +562,12 @@ def skill_operation(context, operation, p):
         result = validate_skill(entry["content"], config.permissions)
         validate_inputs(result["inputs"], p["inputs"])
         entry_id, version = entry["id"], entry["version"]
+    store.event(
+        sid,
+        "skill_loaded",
+        {"entry_id": entry_id, "version": version, "operation": "prepare"},
+        parent=context.source_event,
+    )
     outcomes = store.db.execute(
         "SELECT passed FROM skill_outcomes WHERE entry_id=? AND version=? ORDER BY rowid DESC LIMIT ?",
         (entry_id, version, config.refinement.skill_failure_limit),

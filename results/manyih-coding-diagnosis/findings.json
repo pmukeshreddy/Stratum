@@ -1,0 +1,52 @@
+{
+  "official_baseline_score_unchanged": 62,
+  "tasks": 100,
+  "style_only_failures": 28,
+  "functional_only_failures": 7,
+  "both_failed": 3,
+  "style_category_failures": {
+    "operator_spacing": 26,
+    "type_hints": 1,
+    "internal_blank_lines": 4,
+    "line_length": 1
+  },
+  "model_request_purposes": {
+    "agent": 102
+  },
+  "agent_request_count_histogram": {
+    "1": 99,
+    "3": 1
+  },
+  "verifier_check_count_histogram": {
+    "0": 100
+  },
+  "verifier_pass_histogram": {
+    "True": 100
+  },
+  "paired": {
+    "buffalo_only": [
+      "19",
+      "37",
+      "41"
+    ],
+    "codex_only": [
+      "18",
+      "32",
+      "33",
+      "69",
+      "77",
+      "96",
+      "97"
+    ]
+  },
+  "exact_two_sided_mcnemar_p": 0.34375,
+  "posthoc_diagnostics": {
+    "NOT_AN_AGENT_SCORE": true,
+    "uses_known_failures": true,
+    "new_model_calls": 0,
+    "edited_task_count": 13,
+    "official_grader_recovered_answers": 13,
+    "new_failures": 0,
+    "saved_answer_counterfactual_total": 75
+  }
+}

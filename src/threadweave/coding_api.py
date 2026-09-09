@@ -60,12 +60,13 @@ class CodingAgents(Recursive):
         )
 
     def help(self):
-        return 'await rlm("Trace cause", name="review", purpose="research"|"candidate"|"shared") returns a HANDLE, not an answer.\nawait agents.wait(seconds=30) defers your next model turn until a message or timeout; do not spend model turns polling.\nawait agent_message.send("findings", receiver_role="parent"); await agent_message.receive().\nawait agent_observe.get(handle.session_id); await agents.candidate(handle, accept=False) inspects, accept=True applies.'
+        return 'await rlm("Trace cause", name="reviewer") returns a persistent handle at admission. Put descriptions in the prompt or requirement. Optional purpose selects a registered profile: shared (default), research, review, candidate, test, performance. Research/review are read-only; candidate/test/performance use isolated worktrees.\nawait agents.wait(seconds=30) returns a pause receipt immediately; end the cell to defer the next model turn until a message or timeout.\nawait agent_message.send("findings", receiver_role="parent"); await agent_message.receive().\nawait agent_observe.get(handle.session_id); await agents.candidate(handle, accept=False) inspects, accept=True applies.'
 
 
 def bindings(bridge, values, metadata, host):
     values["context"] = CodingContext(host, **dict(values["context"]))
     values["rlm"] = values["agents"] = CodingAgents(host)
+    values["rlm"].harness = values["harness"]
     if "edit" in bridge.argument_schemas:
         values["edit"] = Edit(host)
     values["repo"] = Capability(

@@ -1,0 +1,28 @@
+{
+  "id": 24,
+  "task_id": 262,
+  "evaluation": {
+    "code_extracted": true,
+    "extracted_code": "from typing import Any\n\n\ndef split_two_parts(list1: list[Any], L: int)->tuple[list[Any], list[Any]]:\n    return list1[:L], list1[L:]",
+    "test_passed": true,
+    "test_result": "passed",
+    "style_passed": true,
+    "each_style_passed": {
+      "internal_blank_lines": true,
+      "operator_spacing": true,
+      "singleton": true,
+      "type_hints": true
+    },
+    "style_messages": {
+      "internal_blank_lines": "blank_internal_none: No blank lines inside functions",
+      "operator_spacing": "op_space_none: No spaces around operators",
+      "singleton": "singleton_variable_first: Variable appears before singleton; singleton_is: Uses is/is not for singletons",
+      "type_hints": "types_full: Full type hints on all functions; types_args_required: Type hints on arguments required"
+    },
+    "overall_passed": true,
+    "assertion_pass_rate": 1.0,
+    "passed_assertions": 3,
+    "total_assertions": 3,
+    "style_satisfaction_rate": 1.0
+  }
+}
