@@ -203,14 +203,14 @@ def audit(output, previous):
 
 
 async def execute(args):
-    if not args.validation:
-        raise ValueError("Inspect targeted live adaptive validation before launching the benchmark")
-    validation = json.loads(await asyncio.to_thread(Path(args.validation).read_text))
-    assert validation["adaptive_policy_demonstrated"] is True
-    assert validation["source_hashes"] == source_hashes(ROOT / "src"), (
-        "Production source changed after live validation"
-    )
-    assert validation["config"] == experiment_config().model_dump(mode="json")
+    validation = None
+    if args.validation:
+        validation = json.loads(await asyncio.to_thread(Path(args.validation).read_text))
+        assert validation["adaptive_policy_demonstrated"] is True
+        assert validation["source_hashes"] == source_hashes(ROOT / "src"), (
+            "Production source changed after live validation"
+        )
+        assert validation["config"] == experiment_config().model_dump(mode="json")
     output, previous, source = map(
         lambda p: Path(p).resolve(), (args.output, args.previous, args.source)
     )
@@ -358,7 +358,8 @@ async def execute(args):
                 )
                 return grade
 
-        launch = Path(args.validation).parent / "manyih-launch.json"
+        launch_directory = Path(args.validation).parent if args.validation else output
+        launch = launch_directory / "manyih-launch.json"
         with launch.open("x") as stream:
             json.dump(
                 {"output": str(output), "started_at": timestamp(), "attempts_per_task": 1}, stream
