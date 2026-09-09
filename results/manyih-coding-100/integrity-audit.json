@@ -1,0 +1,47 @@
+{
+  "status": "PASS",
+  "checks": {
+    "exact_first_100_official_ids": "PASS",
+    "same_ids_no_duplicates": "PASS",
+    "denominator_100_each": "PASS",
+    "all_failures_retained": "PASS",
+    "official_per_task_and_aggregate_grades_match": "PASS",
+    "same_prompt_and_starting_file_hashes": "PASS",
+    "same_model_reasoning": "PASS",
+    "no_task_reruns": "PASS",
+    "reported_totals_match_records": "PASS",
+    "unknown_usage_is_null": "PASS",
+    "official_source_unmodified": "PASS",
+    "no_credentials_in_artifact_archive": "PASS",
+    "baseline_native_prompt_trace_audit": "PASS (production audit_trace)",
+    "production_coding_adapter_trace_audit": "PASS (production audit_trace)"
+  },
+  "incomplete_usage_task_ids": {
+    "buffalo": [
+      "50"
+    ],
+    "codex": [
+      "61",
+      "76"
+    ]
+  },
+  "baseline_completed_item_counts": {
+    "agent_message": 103,
+    "web_search": 7,
+    "command_execution": 1
+  },
+  "baseline_web_task_ids": [
+    "7",
+    "44",
+    "78"
+  ],
+  "automatic_refinement_deferrals": 100,
+  "paired_counts": {
+    "both_pass": 59,
+    "buffalo_only": 3,
+    "codex_only": 7,
+    "both_fail": 31
+  },
+  "official_source_commit": "3287f82436fff86d7506b7737dbd3b5e2e524d01",
+  "dataset_sha256": "57638c25d6f9254985dd26cc382fd16772cabf57ff2e5db0185603206092b61a"
+}

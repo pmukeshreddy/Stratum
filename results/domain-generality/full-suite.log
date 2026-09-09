@@ -1,0 +1,15 @@
+...........................s..........................s................. [ 15%]
+........................................................................ [ 31%]
+..........................s............................................. [ 46%]
+.............................ss......................................... [ 62%]
+...................s.................................................... [ 78%]
+.................................s.......................s.............. [ 93%]
+..........s.................                                             [100%]
+=============================== warnings summary ===============================
+tests/test_chat_terminal.py::test_terminal_multiturn_ctrl_c_detach_daemon_restart_and_continue
+tests/test_chat_terminal.py::test_terminal_multiturn_ctrl_c_detach_daemon_restart_and_continue
+  /Users/mukeshreddypochamreddy/.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/pty.py:95: DeprecationWarning: This process (pid=16008) is multi-threaded, use of forkpty() may lead to deadlocks in the child.
+    pid, fd = os.forkpty()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+451 passed, 9 skipped, 2 warnings in 95.59s (0:01:35)

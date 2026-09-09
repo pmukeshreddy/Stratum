@@ -182,6 +182,43 @@ async def baseline(directory, workspace, task, config):
         shutil.rmtree(home)
 
 
+def measured_usage(record):
+    """Reported usage only; durable runtime reservations are not provider measurements."""
+    directory = Path(record["run_artifact"])
+    if record["system"] == "buffalo":
+        with sqlite3.connect(directory / "state/history.sqlite3") as db:
+            attempts = [
+                json.loads(row[0]) for row in db.execute("SELECT usage FROM model_attempts")
+            ]
+        unknown = sum(bool(u.get("estimated_calls")) for u in attempts)
+        known = [u for u in attempts if not u.get("estimated_calls")]
+        counts = {
+            key: sum(u.get(key, 0) for u in known)
+            for key in ("input_tokens", "output_tokens", "cached_input_tokens")
+        }
+    else:
+        usage = json.loads((directory / "agent-result.json").read_text())["usage"]
+        events = [json.loads(line) for line in (directory / "codex.jsonl").read_text().splitlines()]
+        interruptions = sum(
+            event.get("type") == "error"
+            and any(
+                term in event.get("message", "").lower()
+                for term in ("reconnecting", "stream disconnected", "connection reset")
+            )
+            for event in events
+        )
+        unknown = max(int(usage.get("total_tokens") is None), interruptions)
+        counts = {
+            key: usage.get(key) or 0
+            for key in ("input_tokens", "output_tokens", "cached_input_tokens")
+        }
+    return {
+        **{"known_" + key: value for key, value in counts.items()},
+        "known_total_tokens": counts["input_tokens"] + counts["output_tokens"],
+        "unknown_usage_attempts": unknown,
+    }
+
+
 def records_summary(records):
     n = len(records)
     return {
@@ -194,6 +231,16 @@ def records_summary(records):
             key: sum(r[key] for r in records) if all(r[key] is not None for r in records) else None
             for key in ["input_tokens", "output_tokens", "total_tokens", "estimated_cost"]
         },
+        **{
+            key: sum(r.get(key, r.get(key.removeprefix("known_")) or 0) for r in records)
+            for key in (
+                "known_input_tokens",
+                "known_output_tokens",
+                "known_total_tokens",
+                "known_cached_input_tokens",
+                "unknown_usage_attempts",
+            )
+        },
         "summed_task_wall_seconds": sum(r["wall_time_seconds"] for r in records),
         "median_task_wall_seconds": statistics.median(r["wall_time_seconds"] for r in records)
         if n
@@ -205,8 +252,11 @@ def audit_trace(record):
     directory = Path(record["run_artifact"])
     raw = json.loads((directory / "agent-result.json").read_text())
     usage = raw["usage"]
+    incomplete = bool(
+        usage.get("estimated_calls") or measured_usage(record)["unknown_usage_attempts"]
+    )
     for key in ("input_tokens", "output_tokens", "total_tokens"):
-        assert record[key] == (None if usage.get("estimated_calls") else usage.get(key))
+        assert record[key] == (None if incomplete else usage.get(key))
     if record["total_tokens"] is not None:
         assert record["total_tokens"] == record["input_tokens"] + record["output_tokens"]
     task = json.loads((directory / "task.json").read_text())
@@ -277,10 +327,17 @@ def audit(output, expected):
         ids = [r["task_id"] for r in records]
         assert len(ids) == len(set(ids)) == 100 and set(ids) == set(expected), (system, ids)
         for record in records:
+            record.update(measured_usage(record))
+            record["usage_complete"] = not record["unknown_usage_attempts"]
+            if not record["usage_complete"]:
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    record[key] = None
             audit_trace(record)
+            save(Path(record["run_artifact"]) / "result.json", record)
             grade = json.loads(Path(record["official_evaluation"]).read_text())["evaluation"]
             assert record["functional_pass"] == grade["test_passed"]
             assert record["style_pass"] == grade["style_passed"]
+            assert record["overall_pass"] == grade["overall_passed"]
             assert record["overall_pass"] == (record["functional_pass"] and record["style_pass"])
     mapped = {s: {r["task_id"]: r for r in rows[s]} for s in rows}
     for task_id in expected:
@@ -296,6 +353,13 @@ def audit(output, expected):
             "both_pass" if a and b else "buffalo_only" if a else "codex_only" if b else "both_fail"
         ].append(task_id)
     summary = {s: records_summary(rows[s]) for s in rows}
+    for system in rows:
+        timing = output / f"{system}-phase-time.json"
+        if timing.exists():
+            summary[system]["phase_wall_seconds"] = json.loads(timing.read_text())["wall_seconds"]
+    timing = output / "experiment-time.json"
+    if timing.exists():
+        summary["experiment_wall_seconds"] = json.loads(timing.read_text())["wall_seconds"]
     a, b = summary["buffalo"]["overall_pass"], summary["codex"]["overall_pass"]
     summary.update(
         paired=paired,
@@ -472,9 +536,8 @@ async def execute(args):
                 output / f"{system}-phase-time.json",
                 {"wall_seconds": time.monotonic() - phase_start},
             )
+        save(output / "experiment-time.json", {"wall_seconds": time.monotonic() - start})
         summary = audit(output, ids)
-        summary["experiment_wall_seconds"] = time.monotonic() - start
-        save(output / "summary.json", summary)
         print(json.dumps(summary), flush=True)
     finally:
         await official.close()
@@ -487,10 +550,17 @@ def main():
     parser.add_argument("--generality-gate", default="results/domain-generality/gate.json")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--audit-only", action="store_true")
     args = parser.parse_args()
     # Shell tools in both harnesses resolve the same Python/dependency environment.
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
-    asyncio.run(execute(args))
+    if args.audit_only:
+        output = Path(args.output).resolve()
+        print(
+            json.dumps(audit(output, json.loads((output / "task-ids.json").read_text())), indent=2)
+        )
+    else:
+        asyncio.run(execute(args))
 
 
 if __name__ == "__main__":

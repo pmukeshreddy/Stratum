@@ -1,0 +1,125 @@
+{
+  "summary": {
+    "total_samples": 100,
+    "test_passed": 90,
+    "test_passed_pct": 90.0,
+    "style_passed": 72,
+    "style_passed_pct": 72.0,
+    "overall_passed": 66,
+    "overall_passed_pct": 66.0
+  },
+  "test_failures": {
+    "count": 10,
+    "pct_of_total": 10.0,
+    "by_reason": {
+      "assertion_error": {
+        "count": 10,
+        "pct_of_failures": 100.0,
+        "pct_of_total": 10.0
+      }
+    }
+  },
+  "style_failures": {
+    "count": 28,
+    "pct_of_total": 28.0,
+    "by_category": {
+      "operator_spacing": {
+        "count": 23,
+        "pct_of_failures": 82.14,
+        "pct_of_total": 23.0
+      },
+      "internal_blank_lines": {
+        "count": 4,
+        "pct_of_failures": 14.29,
+        "pct_of_total": 4.0
+      },
+      "type_hints": {
+        "count": 1,
+        "pct_of_failures": 3.57,
+        "pct_of_total": 1.0
+      }
+    }
+  },
+  "failure_breakdown": {
+    "total_failed": 34,
+    "total_failed_pct": 34.0,
+    "only_test_failed": 6,
+    "only_test_failed_pct": 6.0,
+    "only_style_failed": 24,
+    "only_style_failed_pct": 24.0,
+    "both_failed": 4,
+    "both_failed_pct": 4.0
+  },
+  "fine_grained": {
+    "assertion_stats": {
+      "avg_pass_rate": 0.9233333333333333,
+      "total_assertions": 306,
+      "passed_assertions": 283
+    },
+    "style_satisfaction": {
+      "avg_satisfaction_rate": 0.93,
+      "by_category": {
+        "function_doc": {
+          "passed": 15,
+          "total": 15,
+          "rate": 1.0
+        },
+        "indent": {
+          "passed": 44,
+          "total": 44,
+          "rate": 1.0
+        },
+        "internal_blank_lines": {
+          "passed": 35,
+          "total": 39,
+          "rate": 0.8974358974358975
+        },
+        "license": {
+          "passed": 53,
+          "total": 53,
+          "rate": 1.0
+        },
+        "line_length": {
+          "passed": 6,
+          "total": 6,
+          "rate": 1.0
+        },
+        "naming_convention": {
+          "passed": 18,
+          "total": 18,
+          "rate": 1.0
+        },
+        "operator_spacing": {
+          "passed": 47,
+          "total": 70,
+          "rate": 0.6714285714285714
+        },
+        "quotes": {
+          "passed": 25,
+          "total": 25,
+          "rate": 1.0
+        },
+        "return_style": {
+          "passed": 17,
+          "total": 17,
+          "rate": 1.0
+        },
+        "singleton": {
+          "passed": 25,
+          "total": 25,
+          "rate": 1.0
+        },
+        "type_hints": {
+          "passed": 44,
+          "total": 45,
+          "rate": 0.9777777777777777
+        },
+        "variable_name_length": {
+          "passed": 43,
+          "total": 43,
+          "rate": 1.0
+        }
+      }
+    }
+  }
+}

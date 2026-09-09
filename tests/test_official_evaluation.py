@@ -506,3 +506,71 @@ async def test_evaluation_can_use_production_coding_adapter_without_rewriting_ta
     assert sessions[0]["instruction"] == "Official task verbatim"
     saved = RunConfig.model_validate_json((tmp_path / "run/buffalo-config.json").read_text())
     assert saved.task.adapter == "coding"
+
+
+def test_manyih_reporting_excludes_unreported_transport_reservations(tmp_path):
+    import sqlite3
+
+    from threadweave.evals.manyih_coding import measured_usage, records_summary
+
+    (tmp_path / "state").mkdir()
+    with sqlite3.connect(tmp_path / "state/history.sqlite3") as db:
+        db.execute("CREATE TABLE model_attempts(usage TEXT)")
+        db.executemany(
+            "INSERT INTO model_attempts VALUES(?)",
+            [
+                (json.dumps(row),)
+                for row in [
+                    {"input_tokens": 2000, "output_tokens": 32768, "estimated_calls": 1},
+                    {"input_tokens": 100, "output_tokens": 20, "estimated_calls": 0},
+                ]
+            ],
+        )
+    record = {
+        "system": "buffalo",
+        "run_artifact": str(tmp_path),
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "estimated_cost": None,
+        "functional_pass": True,
+        "style_pass": False,
+        "overall_pass": False,
+        "wall_time_seconds": 12,
+    }
+    record.update(measured_usage(record))
+    assert record["known_total_tokens"] == 120
+    assert record["unknown_usage_attempts"] == 1
+    summary = records_summary([record])
+    assert summary["total_tokens"] is None
+    assert summary["known_total_tokens"] == 120
+    assert summary["denominator"] == 1 and summary["overall_pass"] == 0
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_manyih_native_usage_preserves_measurements_but_flags_interrupted_streams(
+    tmp_path, interrupted
+):
+    from threadweave.evals.manyih_coding import measured_usage
+
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cached_input_tokens": 40,
+        "total_tokens": 120,
+    }
+    (tmp_path / "agent-result.json").write_text(json.dumps({"usage": usage}))
+    events = [{"type": "turn.completed", "usage": usage}]
+    if interrupted:
+        events.insert(
+            0,
+            {
+                "type": "error",
+                "message": "Reconnecting... 2/5 (stream disconnected before completion)",
+            },
+        )
+    (tmp_path / "codex.jsonl").write_text("\n".join(json.dumps(event) for event in events))
+    measured = measured_usage({"system": "codex", "run_artifact": str(tmp_path)})
+    assert measured["known_total_tokens"] == 120
+    assert measured["known_cached_input_tokens"] == 40
+    assert measured["unknown_usage_attempts"] == int(interrupted)

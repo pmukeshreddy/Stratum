@@ -1,0 +1,15 @@
+{
+  "official_assertion_timeout_seconds": 3.0,
+  "task_attempts": 1,
+  "smoke_attempts_excluded_from_full_results": true,
+  "source_commit": "983881a60b4407284e6ba17ef3de9b1186358320",
+  "native_codex_library_revision": "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a",
+  "phase_order": [
+    "100 Buffalo",
+    "100 Codex"
+  ],
+  "parallel_tasks_per_system": 4,
+  "architecture_full_suite": "451 passed, 9 skipped",
+  "post_integration_suite": "454 passed, 7 skipped",
+  "smoke_audit": "All four official grades pass; prompt/file hashes equal; captured provider/rollout settings match"
+}

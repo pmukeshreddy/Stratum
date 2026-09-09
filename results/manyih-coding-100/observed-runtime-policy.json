@@ -1,0 +1,58 @@
+{
+  "automatic_refinement_enabled": true,
+  "automatic_refinement_deferrals_observed": 100,
+  "explanation": "Production admission preserves time for an agent/tool cycle. Under the shared 300-second task budget and coding default 600-second tool timeout, optional automatic refinement is deferred. Explicit model-invoked harness capabilities remain available. No settings changed after observing outcomes.",
+  "examples": [
+    {
+      "purpose": "refinement",
+      "remaining_seconds": 292.9476659297943,
+      "required_seconds": 983.5850208997726,
+      "auxiliary_seconds": 300.0,
+      "agent_seconds": 6.868016719818115,
+      "reason": "Preserve an agent/tool cycle; defer optional work"
+    },
+    {
+      "purpose": "refinement",
+      "remaining_seconds": 265.3372311592102,
+      "required_seconds": 1018.0999776721001,
+      "auxiliary_seconds": 300.0,
+      "agent_seconds": 34.479982137680054,
+      "reason": "Preserve an agent/tool cycle; defer optional work"
+    }
+  ],
+  "all_buffalo_event_counts": {
+    "auxiliary_deferred": 100,
+    "coding_baseline": 100,
+    "completion": 100,
+    "completion_attempt": 100,
+    "context_estimate": 102,
+    "context_usage_anchor": 102,
+    "environment_prepare": 100,
+    "environment_prepared": 100,
+    "git_checkpoint": 100,
+    "model_invocation_started": 103,
+    "model_response": 102,
+    "model_routing": 102,
+    "model_stream": 2197,
+    "recovery": 100,
+    "resource_usage": 515,
+    "session_transition": 604,
+    "subscription_model_selected": 102,
+    "task_admitted": 100,
+    "turn_completed": 102,
+    "verifier_result": 100,
+    "verifier_started": 100,
+    "failure": 1,
+    "retry": 1,
+    "action_fingerprint": 2,
+    "environment_action_finished": 2,
+    "environment_action_started": 2,
+    "kernel_recovery": 1,
+    "mutation_observation_finished": 2,
+    "mutation_observation_started": 2,
+    "python_execution": 2,
+    "python_result": 2,
+    "tool_call": 2,
+    "tool_result": 2
+  }
+}
