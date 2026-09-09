@@ -1,4 +1,4 @@
-"""Prime continual harness: canonical JSON state and append-only JSONL refinements."""
+"""Prime continual harness: canonical JSON state and scope-aware refinement history."""
 
 from __future__ import annotations
 
@@ -248,6 +248,32 @@ def validate_edit(edit, id):
     return None
 
 
+def updated_entry(kind, id, edit, before=None, *, scope="local", source="agent"):
+    """Shared version/timestamp machinery for planner edits and direct kernel writes."""
+    previous = before or {}
+    return {
+        "id": id,
+        "kind": kind,
+        "title": edit["title"],
+        "content": edit["content"],
+        "path": edit.get("path", previous.get("path", "general")),
+        "scope": previous.get("scope", scope),
+        **{k: edit.get(k, previous.get(k, {})) for k in ("reference", "arguments", "metadata")},
+        "source": source,
+        "version": previous.get("version", 0) + 1,
+        "created_at": previous.get("created_at", timestamp()),
+        "updated_at": timestamp(),
+    }
+
+
+def scope_target(id, global_=False):
+    if isinstance(id, str):
+        scope, sep, bare = id.partition(":")
+        if sep and bare and scope in ("local", "global"):
+            return bare, global_ or scope == "global"
+    return id, global_
+
+
 def apply_refinement_proposal(
     state, proposal, *, id, scope="local", baseline_state=None, rollback_of=None
 ):
@@ -296,23 +322,7 @@ def apply_refinement_proposal(
             del state["entries"][kind][identifier]
             modified.add(key)
         else:
-            previous = before or {}
-            after = {
-                "id": identifier,
-                "kind": kind,
-                "title": edit["title"],
-                "content": edit["content"],
-                "path": edit.get("path", previous.get("path", "general")),
-                "scope": previous.get("scope", scope),
-                **{
-                    k: edit.get(k, previous.get(k, {}))
-                    for k in ("reference", "arguments", "metadata")
-                },
-                "source": "refine",
-                "version": previous.get("version", 0) + 1,
-                "created_at": previous.get("created_at", timestamp()),
-                "updated_at": timestamp(),
-            }
+            after = updated_entry(kind, identifier, edit, before, scope=scope, source="refine")
             state["entries"][kind][identifier] = after
             result["after"] = copy.deepcopy(after)
             modified.add(key)
@@ -378,8 +388,9 @@ def refinement_notice(result, source):
 
 
 class HarnessStore:
-    def __init__(self, directory):
+    def __init__(self, directory, *, session_history):
         self.directory = Path(directory)
+        self.session_history = session_history
 
     def path(self, sid=None):
         return (
@@ -400,11 +411,101 @@ class HarnessStore:
     def get(self, sid, kind, id, *, global_=False):
         if kind not in KINDS:
             raise ValueError(f"Unknown harness kind: {kind}")
+        id, global_ = scope_target(id, global_)
         return self.load(None if global_ else sid)["entries"][kind].get(id)
+
+    def mutate(self, sid, action, kind=None, *, id=None, global_=False, source="agent", **fields):
+        id, global_ = scope_target(id, global_)
+        target = None if global_ else sid
+        with self.lock(target):
+            state = self.load(target)  # Never overwrite a host/kernel writer's newer snapshot.
+            if action == "record_refinement":
+                changes = fields["changes"]
+                result = {
+                    "id": id or f"refine_{len(state['refinements']) + 1:04d}",
+                    "trigger": fields["trigger"],
+                    "changes": [changes] if isinstance(changes, str) else list(changes),
+                    "evidence": fields.get("evidence", ""),
+                    "outcome": fields.get("outcome", ""),
+                    "created_at": timestamp(),
+                }
+                state["refinements"].append(result)
+            else:
+                if kind not in KINDS:
+                    raise ValueError(f"Unknown harness kind: {kind}")
+                if action not in ("create", "update", "delete", "upsert"):
+                    raise ValueError(f"Unknown harness operation: {action}")
+                identifier = id or "_".join(
+                    "".join(
+                        c.lower() if c.isalnum() else "_" for c in fields.get("title", "").strip()
+                    ).split()
+                )
+                identifier = id or ("_".join(p for p in identifier.split("_") if p) or kind)[:80]
+                before = state["entries"][kind].get(identifier)
+                if action == "delete":
+                    if before is None:
+                        return False
+                    del state["entries"][kind][identifier]
+                    result = True
+                else:
+                    if action == "create" and before is not None:
+                        raise ValueError(f"{kind} entry {identifier!r} already exists")
+                    if action == "update" and before is None:
+                        raise ValueError(f"{kind} entry {identifier!r} does not exist")
+                    fields = {k: v for k, v in fields.items() if v is not None}
+                    result = updated_entry(
+                        kind,
+                        identifier,
+                        fields,
+                        before,
+                        scope="global" if global_ else "local",
+                        source=source,
+                    )
+                    error = validate_edit(
+                        {**result, "action": "update" if before else "create"}, identifier
+                    )
+                    if error:
+                        raise ValueError(error)
+                    state["entries"][kind][identifier] = result
+            save_harness_state(self.path(target), state)
+            return copy.deepcopy(result)
+
+    def overview(self, sid, *, global_=False, max_entries_per_kind=20):
+        state = self.load(None if global_ else sid)
+        lines = [
+            f"Harness state ({'global' if global_ else 'local'}): {self.path(None if global_ else sid) / 'harness_state.json'}",
+            "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
+            "harness skills use Python references and arguments. Spawn a subagent spec with "
+            "handle = await rlm('sub-task'); admission returns immediately, never the child's answer. "
+            "Children reply with await agent_message.send(message, receiver_role='parent'). "
+            "Use await rlm.list_subagents() and receiver_role='child' for follow-ups.",
+        ]
+        for kind in KINDS:
+            entries = sorted(
+                state["entries"][kind].values(), key=lambda e: (e["path"], e["title"], e["id"])
+            )
+            lines.append(f"{kind}: {len(entries)}")
+            for entry in entries[:max_entries_per_kind]:
+                extra = ""
+                if kind == "skill":
+                    for field, label in (("reference", "ref"), ("arguments", "args")):
+                        if entry.get(field):
+                            extra += f" {label}=" + compact_text(
+                                json.dumps(entry[field], ensure_ascii=False, sort_keys=True), 120
+                            )
+                lines.append(
+                    f"  - [{entry['scope']}:{entry['id']}] {entry['title']} ({entry['path']}, v{entry['version']}){extra}: {compact_text(entry['content'], 120)}"
+                )
+            if len(entries) > max_entries_per_kind:
+                lines.append(f"  - +{len(entries) - max_entries_per_kind} more")
+        lines.append(f"refinements: {len(state['refinements'])}")
+        for event in state["refinements"][-5:]:
+            lines.append(f"  - [{event['id']}] {event['trigger']}: {', '.join(event['changes'])}")
+        return "\n".join(lines)
 
     def history(self, sid):
         return merge_refinement_history(
-            load_refinement_history(self.path()), load_refinement_history(self.path(sid), "local")
+            load_refinement_history(self.path()), self.session_history.refinement_history(sid)
         )
 
     @contextmanager
@@ -439,5 +540,7 @@ class HarnessStore:
                 rollback_of=rollback_of,
             )
             result["harnessStatePath"] = save_harness_state(directory, state)
-            append_refinement_history(self.path(target), result)
+            if global_:
+                append_refinement_history(self.path(), result)
+            self.session_history.record_harness_refinement(sid, result)
         return result

@@ -41,7 +41,7 @@ class LearningSession:
 observed_lesson = 'Run checks in the project environment'
 receipt = await refine.run('Remember the project validation environment')
 assert receipt['scheduled']
-assert (await refine.status())['pending']
+assert (await refine.status())['in_flight']
 assert not harness.list('memory')
 print({'scheduled': receipt['scheduled'], 'state_before_boundary': harness.list('memory')})""",
                 )
@@ -81,7 +81,8 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
         state_path = runtime.store.harness.path(root.id) / "harness_state.json"
         history_path = state_path.with_name("refinements.jsonl")
         assert json.loads(state_path.read_text())["entries"]["memory"]["lesson"]
-        assert len(history_path.read_text().splitlines()) == 1
+        assert not history_path.exists()
+        assert len(runtime.store.refinement_history(root.id)) == 1
         assert provider.peak == 1
         events = runtime.store.events(root.id, limit=100)
         kinds = [e["type"] for e in events]
@@ -109,7 +110,8 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
         trace = {
             "session_id": root.id,
             "canonical_state": json.loads(state_path.read_text()),
-            "refinements": [json.loads(line) for line in history_path.read_text().splitlines()],
+            "local_history_storage": "session trajectory: harness_refinement",
+            "refinements": runtime.store.refinement_history(root.id),
             "events": [
                 {"type": e["type"], "payload": e["payload"]}
                 for e in runtime.store.events(root.id, limit=1000)
@@ -117,6 +119,7 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
                 in {
                     "refine_scheduled",
                     "refine_complete",
+                    "harness_refinement",
                     "refinement_notice",
                     "refinement_continuation",
                     "resumed",

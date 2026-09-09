@@ -59,6 +59,10 @@ class Checkpoint:
     pending_interval: bool = False
     branch_version: int = 0
     task: asyncio.Task | None = None
+    background: asyncio.Task | None = None
+    background_options: dict | None = None
+    claim: asyncio.Task | None = None
+    counted_response: str | None = None
 
 
 class RefinementServices(AuxiliaryServices):
@@ -69,7 +73,12 @@ class RefinementServices(AuxiliaryServices):
 
     def refinement_status(self, sid):
         state = self.refinement_state(sid)
-        return {"pending": state.pending_request is not None, "in_flight": state.in_progress}
+        return {
+            "pending": state.pending_request is not None,
+            "in_flight": state.in_progress
+            or state.background is not None
+            or state.claim is not None,
+        }
 
     def request_refinement(
         self, sid, *, instructions=None, global_=False, rollback_id=None, source="self"
@@ -92,7 +101,7 @@ class RefinementServices(AuxiliaryServices):
         if session.outcome not in (Outcome.ACTIVE, Outcome.COMPLETED):
             return {"scheduled": False, "reason": "Session is stopped"}
         state = self.refinement_state(sid)
-        previous = state.pending_request or {}
+        previous = state.pending_request or state.background_options or {}
         request = {
             "instructions": instructions
             if instructions is not None
@@ -101,11 +110,15 @@ class RefinementServices(AuxiliaryServices):
             "rollback_id": rollback_id,
             "source": "self",
         }
-        if state.in_progress or state.pending_plan:
+        if state.in_progress or state.pending_plan or state.background:
             state.branch_version += 1
             state.pending_plan = None
+            if state.background:
+                state.background.cancel()
         state.pending_request = request
         self.store.event(sid, "refine_scheduled", request)
+        if source == "self":
+            self.maybe_start_refinement_plan(sid)
         self._wake.set()
         return {
             "scheduled": True,
@@ -114,7 +127,11 @@ class RefinementServices(AuxiliaryServices):
 
     def has_pending_refinement(self, sid):
         state, policy = self.refinement_state(sid), self.store.config(sid).refinement
-        if state.pending_request is not None or state.pending_plan is not None:
+        if (
+            state.pending_request is not None
+            or state.pending_plan is not None
+            or state.background is not None
+        ):
             return True
         return (
             policy.enabled
@@ -133,17 +150,19 @@ class RefinementServices(AuxiliaryServices):
         state = self.refinement_state(sid)
         state.branch_version += 1
         state.turns_since_review = 0
+        state.counted_response = None
         state.pending_request = state.pending_review = state.pending_plan = None
         state.pending_compact = state.pending_interval = False
-        if state.task and state.task is not asyncio.current_task():
-            state.task.cancel()
+        for task in (state.task, state.background, state.claim):
+            if task and task is not asyncio.current_task():
+                task.cancel()
 
     def refinement_compacted(self, sid):
         if self.store.session(sid).depth == 0:
             self.refinement_state(sid).pending_compact = True
             self._wake.set()
 
-    def refinement_boundary(self, sid):
+    def refinement_boundary(self, sid, *, ignore_planning=False):
         session = self.store.session(sid)
         if (
             self._closing
@@ -160,18 +179,32 @@ class RefinementServices(AuxiliaryServices):
         ).fetchone():
             return False
         return not self.store.db.execute(
-            "SELECT 1 FROM model_attempts a JOIN model_requests r ON r.id=a.request_id WHERE r.session_id=? AND a.status='running' LIMIT 1",
-            (sid,),
+            "SELECT 1 FROM model_attempts a JOIN model_requests r ON r.id=a.request_id WHERE r.session_id=? AND a.status='running' AND (?=0 OR r.purpose NOT IN ('refinement','refinement_review')) LIMIT 1",
+            (sid, int(ignore_planning)),
         ).fetchone()
 
     def refinement_input(self, sid, *, review=False, reason=None, instructions=None, global_=False):
         session = self.store.session(sid)
         # Current context already includes tool results, child findings and compaction.
+        pending = session.pending_turn or {}
+        response = pending.get("response", {})
+        active_message = (
+            [
+                {
+                    "role": "assistant",
+                    "content": response.get("text", ""),
+                    "tool_calls": response.get("actions", []),
+                }
+            ]
+            if response and not pending.get("context_committed")
+            else []
+        )
         trajectory = json.dumps(
             [
                 *self.context.original_task(sid)["messages"],
                 *([{"role": "user", "content": session.summary}] if session.summary else []),
                 *[m for block in session.context for m in block["messages"]],
+                *active_message,
             ],
             ensure_ascii=False,
             default=str,
@@ -264,14 +297,139 @@ class RefinementServices(AuxiliaryServices):
             "target_directory": directory,
         }
 
+    def count_refinement_turn(self, sid):
+        state = self.refinement_state(sid)
+        pending = self.store.session(sid).pending_turn or {}
+        response_id = pending.get("event_id")
+        if response_id and response_id == state.counted_response:
+            return
+        state.counted_response = response_id
+        state.turns_since_review += 1
+        state.pending_interval |= (
+            state.turns_since_review >= self.store.config(sid).refinement.turn_interval
+        )
+
+    def refinement_message_end(self, sid):
+        if self.store.session(sid).depth == 0:
+            self.count_refinement_turn(sid)
+            self.maybe_start_refinement_plan(sid)
+
+    def maybe_start_refinement_plan(self, sid):
+        state, session = self.refinement_state(sid), self.store.session(sid)
+        if self._closing or session.depth or session.paused or session.outcome != Outcome.ACTIVE:
+            return
+        if state.background or state.claim or state.in_progress or state.pending_plan:
+            return
+        # The primary response must have finished. Planning may overlap its tools only.
+        if (
+            not session.pending_turn
+            or self.store.db.execute(
+                "SELECT 1 FROM model_attempts a JOIN model_requests r ON r.id=a.request_id "
+                "WHERE r.session_id=? AND a.status='running' LIMIT 1",
+                (sid,),
+            ).fetchone()
+        ):
+            return
+        options = state.pending_request
+        if options is None:
+            policy = self.store.config(sid).refinement
+            if not policy.enabled or state.turns_since_review < policy.turn_interval:
+                return
+            if (
+                state.last_review_at
+                and time.time() - state.last_review_at < policy.cooldown_seconds
+            ):
+                return
+        state.pending_request = None
+        state.background_options = options
+        state.background = asyncio.create_task(
+            self.background_refinement_plan(sid, options, state.branch_version),
+            name=f"refinement-plan-{sid}",
+        )
+
+    async def background_refinement_plan(self, sid, options, branch):
+        explicit = options is not None
+        reason = None if explicit else "turn_interval"
+        try:
+            if not explicit:
+                review = await self.review_refinement(sid, reason)
+                if self._closing or self.refinement_state(sid).branch_version != branch:
+                    return {"status": "invalidated", "branch": branch}
+                if not review["shouldRefine"]:
+                    return {"status": "skip", "branch": branch}
+                options = {
+                    "instructions": f"Automatic refinement checkpoint: {reason}.\n{review['rationale']}\n{review.get('instructions', '')}",
+                    "source": "auto",
+                }
+            plan = await self.plan_refinement(sid, options)
+            if self._closing or self.refinement_state(sid).branch_version != branch:
+                return {"status": "invalidated", "branch": branch}
+            return {
+                "status": "plan",
+                "branch": branch,
+                "plan": plan,
+                "options": options,
+                "reason": reason,
+            }
+        except asyncio.CancelledError:
+            return {"status": "invalidated", "branch": branch}
+        except Exception as exc:
+            return {
+                "status": "failure",
+                "branch": branch,
+                "explicit": explicit,
+                "options": options,
+                "error": str(exc),
+            }
+
     async def refinement_checkpoint(self, sid, *, completed_turn=False):
         state = self.refinement_state(sid)
         if self.store.session(sid).depth != 0:
             return False
-        policy = self.store.config(sid).refinement
         if completed_turn:
-            state.turns_since_review += 1
-            state.pending_interval |= state.turns_since_review >= policy.turn_interval
+            self.count_refinement_turn(sid)
+        if state.claim:
+            await asyncio.shield(state.claim)
+            return False  # The owning drain already processed this boundary.
+        if not self.refinement_boundary(sid, ignore_planning=state.background is not None):
+            return False
+        state.claim = asyncio.current_task()
+        try:
+            if background := state.background:
+                try:
+                    result = await asyncio.shield(background)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
+                    result = {"status": "invalidated", "branch": state.branch_version}
+                if state.background is background:
+                    state.background = state.background_options = None
+                current = result["branch"] == state.branch_version and not self._closing
+                if current and result["status"] == "plan":
+                    state.pending_plan = (result["plan"], result["options"], result["reason"])
+                elif current and result["status"] == "failure":
+                    state.last_review_at = time.time()
+                    self.store.event(
+                        sid, "refine_failed", {"error": result["error"], "phase": "background"}
+                    )
+                    # Explicit work gets one boundary retry; an interval failure does not.
+                    if result["explicit"] and not state.pending_request:
+                        state.pending_request = result["options"]
+                elif current:
+                    state.last_review_at, state.turns_since_review = time.time(), 0
+                    state.pending_interval = False
+                if state.pending_request is None and state.pending_plan is None:
+                    return False
+            return await self._refinement_checkpoint_after_background(sid)
+        except asyncio.CancelledError:
+            self.invalidate_refinement(sid)
+            raise
+        finally:
+            state.claim = None
+
+    async def _refinement_checkpoint_after_background(self, sid):
+        state = self.refinement_state(sid)
+        policy = self.store.config(sid).refinement
         if state.in_progress or not self.refinement_boundary(sid):
             return False
         ready = state.pending_plan

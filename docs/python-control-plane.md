@@ -116,18 +116,22 @@ rlm.get_harness_state()
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
-learned state is imported once; old tables have no runtime readers or writers.
+Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
+refinement history is part of the persisted session trajectory; no local JSONL
+sidecar is used. Existing SQLite learned state is imported once; old learned-state
+tables have no runtime readers or writers.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
-returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+returns `pending` and `in_flight`. Planning overlaps tools after the model response
+finishes; the exact plan is applied only at a completed-turn boundary,
 then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
 before it continues. Zero-edit proposals produce no update notice. Automatic review
 is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
 findings are ordinary trajectory evidence, not separate refinement triggers.
 
-A compact merged digest enters context at session start, resume, compaction, and
+An untouched session defers its compact merged digest until its first input commit.
+The digest refreshes on resume, compaction, and
 stale-state detection. Unchanged digests are deduplicated. The base system prompt
 stays unchanged after learning. Colliding global/local IDs remain visible with
 scope labels; local guidance can override global guidance within the session.
@@ -140,9 +144,15 @@ See [the source/test parity matrix](continual-harness-parity.md) and
 Installed skills remain ordinary Python modules. Read SKILL.md and invoke the
 documented callable directly; `skills.list()` and `skills.load(name)` provide
 inspection and importing. A learned skill's JSON holds a Python `reference` and
-an `arguments` contract, never executable implementation text. Harness inspection
-is read-only. `refine.run` schedules all model-driven create/update/delete planning
-and application at a safe turn boundary.
+an `arguments` contract, never executable implementation text. `rlm.harness`
+(and `harness`) provides Prime's direct create/update/delete methods for memory,
+prompt, skill and subagent entries. Prompt methods also support Prime's
+`create_prompt_note`, `update_prompt_note` and `delete_prompt_note` names. CRUD is
+local by default; `global_=True` or a `global:id` prefix explicitly selects global
+state. Reads return `None` for missing entries; deletes return a boolean.
+Updates preserve omitted fields. Direct writes are immediate, atomically saved
+JSON edits; `record_refinement` explicitly records their summary. `refine.run`
+starts host planning during tools and applies only at the safe boundary.
 
 ## MCP configuration
 

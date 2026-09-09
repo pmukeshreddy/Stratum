@@ -10,7 +10,7 @@ trajectory and child runtime.
 | Behavior | Prime source/test | Buffalo source/test | Exact parity? |
 | --- | --- | --- | --- |
 | JSON canonical state | `src/core/refinement/refinement.ts:loadHarnessState/saveHarnessState`; `test/refinement.test.ts` | `src/threadweave/harness.py`; `test_missing_and_corrupt_state`, `test_atomic_save_roundtrip_and_failure` | Yes |
-| JSONL refinement history | `appendGlobalRefinement/loadGlobalRefinementHistory`, session custom entries | `load_refinement_history/append_refinement_history`; `test_jsonl_skips_malformed_and_merges` | Yes; local JSONL lives in the persisted session's harness directory |
+| Global JSONL / local session history | `appendGlobalRefinement`, `_loadRefinementHistory`, `_applyRefine`; session custom entries | `Store.refinement_history/record_harness_refinement`, `HarnessStore.history/apply`; `test_local_history_is_session_history_global_is_jsonl_and_restart_merges` | Yes; no local history sidecar |
 | Local default, explicit global | `planRefinement`, `handleRefineHostRequest`; `test/suite/agent-session-refine-skill.test.ts` | `request_refinement`, `Refine.run`; `test_schedule_status_coalesce_and_safe_boundary` | Yes |
 | Collision-preserving merge | `mergeHarnessStates`; “without hiding colliding entries” | `merge_harness_states`; `test_merge_preserves_collisions_without_mutating_inputs` | Yes; both entries remain, local key is `local:id` |
 | Local cannot modify global | `_planRefine/_applyRefine` scope selection | `HarnessStore.apply`; `test_local_cannot_update_or_delete_global_and_can_override` | Yes |
@@ -25,6 +25,9 @@ trajectory and child runtime.
 | Scheduled turn-boundary execution | `handleRefineHostRequest`, `_runSerializedRefineCheckpoint` | `_run_turn/refinement_checkpoint`; safe-boundary, idle-continuation and flow tests | Yes; no application inside the requesting cell |
 | Serialized application / stale work | `_autoRefineBranchVersion`, baseline comparison, in-flight guards | `Checkpoint`, `invalidate_refinement`, file lock and baseline comparison; cancellation/deferred-plan/conflict tests | Yes |
 | Pending review / failed review recovery | `_pendingAutoRefineReview`, review/refine failure cooldown | `pending_review`, `finally` cleanup; `test_approved_review_deferred_until_safe_and_failure_unwedges` | Yes |
+| Writable Python API | `prime-agent-runtime/src/rlm/harness.py`, `test/test_harness.py` | `kernel_api.Harness`, `HarnessStore.mutate`; all-kind/scope CRUD, prefix routing, omitted-field and external-write tests in `test_continual_harness_gaps.py` | Yes; direct atomic writes, explicit `record_refinement` |
+| Overlapped serialized planning | `_maybeStartSerializedBackgroundPlan`, `_runBackgroundPlan`, `_consumeSerializedBackgroundPlan`; `agent-session-serialized-refine.test.ts` | `maybe_start_refinement_plan`, `background_refinement_plan`, `refinement_checkpoint`; overlap, concurrent-drain, supersession, failure, cancellation and restart tests | Yes; tools overlap planning, application and next model turn are serialized |
+| Untouched-session digest timing | `_ensureHarnessDigestContext`, `_harnessDigestPending` | `ensure_harness_digest`, first input commit in `_run_turn`; empty/resume/stale and real-turn tests | Yes; no eager digest in untouched sessions |
 | Create/update/delete | `applyRefinementProposal`; all-kind CRUD tests | `apply_refinement_proposal`; all-kind CRUD and validation tests | Yes; stable IDs, versions, timestamps and snapshots |
 | Rollback | `rollbackProposal`, recorded scope/path; copied-local-history test | `rollback_proposal/plan_refinement`; inverse, cross-session and copied-history tests | Yes; reversed applied edits target recorded store |
 | Learned skills | Python `reference` plus `arguments` validation | `validate_edit`; skill validation and module execution tests | Yes; no executable body in JSON |
@@ -36,13 +39,22 @@ trajectory and child runtime.
 | Resume persistence | session custom messages plus local/global files | persisted trajectory plus JSON/JSONL; deterministic restart test | Yes |
 | No event-specific trigger graph | interval/compact/manual paths | only `refinement_compacted`, completed-turn count, explicit request | Yes; `test_only_interval_compact_or_explicit_requests_schedule` |
 
-Python storage placement is deliberate: global files are under `DATA/harness`, and
-local files under `DATA/sessions/SESSION_ID/harness`. Prime stores local refinement
-history as custom records in its session JSONL; Buffalo stores those same records
-in the session's `harness/refinements.jsonl`. Ordinary trajectory and model usage
-still use Buffalo's SQLite telemetry. They do not own or mirror learned state.
-Buffalo uses one serialized checkpoint implementation for its runtime; it does not
-add Prime's separate interactive background-planning mode or extension system.
+Global state and history live under `DATA/harness`; local state lives under
+`DATA/sessions/SESSION_ID/harness`. Every planner result is persisted as a
+`harness_refinement` entry in Buffalo's normal session trajectory. Global results
+also append to global `refinements.jsonl`. History merges by ID with session records
+winning, including after restart and fork. Previous local sidecars are imported
+idempotently into session history and removed; runtime history reads never use them.
+Ordinary trajectory storage remains Buffalo's native backend, independently of
+canonical learned state in JSON.
+
+The existing serialized checkpoint now owns both background planning and application.
+Explicit requests start planning immediately once the primary response is complete;
+interval checkpoints start a semantic review at message completion. A boundary
+claims and awaits the exact background result before applying, with no duplicate
+consumer. Branch invalidation cancels stale work; concurrent direct JSON writes are
+checked against the planning baseline. Explicit background failures get a boundary
+retry; interval failures stamp cooldown without a synchronous retry.
 
 Legacy migration imports current active entries once, retaining IDs and versions.
 `memory`, `prompt_note`, and `subagent_spec` map to `memory`, `prompt`, and
@@ -63,20 +75,8 @@ events from the kernel session: scheduled request, completed refinement, durable
 notice, root continuation, restart, digest, compaction review and decline. It uses
 a mock provider and real file persistence; no live-model benchmark was run.
 
-Validation completed September 9, 2026:
-
-- 35 focused continual-harness cases pass, covering persistence, edits, scopes,
-  scheduling, cancellation, cooldown, compaction, digest delivery, migration and rollback.
-- The deterministic runtime/kernel flow passed and produced the linked trace.
-  Provider-wire contracts and installed-callable integration also passed.
-- Complete suite coverage: 457 passing cases and 10 skipped opt-in cases. The
-  initial full invocation exposed a digest/compaction loop under a one-token
-  budget and was interrupted. After fixing it, only the unfinished remainder
-  and affected failures were run; no second full-suite invocation was used.
-- Ruff reports no remaining errors; `git diff --check` passes. `uv build`
-  successfully produced the source distribution and wheel.
-
-The model-facing harness API is read-only. All model-driven mutations go through
-scheduled refinement; the obsolete immediate CRUD helpers were removed too.
-The compaction capacity regression has a bounded no-progress guard and its own
-focused regression test.
+The four-gap follow-up is covered by `tests/test_continual_harness_gaps.py`, the
+existing continual-harness tests, the deterministic kernel flow, and provider-wire
+contracts. Targeted validation: **66 passed**. The single full-suite invocation completed
+with **483 passed, 10 skipped**. No live-model benchmark or performance evaluation
+was run.

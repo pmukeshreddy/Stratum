@@ -186,7 +186,7 @@ async def test_programmable_multiturn_children_context_and_recovery(
         )
         await say(
             "retain procedure",
-            "assert not hasattr(harness, 'create_memory')\nassert x == 123",
+            "assert callable(harness.create_memory)\nassert x == 123",
         )
         runtime.context.compact(root.id)
         await say(

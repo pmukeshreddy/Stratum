@@ -236,7 +236,7 @@ async def test_schedule_status_coalesce_and_safe_boundary(harness_runtime):
     rt.store.update(sid, pending_turn={"context_committed": False})
     assert rt.request_refinement(sid, instructions="first", global_=True)["scheduled"]
     rt.request_refinement(sid, instructions="last")
-    assert rt.refinement_status(sid) == {"pending": True, "in_flight": False}
+    assert rt.refinement_status(sid) == {"pending": True, "in_flight": True}
     assert not await rt.refinement_checkpoint(sid)
     assert not provider.requests and not rt.store.harness.entries(sid)
     rt.store.update(sid, pending_turn={"context_committed": True})
@@ -314,10 +314,12 @@ async def test_inflight_protection_branch_invalidation_and_recovery(harness_runt
     task = asyncio.create_task(rt.refinement_checkpoint(sid))
     await provider.entered.wait()
     assert rt.refinement_status(sid)["in_flight"]
-    assert not await rt.refinement_checkpoint(sid)
+    other = asyncio.create_task(rt.refinement_checkpoint(sid))
+    await asyncio.sleep(0)
+    assert not other.done()
     rt.invalidate_refinement(sid)
     provider.release.set()
-    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.gather(task, other, return_exceptions=True)
     assert not rt.refinement_status(sid)["in_flight"]
     assert not rt.store.harness.entries(sid)
     rt.request_refinement(sid, source="human")
@@ -514,7 +516,7 @@ async def test_copied_local_history_rollback_targets_original_file(
     target = rt.store.harness.history(sid)[-1]
     branch = rt.create("branch", tmp_path, config=config)
     rt.store.harness.apply(branch.id, proposal(edit(content="branch keeps this")), id="branch")
-    append_refinement_history(rt.store.harness.path(branch.id), target)
+    rt.store.record_harness_refinement(branch.id, target)
     rt.request_refinement(branch.id, source="human", rollback_id=target["id"])
     assert await rt.refinement_checkpoint(branch.id)
     assert not rt.store.harness.load(sid)["entries"]["memory"]

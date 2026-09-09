@@ -1090,6 +1090,7 @@ class Runtime(RefinementServices):
                 await self._prepare(sid)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
+                self.context.ensure_harness_digest(sid, committed=True)
                 self._admitted_turns.add(sid)
                 response, response_event = await self._invoke(sid)
                 if (
@@ -1107,6 +1108,7 @@ class Runtime(RefinementServices):
                 self._admitted_turns.add(sid)
                 response = ModelResponse.model_validate(pending["response"])
                 response_event = pending["event_id"]
+            self.refinement_message_end(sid)
             while pending["index"] < len(response.actions):
                 self._check_limits(sid)
                 index = pending["index"]
@@ -1349,6 +1351,12 @@ class Runtime(RefinementServices):
                 )
         finally:
             self._admitted_turns.discard(sid)
+            if self._closing or self.store.session(sid).outcome in (
+                Outcome.CANCELLED,
+                Outcome.FAILED,
+                Outcome.LIMITED,
+            ):
+                self.invalidate_refinement(sid)
             with self.store.transaction():
                 self.store.charge(sid, Usage(wall_seconds=max(0, now() - started)))
                 self.store.update(sid, running_since=None)
@@ -2323,15 +2331,13 @@ class Runtime(RefinementServices):
                     ],
                 )
             from .harness import (
-                append_refinement_history,
-                load_refinement_history,
                 save_harness_state,
             )
 
             self.invalidate_refinement(sid)
             save_harness_state(self.store.harness.path(branch.id), self.store.harness.load(sid))
-            for record in load_refinement_history(self.store.harness.path(sid), "local"):
-                append_refinement_history(self.store.harness.path(branch.id), record)
+            for record in self.store.refinement_history(sid):
+                self.store.record_harness_refinement(branch.id, record)
             self.context.ensure_harness_digest(branch.id)
             source_dir = self.store.directory / "kernels" / source.kernel_id
             target_dir = self.store.directory / "kernels" / branch.kernel_id
@@ -2373,6 +2379,8 @@ class Runtime(RefinementServices):
         tasks = list(
             set(self.tasks.values())
             | {state.task for state in self._refinement_states.values() if state.task}
+            | {state.background for state in self._refinement_states.values() if state.background}
+            | {state.claim for state in self._refinement_states.values() if state.claim}
         )
         for task in tasks:
             task.cancel()

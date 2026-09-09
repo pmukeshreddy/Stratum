@@ -119,10 +119,23 @@ class Store(RequestHistory, TrajectoryHistory):
         migrate(self.db, version, now())
         self._depth = 0
         from .harness import HarnessStore
-        from .harness_migration import migrate_sqlite_harness
+        from .harness_migration import migrate_session_refinement_history, migrate_sqlite_harness
 
-        self.harness = HarnessStore(self.directory)
+        self.harness = HarnessStore(self.directory, session_history=self)
         migrate_sqlite_harness(self.db, self.harness)
+        migrate_session_refinement_history(self)
+
+    def refinement_history(self, sid):
+        return [
+            json.loads(row[0])
+            for row in self.db.execute(
+                "SELECT payload FROM events WHERE session_id=? AND type='harness_refinement' ORDER BY seq",
+                (sid,),
+            )
+        ]
+
+    def record_harness_refinement(self, sid, result):
+        self.event(sid, "harness_refinement", result)
 
     @contextmanager
     def transaction(self):

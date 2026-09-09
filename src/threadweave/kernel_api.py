@@ -67,20 +67,312 @@ class Host:
 
 
 class Harness:
-    def __init__(self, host):
-        self.host = host
+    """Prime's writable kernel view of the canonical host-owned JSON store."""
 
-    def list(self, kind=None, *, global_=False):
-        return [Record(e) for e in self.host.call("harness.list", kind=kind, global_=global_)]
+    def __init__(self, host, *, global_=False):
+        self.host, self.global_ = host, global_
 
-    def get(self, kind, id, *, global_=False):
-        value = self.host.call("harness.get", kind=kind, id=id, global_=global_)
-        if value is None:
-            raise KeyError(f"Harness entry not found: {kind}/{id}")
-        return Record(value)
+    def _call(self, operation, *, global_=False, **payload):
+        if "global" in payload:
+            global_ = payload.pop("global")
+        if not isinstance(global_, bool):
+            raise TypeError("global must be a bool")
+        return self.host.call("harness." + operation, global_=global_ or self.global_, **payload)
 
-    def overview(self):
-        return self.host.call("harness.overview")
+    def list(self, kind=None, *, global_=False, **kwargs):
+        return [Record(e) for e in self._call("list", kind=kind, global_=global_, **kwargs)]
+
+    def get(self, kind, id, *, global_=False, **kwargs):
+        value = self._call("get", kind=kind, id=id, global_=global_, **kwargs)
+        return Record(value) if value is not None else None
+
+    def create(
+        self,
+        kind,
+        title,
+        content,
+        *,
+        id=None,
+        path="general",
+        reference=None,
+        arguments=None,
+        metadata=None,
+        source="agent",
+        global_=False,
+        **kwargs,
+    ):
+        return Record(
+            self._call(
+                "create",
+                kind=kind,
+                title=title,
+                content=content,
+                id=id,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+                global_=global_,
+                **kwargs,
+            )
+        )
+
+    def update(
+        self,
+        kind,
+        id,
+        title,
+        content,
+        *,
+        path=None,
+        reference=None,
+        arguments=None,
+        metadata=None,
+        source="agent",
+        global_=False,
+        **kwargs,
+    ):
+        return Record(
+            self._call(
+                "update",
+                kind=kind,
+                id=id,
+                title=title,
+                content=content,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+                global_=global_,
+                **kwargs,
+            )
+        )
+
+    def upsert(
+        self,
+        kind,
+        title,
+        content,
+        *,
+        id=None,
+        path="general",
+        reference=None,
+        arguments=None,
+        metadata=None,
+        source="agent",
+        global_=False,
+        **kwargs,
+    ):
+        return Record(
+            self._call(
+                "upsert",
+                kind=kind,
+                title=title,
+                content=content,
+                id=id,
+                path=path,
+                reference=reference,
+                arguments=arguments,
+                metadata=metadata,
+                source=source,
+                global_=global_,
+                **kwargs,
+            )
+        )
+
+    def delete(self, kind, id, *, global_=False, **kwargs):
+        return self._call("delete", kind=kind, id=id, global_=global_, **kwargs)
+
+    def overview(self, *, max_entries_per_kind=20, global_=False, **kwargs):
+        return self._call(
+            "overview", max_entries_per_kind=max_entries_per_kind, global_=global_, **kwargs
+        )
+
+    def snapshot(self, *, global_=False, **kwargs):
+        return self._call("snapshot", global_=global_, **kwargs)
+
+    def record_refinement(
+        self, trigger, changes, *, evidence="", outcome="", id=None, global_=False, **kwargs
+    ):
+        return Record(
+            self._call(
+                "record_refinement",
+                trigger=trigger,
+                changes=changes,
+                evidence=evidence,
+                outcome=outcome,
+                id=id,
+                global_=global_,
+                **kwargs,
+            )
+        )
+
+    def create_memory(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "general",
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.create(
+            "memory", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs
+        )
+
+    def update_memory(
+        self,
+        id: str,
+        title: str,
+        content: str,
+        *,
+        path: str | None = None,
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.update(
+            "memory", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs
+        )
+
+    def delete_memory(self, id: str, *, global_: bool = False, **kwargs: object) -> bool:
+        return self.delete("memory", id, global_=global_, **kwargs)
+
+    def create_prompt_note(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "policy",
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.create(
+            "prompt", title, content, id=id, path=path, metadata=metadata, global_=global_, **kwargs
+        )
+
+    def update_prompt_note(
+        self,
+        id: str,
+        title: str,
+        content: str,
+        *,
+        path: str | None = None,
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.update(
+            "prompt", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs
+        )
+
+    def delete_prompt_note(self, id: str, *, global_: bool = False, **kwargs: object) -> bool:
+        return self.delete("prompt", id, global_=global_, **kwargs)
+
+    def create_skill(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "general",
+        reference: dict[str, object] | None = None,
+        arguments: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.create(
+            "skill",
+            title,
+            content,
+            id=id,
+            path=path,
+            reference=reference,
+            arguments=arguments,
+            metadata=metadata,
+            global_=global_,
+            **kwargs,
+        )
+
+    def update_skill(
+        self,
+        id: str,
+        title: str,
+        content: str,
+        *,
+        path: str | None = None,
+        reference: dict[str, object] | None = None,
+        arguments: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.update(
+            "skill",
+            id,
+            title,
+            content,
+            path=path,
+            reference=reference,
+            arguments=arguments,
+            metadata=metadata,
+            global_=global_,
+            **kwargs,
+        )
+
+    def delete_skill(self, id: str, *, global_: bool = False, **kwargs: object) -> bool:
+        return self.delete("skill", id, global_=global_, **kwargs)
+
+    def create_subagent(
+        self,
+        title: str,
+        content: str,
+        *,
+        id: str | None = None,
+        path: str = "general",
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.create(
+            "subagent",
+            title,
+            content,
+            id=id,
+            path=path,
+            metadata=metadata,
+            global_=global_,
+            **kwargs,
+        )
+
+    def update_subagent(
+        self,
+        id: str,
+        title: str,
+        content: str,
+        *,
+        path: str | None = None,
+        metadata: dict[str, object] | None = None,
+        global_: bool = False,
+        **kwargs: object,
+    ) -> Record:
+        return self.update(
+            "subagent", id, title, content, path=path, metadata=metadata, global_=global_, **kwargs
+        )
+
+    def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: object) -> bool:
+        return self.delete("subagent", id, global_=global_, **kwargs)
+
+    create_prompt = create_prompt_note
+    update_prompt = update_prompt_note
+    delete_prompt = delete_prompt_note
 
 
 class Recursive:
@@ -112,8 +404,8 @@ class Recursive:
             requirement=requirement,
         )
 
-    def get_harness_state(self):
-        return self.harness.overview()
+    def get_harness_state(self, *, global_=False):
+        return Harness(self.host, global_=True) if global_ else self.harness
 
     def help(self):
         return 'await rlm("assignment", name="child") returns a persistent handle at admission. Put prose in the prompt or requirement. Optional purpose selects a registered child workspace/capability profile (default shared), not a description. await agents.wait(seconds=30) returns a receipt immediately and defers the next model turn; end the cell afterward. agent_message sends/receives messages; agent_observe reads child trajectories.'

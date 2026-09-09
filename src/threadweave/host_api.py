@@ -65,19 +65,73 @@ def harness(context, operation, payload):
     kind, global_ = p.pop("kind", None), p.pop("global_", False)
     if not isinstance(global_, bool):
         raise TypeError("global_ must be bool")
-    state = store.harness.load(None if global_ else sid)
+    allowed = {
+        "list": set(),
+        "get": {"id"},
+        "snapshot": set(),
+        "overview": {"max_entries_per_kind"},
+        "create": {
+            "id",
+            "title",
+            "content",
+            "path",
+            "reference",
+            "arguments",
+            "metadata",
+            "source",
+        },
+        "update": {
+            "id",
+            "title",
+            "content",
+            "path",
+            "reference",
+            "arguments",
+            "metadata",
+            "source",
+        },
+        "upsert": {
+            "id",
+            "title",
+            "content",
+            "path",
+            "reference",
+            "arguments",
+            "metadata",
+            "source",
+        },
+        "delete": {"id"},
+        "record_refinement": {"id", "trigger", "changes", "evidence", "outcome"},
+    }
+    if operation not in allowed:
+        raise ValueError(f"Unknown harness operation: {operation}")
+    if extra := p.keys() - allowed[operation]:
+        raise TypeError(f"unexpected keyword argument {next(iter(extra))!r}")
+    if operation in {"create", "update", "delete", "upsert", "record_refinement"}:
+        return store.harness.mutate(sid, operation, kind, global_=global_, **p)
+    if operation == "get":
+        return store.harness.get(sid, kind, p["id"], global_=global_)
     if operation == "overview":
-        return store.harness.merged(sid)
-    if operation == "list":
-        return [
+        return store.harness.overview(sid, global_=global_, **p)
+    state = store.harness.load(None if global_ else sid)
+    if operation == "snapshot":
+        return {
+            "file_path": str(store.harness.path(None if global_ else sid) / "harness_state.json"),
+            "scope": "global" if global_ else "local",
+            "entries": state["entries"],
+            "refinements": state["refinements"],
+        }
+    if kind is not None and kind not in state["entries"]:
+        raise ValueError(f"Unknown harness kind: {kind}")
+    return sorted(
+        [
             e
             for k, entries in state["entries"].items()
             if kind is None or k == kind
             for e in entries.values()
-        ]
-    if operation == "get":
-        return store.harness.get(sid, kind, p["id"], global_=global_)
-    raise ValueError(f"Unknown harness operation: {operation}")
+        ],
+        key=lambda e: (e["kind"], e["path"], e["title"], e["id"]),
+    )
 
 
 async def dispatch(context, request):

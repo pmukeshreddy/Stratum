@@ -42,13 +42,13 @@ All rows below describe runtime objects preloaded by `kernel_worker.Worker` and 
 | `await agent_observe.recent_messages(worker.session_id, limit=8, max_chars=800)` | Target ID/name/unambiguous suffix; `limit=1..50`, `max_chars=80..2000`. Returns `{'session_id': id, 'messages': list[trajectory_record]}` | Reads committed evidence; never waits for child completion. Records carry source ID, sequence, timestamp, session, event type, role and bounded body. Invalid/inaccessible/ambiguous targets fail. |
 | `await agent_observe.get(worker.session_id)` | Target as above; `{'agent': session_record}` | Current lifecycle/configuration metadata. `list_agents()` returns `{'agents': [...]}`. `requests(target)` returns the authorized request graph with requests and edges. |
 | `await agents.wait(seconds=10)` | `seconds`; `{'waiting_seconds': seconds, 'wake_on_message': True}` | Returns a receipt immediately and defers the next model turn. End the cell afterward to release its slot. Message arrival or deadline makes the session runnable. This is not a blocking mailbox receive. `agents` and `rlm` are the same recursive API object. |
-| `entry = harness.get('memory', id)` | `kind`, `id`; optional `global_=False`, `version=None`. Returns attribute-accessible `Record` | Synchronous host call. Missing entries raise `KeyError` locally. Records are data, not awaitables. Full content stays in Python unless inspected. |
+| `entry = harness.get('memory', id)` | `kind`, `id`; optional `global_=False`. Returns an attribute-accessible `Record` or `None` | Synchronous host call. Missing entries return `None`. Records are data, not awaitables. Full content stays in Python unless inspected. |
 | `harness.list(kind=None, global_=False)` | Returns `list[Record]` | Synchronous retrieval, filtered by kind and local/global scope. |
 | `skills.list()` / `skills.load(name)` | List of installed skills; load returns an imported `ModuleType` | Synchronous. Importable modules are added to the namespace. Missing or disallowed skills fail. Read the associated instructions. |
 | `catalog = tools.catalog()` | List of admitted function schemas | Synchronous discovery into Python. `tools.call(name, **arguments)` is synchronous; `await tools.acall(name, **arguments)` is async. Both return the tool's schema-specific Python value and execute once. Use the latter when coordinating asynchronous work. |
 | `job = bash(command, cwd=None, timeout=None)` / `result = await bash(command)` | Synchronous start returns `BashHandle(id)`. Await returns `Record`: process identity, command/cwd, state/running, exit code, duration, stdout/stderr/output, stream artifact IDs, passed/timed_out/interrupted flags | Start waits only for process admission. Retaining a handle allows background work; awaiting waits for completion. Nonzero exits are results, not exceptions. `poll()` returns `None` while running, otherwise status; `tail(n=50)`, `output()`, `pid`, `running` inspect; `kill(sig=15, grace=.5)` returns status. Restart retains identity but does not silently replay a lost process. |
 | `await compact()` | No arguments; `{'event_id': id_or_None}` | Compacts committed model context now, queues an automatic review checkpoint when appropriate, and retains Python state/history. Does not compact the currently executing unfinished block. |
-| `await refine.run(instructions=None, global_=False)` | Returns `scheduled` immediately | The host plans and applies at a completed-turn boundary; `refine.status()` reports pending/in-flight work. |
+| `await refine.run(instructions=None, global_=False)` | Returns `scheduled` immediately | Host planning overlaps tools after the model response; application waits for the completed-turn boundary; `refine.status()` reports pending/in-flight work. |
 
 Other generic preloads are `Path`, `pathlib`, `os`, `asyncio`, `json`, `session`, `context`, `history`, `artifacts`, `mcp`, `goal`, `verify`, `heartbeat`, `forget`, `remember_recipe`, and IPython's `get_ipython`. `shell` aliases `bash`. Coding sessions additionally preload `repo`, `git`, `edit`, `tests`, `build`, `lint`, `typecheck`, `bench`, `experiment`, and coding context/child helpers where admitted. These are capability surfaces, not an ordered workflow. Their live `help` and admitted schemas expose exact method arguments. Existing synchronous coding-capability result wrappers remain optionally awaitable; the canonical examples use their synchronous form. Plain harness/skill records do not use that compatibility behavior.
 
@@ -57,18 +57,22 @@ Other generic preloads are `Path`, `pathlib`, `os`, `asyncio`, `json`, `session`
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
-learned state is imported once; old tables have no runtime readers or writers.
+Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
+refinement history is part of the persisted session trajectory; no local JSONL
+sidecar is used. Existing SQLite learned state is imported once; old learned-state
+tables have no runtime readers or writers.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
-returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+returns `pending` and `in_flight`. Planning overlaps tools after the model response
+finishes; the exact plan is applied only at a completed-turn boundary,
 then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
 before it continues. Zero-edit proposals produce no update notice. Automatic review
 is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
 findings are ordinary trajectory evidence, not separate refinement triggers.
 
-A compact merged digest enters context at session start, resume, compaction, and
+An untouched session defers its compact merged digest until its first input commit.
+The digest refreshes on resume, compaction, and
 stale-state detection. Unchanged digests are deduplicated. The base system prompt
 stays unchanged after learning. Colliding global/local IDs remain visible with
 scope labels; local guidance can override global guidance within the session.

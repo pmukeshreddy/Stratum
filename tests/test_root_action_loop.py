@@ -228,17 +228,12 @@ assert callable(rlm) and inspect.iscoroutinefunction(rlm.__call__)
 assert all(name in globals() for name in ('task','workspace','rlm','agent_message','agent_observe','harness','skills','tools','bash','compact','refine'))
 assert rlm.harness is harness
 entry = harness.get('memory', 'units')
-assert not hasattr(harness, 'create')
+assert callable(harness.create)
 assert not inspect.isawaitable(entry)
 assert not inspect.isawaitable(harness.list())
 assert not inspect.isawaitable(skills.list())
 assert harness.get('memory', entry.id).version == 1
-try:
-    harness.get('memory', 'missing')
-except KeyError:
-    pass
-else:
-    raise AssertionError('missing entry must raise KeyError')
+assert harness.get('memory', 'missing') is None
 child = await rlm('Check a distinct boundary.', name='checker')
 assert child.session_id and child.name == 'checker'
 root_value = 41

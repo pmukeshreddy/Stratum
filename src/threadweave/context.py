@@ -136,8 +136,14 @@ a small local task needs no child. Optional requirement= describes the task requ
         text += """\nContinual harness:
 The learned kinds are prompt, memory, skill and subagent. Local state belongs to this persisted
 session; global state survives sessions. The compact harness digest is delivered at session start,
-resume and compaction, with updates when stale. harness.list(), harness.get(kind, id), and
-rlm.get_harness_state() inspect full JSON state. Use global_=True to inspect the global store.
+resume and compaction, with updates when stale. rlm.harness (also harness) exposes list(),
+get(kind, id), overview() and snapshot(); rlm.get_harness_state() returns the same writable view.
+Use create_memory(title, content), update_memory(id, title, content), delete_memory(id),
+and the corresponding prompt, skill and subagent methods for direct atomic JSON writes.
+create_prompt_note/update_prompt_note/delete_prompt_note are Prime's prompt aliases.
+Updates preserve omitted path, reference, arguments and metadata; get returns None when missing.
+Direct writes are immediate; record_refinement(trigger, changes, evidence=..., outcome=...) records
+their explicit audit summary. Use global_=True or a global:id prefix to target the global store.
 Supplemental state never overrides the task or the immutable base system prompt.
 Actively improve the harness when a repeated failure, reusable debugging strategy, better tool
 workflow, repeated command sequence, durable fact, reusable coding procedure, useful delegation
@@ -145,7 +151,8 @@ role, behavioral instruction or user correction emerges. Correct or delete wrong
 skills. Call await refine.run() or await refine.run('specific instructions') as part of normal work.
 Default refinement is LOCAL. await refine.run(global_=True) explicitly targets GLOBAL state for
 stable cross-session lessons. await refine.status() reports pending and in_flight.
-refine.run() returns scheduled immediately. It runs after the current turn's tools finish; edits
+refine.run() returns scheduled immediately. Planning may overlap the current tools; edits apply
+only after the tools finish and the baseline is checked. Applied edits
 enter your trajectory as a durable [self-refinement] notice and you resume automatically.
 The refinement model selects create/update/delete edits to prompt, memory, skill or subagent.
 Validate the lesson on subsequent work. Do not wait for automatic checkpoints to learn.
@@ -255,10 +262,12 @@ class Context:
                 self._export_cursors[sid] = row["seq"]
         return path
 
-    def ensure_harness_digest(self, sid):
+    def ensure_harness_digest(self, sid, *, committed=False):
         from .harness import format_harness_state
 
         session = self.store.session(sid)
+        if not committed and not session.context and not session.summary:
+            return False  # Untouched sessions defer delivery until their first input commit.
         digest = format_harness_state(self.store.harness.merged(sid))
         latest = None
         for block in session.context:

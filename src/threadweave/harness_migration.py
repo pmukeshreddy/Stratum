@@ -9,6 +9,24 @@ from .harness import atomic_json, save_harness_state, validate_edit
 log = logging.getLogger(__name__)
 
 
+def migrate_session_refinement_history(store):
+    """Import and retire the previous local sidecar once; normal reads use events."""
+    from .harness import load_refinement_history
+
+    for session in store.sessions():
+        directory = store.harness.path(session.id)
+        path = directory / "refinements.jsonl"
+        if not path.exists():
+            continue
+        known = {r["id"] for r in store.refinement_history(session.id)}
+        with store.transaction():
+            for record in load_refinement_history(directory, "local"):
+                if record["id"] not in known:
+                    store.record_harness_refinement(session.id, record)
+                    known.add(record["id"])
+        path.unlink()
+
+
 def migrate_sqlite_harness(db, harness):
     marker = harness.directory / "harness" / ".sqlite-migrated.json"
     if marker.exists():

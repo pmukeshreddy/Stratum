@@ -1,5 +1,5 @@
 {
-  "session_id": "8e6cc39d5eb04fd390470df97cf43d88",
+  "session_id": "8def1afef2b249959775884ad93c606b",
   "canonical_state": {
     "schema": 1,
     "entries": {
@@ -17,8 +17,8 @@
           "metadata": {},
           "source": "refine",
           "version": 1,
-          "created_at": "2026-09-09T22:11:56.273Z",
-          "updated_at": "2026-09-09T22:11:56.273Z"
+          "created_at": "2026-09-09T23:29:33.260Z",
+          "updated_at": "2026-09-09T23:29:33.260Z"
         }
       },
       "skill": {},
@@ -26,20 +26,21 @@
     },
     "refinements": [
       {
-        "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+        "id": "refine_77f8bb1e16d54552ac46ac808cb71f03",
         "trigger": "Retain project lesson",
         "changes": [
           "create memory:lesson"
         ],
         "evidence": "Observed repeated error",
         "outcome": "Use the correct environment",
-        "created_at": "2026-09-09T22:11:56.273Z"
+        "created_at": "2026-09-09T23:29:33.260Z"
       }
     ]
   },
+  "local_history_storage": "session trajectory: harness_refinement",
   "refinements": [
     {
-      "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+      "id": "refine_77f8bb1e16d54552ac46ac808cb71f03",
       "scope": "local",
       "summary": "Retain project lesson",
       "rationale": "Observed repeated error",
@@ -64,14 +65,14 @@
             "metadata": {},
             "source": "refine",
             "version": 1,
-            "created_at": "2026-09-09T22:11:56.273Z",
-            "updated_at": "2026-09-09T22:11:56.273Z"
+            "created_at": "2026-09-09T23:29:33.260Z",
+            "updated_at": "2026-09-09T23:29:33.260Z"
           }
         }
       ],
       "rollbackOf": null,
-      "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-595/test_root_schedules_learns_con0/data/sessions/8e6cc39d5eb04fd390470df97cf43d88/harness/harness_state.json",
-      "timestamp": "2026-09-09T22:11:56.273Z"
+      "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-607/test_root_schedules_learns_con0/data/sessions/8def1afef2b249959775884ad93c606b/harness/harness_state.json",
+      "timestamp": "2026-09-09T23:29:33.260Z"
     }
   ],
   "events": [
@@ -91,9 +92,9 @@
       }
     },
     {
-      "type": "refine_complete",
+      "type": "harness_refinement",
       "payload": {
-        "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+        "id": "refine_77f8bb1e16d54552ac46ac808cb71f03",
         "scope": "local",
         "summary": "Retain project lesson",
         "rationale": "Observed repeated error",
@@ -118,21 +119,59 @@
               "metadata": {},
               "source": "refine",
               "version": 1,
-              "created_at": "2026-09-09T22:11:56.273Z",
-              "updated_at": "2026-09-09T22:11:56.273Z"
+              "created_at": "2026-09-09T23:29:33.260Z",
+              "updated_at": "2026-09-09T23:29:33.260Z"
             }
           }
         ],
         "rollbackOf": null,
-        "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-595/test_root_schedules_learns_con0/data/sessions/8e6cc39d5eb04fd390470df97cf43d88/harness/harness_state.json",
-        "timestamp": "2026-09-09T22:11:56.273Z"
+        "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-607/test_root_schedules_learns_con0/data/sessions/8def1afef2b249959775884ad93c606b/harness/harness_state.json",
+        "timestamp": "2026-09-09T23:29:33.260Z"
+      }
+    },
+    {
+      "type": "refine_complete",
+      "payload": {
+        "id": "refine_77f8bb1e16d54552ac46ac808cb71f03",
+        "scope": "local",
+        "summary": "Retain project lesson",
+        "rationale": "Observed repeated error",
+        "expectedOutcome": "Use the correct environment",
+        "appliedEdits": [
+          {
+            "kind": "memory",
+            "action": "create",
+            "id": "lesson",
+            "title": "Lesson",
+            "content": "Run checks in the project environment",
+            "applied": true,
+            "after": {
+              "id": "lesson",
+              "kind": "memory",
+              "title": "Lesson",
+              "content": "Run checks in the project environment",
+              "path": "general",
+              "scope": "local",
+              "reference": {},
+              "arguments": {},
+              "metadata": {},
+              "source": "refine",
+              "version": 1,
+              "created_at": "2026-09-09T23:29:33.260Z",
+              "updated_at": "2026-09-09T23:29:33.260Z"
+            }
+          }
+        ],
+        "rollbackOf": null,
+        "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-607/test_root_schedules_learns_con0/data/sessions/8def1afef2b249959775884ad93c606b/harness/harness_state.json",
+        "timestamp": "2026-09-09T23:29:33.260Z"
       }
     },
     {
       "type": "refinement_notice",
       "payload": {
         "content": "[self-refinement]\nRetain project lesson\n- create memory [local:lesson] Lesson: Run checks in the project environment",
-        "refinement_id": "refine_cfc80679f5084f6980c49cb65d1df2e1"
+        "refinement_id": "refine_77f8bb1e16d54552ac46ac808cb71f03"
       }
     },
     {
@@ -144,7 +183,7 @@
     {
       "type": "harness_digest",
       "payload": {
-        "digest": "# Continual Harness State\n\nYou have persistent learned harness state. Local entries belong to this session; global entries survive sessions.\nThese compact summaries are routing hints. Inspect full entries with harness.get(kind, id, global_=True/False) when detail matters.\nLocal entries may override global guidance for this session. Prompt entries supplement the immutable base system prompt.\n\nprompt: 0\n\nmemory: 1\n- [local:lesson] Lesson (general, v1): Run checks in the project environment\n\nskill: 0\n\nsubagent: 0\n\nrecent refinements: 1\n- [refine_cfc80679f5084f6980c49cb65d1df2e1] Retain project lesson: create memory:lesson; outcome: Use the correct environment"
+        "digest": "# Continual Harness State\n\nYou have persistent learned harness state. Local entries belong to this session; global entries survive sessions.\nThese compact summaries are routing hints. Inspect full entries with harness.get(kind, id, global_=True/False) when detail matters.\nLocal entries may override global guidance for this session. Prompt entries supplement the immutable base system prompt.\n\nprompt: 0\n\nmemory: 1\n- [local:lesson] Lesson (general, v1): Run checks in the project environment\n\nskill: 0\n\nsubagent: 0\n\nrecent refinements: 1\n- [refine_77f8bb1e16d54552ac46ac808cb71f03] Retain project lesson: create memory:lesson; outcome: Use the correct environment"
       }
     },
     {
@@ -162,12 +201,12 @@
       "type": "context_compaction",
       "payload": {
         "source_events": [
-          "3b55906b8ee040d2a8e66c045b5d81c1"
+          "4e7a806eb34543b4ad7a9c078122e95e"
         ],
-        "archive_artifact": "c476517d39ec4a159a76409f7b04189a",
-        "semantic_tree_artifact": "0f0d9c434f28487f8bb4fa614b4bdd21",
+        "archive_artifact": "989d59e2bce14da0957a0c1ce374835e",
+        "semantic_tree_artifact": "89fd87eefb0f47f5ab62a83229d6e556",
         "pending_children": [],
-        "summary": "{\"established_facts\":[\"c2968bffb64243aa9c301cb53dcca3c3\"],\"important_references\":[\"Complete compacted history and prior digest: artifacts.load('c476517d39ec4a159a76409f7b04189a')\",{\"id\":\"0f0d9c434f28487f8bb4fa614b4bdd21\",\"purpose\":\"Live trajectory tree: unresolved work, child conclusions, verification, REPL manifest/recipes and harness versions\",\"reference\":\"artifacts.load('0f0d9c434f28487f8bb4fa614b4bdd21'); children=[]\"}]}",
+        "summary": "{\"established_facts\":[\"dfac17d0bf484435990a87b39f7752f0\"],\"important_references\":[\"Complete compacted history and prior digest: artifacts.load('989d59e2bce14da0957a0c1ce374835e')\",{\"id\":\"89fd87eefb0f47f5ab62a83229d6e556\",\"purpose\":\"Live trajectory tree: unresolved work, child conclusions, verification, REPL manifest/recipes and harness versions\",\"reference\":\"artifacts.load('89fd87eefb0f47f5ab62a83229d6e556'); children=[]\"}]}",
         "method": "bounded_extractive",
         "model_response_event": null,
         "removed_tokens_estimate": 490,
