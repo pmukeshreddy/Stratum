@@ -10,7 +10,16 @@ from pathlib import Path
 
 from pydantic import Field
 
-from ..models import HarnessError, ModelRequest, Record, TaskConfig, Usage
+from ..models import (
+    HarnessError,
+    ModelRequest,
+    Outcome,
+    Record,
+    RunConfig,
+    TaskConfig,
+    Usage,
+    new_id,
+)
 from ..providers import default_providers
 from ..runtime import Runtime
 from ..tokenization import estimate
@@ -101,63 +110,82 @@ async def discard(_):
 
 
 async def invoke_judge(config, request, directory, usages):
+    # Judges use exactly their official prompt/settings, but share the production
+    # request ledger, retry identities and failure accounting with agent calls.
+    directory = Path(directory)
     provider = default_providers()[config.name]
-    # The official evaluator selects judge temperature; the configured output cap is shared.
     resolved = config.model_copy(deep=True)
     resolved.max_output_tokens = min(config.max_output_tokens, request["max_tokens"])
     if config.name == "chat":
         resolved.parameters["temperature"] = request["temperature"]
     messages = [{"role": "user", "content": request["prompt"]}]
-    measured = MatchedProvider(provider, resolved, Path(directory) / "judge-calls.jsonl")
-    for attempt in range(3):
-        try:
-            response = await measured.invoke(
-                ModelRequest(
-                    session_id="official-judge",
-                    root_id="official-judge",
-                    parent_id=None,
-                    name="official-judge",
-                    turn=len(usages),
-                    messages=messages,
-                    tools=[],
-                    config=resolved,
-                    input_token_bound=estimate(messages, resolved.model),
-                ),
-                discard,
+    size = estimate(messages, resolved.model)
+    measured = MatchedProvider(provider, resolved, directory / "judge-calls.jsonl")
+    runtime = Runtime(directory / "judge-state" / new_id(), providers={resolved.name: measured})
+    session = None
+    try:
+        session = runtime.create(
+            request["prompt"],
+            directory,
+            name="official-judge",
+            mode="interactive",
+            config=RunConfig(
+                provider=resolved,
+                permissions=[],
+                tool_allowlist=[],
+                context={"max_tokens": max(2048, size + resolved.max_output_tokens + 2048)},
+                retry={"attempts": 3, "initial_delay": 1, "max_delay": 2},
+                refinement={"enabled": False},
+                limits={
+                    "token_budget": 3 * (size + resolved.max_output_tokens) + 1,
+                    "max_model_calls": 3,
+                    "wall_seconds": 3 * resolved.timeout_seconds + 10,
+                },
+            ),
+        )
+        response, _ = await runtime._model_call(
+            session.id,
+            ModelRequest(
+                session_id=session.id,
+                root_id=session.root_id,
+                parent_id=None,
+                name="official-judge",
+                turn=len(usages),
+                messages=messages,
+                tools=[],
+                config=resolved,
+                input_token_bound=size,
+                metadata={"purpose": "evaluation_judge"},
+            ),
+            persist_turn=False,
+        )
+        runtime.store.finish(session.id, Outcome.COMPLETED, response.text)
+        return response.text
+    except BaseException as exc:
+        if session:
+            runtime.store.finish(
+                session.id, Outcome.FAILED, "Judge invocation failed; inspect request history"
             )
-            break
-        except BaseException as exc:
-            usages.append(
-                Usage(
-                    input_tokens=estimate(messages, resolved.model),
-                    output_tokens=resolved.max_output_tokens,
-                    cost=None,
-                    estimated_calls=1,
-                    model_calls=1,
+        with (directory / "judge-errors.jsonl").open("a") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "time": timestamp(),
+                        "type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                        "request_history": str(runtime.store.directory),
+                    }
                 )
+                + "\n"
             )
-            with (Path(directory) / "judge-errors.jsonl").open("a") as stream:
-                stream.write(
-                    json.dumps(
-                        {
-                            "time": timestamp(),
-                            "type": type(exc).__name__,
-                            "traceback": traceback.format_exc(),
-                        }
-                    )
-                    + "\n"
+        raise
+    finally:
+        if session:
+            for logical in runtime.store.request_graph(session.id)["requests"]:
+                usages.extend(
+                    Usage.model_validate(attempt["usage"]) for attempt in logical["attempts"]
                 )
-            retryable = (isinstance(exc, HarnessError) and exc.failure.retryable) or (
-                isinstance(exc, PermissionError) and exc.errno == 1
-            )
-            if not retryable or attempt == 2:
-                raise
-            await asyncio.sleep(2**attempt)
-    usage = response.usage.model_copy(deep=True)
-    usage.model_calls += 1
-    usage.estimated_calls += int(not response.usage_reported)
-    usages.append(usage)
-    return response.text
+        await runtime.shutdown()
 
 
 async def run_buffalo(

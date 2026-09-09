@@ -40,7 +40,14 @@ class BackgroundProcesses:
                 state="lost",
                 recovery_note="Daemon lost ownership; no command replay or unsafe PID-based adoption",
             )
-            self.save(id, row["session_id"], result)
+            with self.runtime.store.transaction():
+                self.save(id, row["session_id"], result)
+                self.runtime.message(
+                    context.session_id,
+                    context.session_id,
+                    "Background process lost during restart: "
+                    + encode({"id": id, "state": "lost", "recovery_note": result["recovery_note"]}),
+                )
         directory = self.runtime.store.directory / "processes" / id
         cap = self.runtime.store.config(context.session_id).execution.output_chars
         for stream in ("stdout", "stderr", "output"):
@@ -242,10 +249,22 @@ class BackgroundProcesses:
                 body[stream + "_artifact"] = self.runtime.artifacts.put_stream(
                     context.session_id, f, source_event=context.source_event
                 )
-        self.save(body["id"], context.session_id, body)
-        self.runtime.store.event(
-            context.session_id, "execution_result", body, parent=context.source_event
-        )
+        with self.runtime.store.transaction():
+            self.save(body["id"], context.session_id, body)
+            self.runtime.store.event(
+                context.session_id, "execution_result", body, parent=context.source_event
+            )
+            self.runtime.message(
+                context.session_id,
+                context.session_id,
+                "Background process completed: "
+                + encode(
+                    {
+                        key: value[:2000] if key in {"stdout", "stderr", "output"} else value
+                        for key, value in self.status(context, body["id"]).items()
+                    }
+                ),
+            )
         if self.runtime.store.config(context.session_id).task.adapter == "coding":
             try:
                 self.runtime.environment.mutations.reconcile(

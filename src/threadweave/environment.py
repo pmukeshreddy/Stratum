@@ -33,6 +33,27 @@ class Environment:
             config.task.require_verifier = True
             config.task.verify_each_turn = False
 
+    def inherit_shared_admission(self, parent, child):
+        store = self.runtime.store
+        if (
+            parent.workspace.path != child.workspace.path
+            or store.config(child.id).task.adapter != "coding"
+        ):
+            return
+        row = store.db.execute(
+            "SELECT body FROM coding_baselines WHERE session_id=?", (parent.id,)
+        ).fetchone()
+        if row:
+            # A shared child observes the SAME workspace changes against the
+            # original verified baseline; it must not establish a new dirty baseline.
+            with store.transaction():
+                store.db.execute("INSERT INTO coding_baselines VALUES(?,?)", (child.id, row[0]))
+                store.event(
+                    child.id,
+                    "coding_baseline_inherited",
+                    {"parent_id": parent.id, "workspace": child.workspace.path},
+                )
+
     async def prepare(self, sid, *, force=False):
         runtime, store = self.runtime, self.runtime.store
         config, session = store.config(sid), store.session(sid)
@@ -126,14 +147,12 @@ class Environment:
                 "environment", "observation_failed", str(exc), uncertain=True
             ) from exc
 
-    def continuation_workspace(self, source, config, *, child=False):
+    def continuation_workspace(self, source, config, *, child=False, isolate=None):
         """Explicit coding environments isolate writable continuations; others share metadata."""
-        if config.task.adapter != "coding":
-            if child:
-                config.task.verifier = "none"
-                config.task.require_verifier = False
-                config.task.verifier_options = {}
-            return source.workspace, None
+        if isolate is None:
+            isolate = config.task.adapter == "coding"
+        if not isolate:
+            return source.workspace.model_copy(deep=True), None
         from .gitops import GitWorkspace
 
         event = self.runtime.store.event(
@@ -155,7 +174,6 @@ class Environment:
         config.task.base_commit = None
         if child:
             config.task.require_change = False
-            config.task.verifier_options = {}
         return workspace, checkpoint
 
     async def recover(self):

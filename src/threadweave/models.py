@@ -272,6 +272,7 @@ class RunConfig(Record):
         default_factory=lambda: ["workspace.read", "workspace.write", "python", "agents", "state"]
     )
     tool_allowlist: list[str] | None = None
+    active_tool_names: list[str] | None = None
     allow_sibling_messages: bool = True
     extensions: list[str] = Field(default_factory=list)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -324,6 +325,8 @@ class Session(Record):
     id: str
     parent_id: str | None = None
     root_id: str
+    spawned_by_request_id: str | None = None
+    depth: int = 0
     branch_from: str | None = None
     branch_event: str | None = None
     name: str
@@ -376,6 +379,7 @@ class Action(Record):
 
 
 class ModelRequest(Record):
+    request_id: str = Field(default_factory=new_id)
     session_id: str
     root_id: str
     parent_id: str | None

@@ -115,11 +115,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth_provider_from_auth_manager(Arc::clone(&manager), &auth),
     );
     let mut recovery = manager.unauthorized_recovery();
+    let mut request_headers = http::HeaderMap::new();
+    if let Some(id) = request["request_id"].as_str() {
+        let value = http::HeaderValue::from_str(id)?;
+        request_headers.insert("x-client-request-id", value.clone());
+        request_headers.insert("idempotency-key", value);
+    }
     let stream = loop {
         match client
             .stream(
                 request["body"].clone(),
-                Default::default(),
+                request_headers.clone(),
                 Compression::None,
                 None,
             )

@@ -100,6 +100,9 @@ class Runtime(MemoryServices):
         self._closing = False
         self._extensions: set[str] = set()
         self._python_parent: dict[str, str] = {}
+        self.store.refinement_guard = self.refinement_boundary
+        self._transitioning = set()
+        self._active_refinements = {}
 
     def load_extensions(self, config):
         for reference in config.extensions:
@@ -187,6 +190,9 @@ class Runtime(MemoryServices):
         role="agent",
         isolate=None,
         provider=None,
+        model=None,
+        thinking=None,
+        adapter=None,
         purpose=None,
         _defer_workspace=False,
     ):
@@ -207,6 +213,11 @@ class Runtime(MemoryServices):
         if depth > root_config.limits.max_depth:
             raise HarnessError("tool", "depth_limit", "Recursive depth limit reached")
         config = self.store.config(parent_id).model_copy(deep=True)
+        # Snapshot active registry capabilities separately from the permission
+        # allowlist; tools loaded later by another session must not leak in.
+        config.active_tool_names = [
+            name for name in self.tools.entries if self.tools.allowed(name, config)
+        ]
         if purpose not in {
             None,
             "research",
@@ -219,7 +230,11 @@ class Runtime(MemoryServices):
             raise ValueError(
                 "Child purpose must be research, review, shared, candidate, test, or performance"
             )
-        if purpose:
+        if purpose in {"candidate", "test", "performance"} and isolate is False:
+            raise ValueError(
+                "Candidate, test, and performance children require isolated workspaces"
+            )
+        if purpose and isolate is None:
             isolate = purpose in {"candidate", "test", "performance"}
         if purpose in {"research", "review"}:
             config.execution.read_only = True
@@ -230,19 +245,53 @@ class Runtime(MemoryServices):
         if purpose in {"candidate", "test", "performance"}:
             config.task.adapter = "coding"
             self.environment.configure(config)
+        if adapter is not None:
+            if (
+                adapter != "coding"
+                and config.task.adapter == "coding"
+                and config.task.verifier == "coding"
+            ):
+                config.task.verifier = "none"
+                config.task.require_verifier = False
+            config.task.adapter = adapter
+            self.environment.configure(config)
+        if purpose in {"research", "review"}:
+            # Investigation retains coding tools but does not launch writable
+            # baseline/test processes or assert that a code patch was completed.
+            config.task.verifier = "none"
+            config.task.require_verifier = False
+            config.task.capture_baseline = False
+            config.task.require_tests = False
+            config.task.require_clean_baseline = False
+            config.task.require_change = False
+        # Snapshot the parent's effective agent route, including a role-based model.
+        effective = route(self.store, parent_id, parent.role).model_copy(deep=True)
         if provider is not None:
-            config.provider = provider
-            config.routing.default = None
+            effective = provider.model_copy(deep=True)
+        if model is not None:
+            choices = {
+                v.name + "/" + v.model: v for v in [config.provider, *config.models.values()]
+            }
+            if model in config.models:
+                effective = config.models[model].model_copy(deep=True)
+            elif model in choices:
+                effective = choices[model].model_copy(deep=True)
+            else:
+                effective.model = model
+        if thinking is not None:
+            effective.parameters["reasoning_effort"] = thinking
+        config.provider = effective
+        config.routing.default = None
+        config.routing.roles.pop(role, None)
+        self.validate_config(config)
         if isolate is None:
-            isolate = config.control_plane == "direct"
-        if not isolate:
-            config.task.adapter = "workspace"
+            isolate = config.control_plane == "direct" and config.task.adapter == "coding"
         if _defer_workspace:
             workspace, checkpoint = parent.workspace.model_copy(deep=True), None
             workspace.metadata["candidate_pending"] = True
         else:
             workspace, checkpoint = self.environment.continuation_workspace(
-                parent, config, child=True
+                parent, config, child=True, isolate=isolate
             )
         focus = self.store.events(parent_id, kind="working_focus", limit=1)
         evidence = self.store.events(parent_id, kind="verifier_result", limit=1)
@@ -266,10 +315,19 @@ class Runtime(MemoryServices):
             workspace,
             config,
             parent_id=parent_id,
+            spawned_by_request_id=self.store.last_request(parent_id, purpose="agent"),
+            depth=depth,
             name=name or f"child-{usage.subagent_count + 1}",
             mode="autonomous" if config.control_plane == "python" else "goal",
         )
+        if not isolate:
+            self.environment.inherit_shared_admission(parent, session)
         self.load_repository_instructions(session.id)
+        self.store.event(
+            session.id,
+            "task_admitted",
+            {"instruction": instruction, "parent_id": parent_id, "depth": depth},
+        )
         self.store.event(
             session.id,
             "child_purpose",
@@ -313,7 +371,17 @@ class Runtime(MemoryServices):
         shared between threads. Cancellation waits for the owned preparation to
         settle, preventing an untracked checkout from appearing after shutdown.
         """
-        if options.get("purpose") not in {"candidate", "test", "performance"}:
+        purpose = options.get("purpose")
+        isolate = options.get("isolate")
+        if isolate is None:
+            parent_config = self.store.config(parent_id)
+            isolate = (
+                purpose in {"candidate", "test", "performance"}
+                if purpose
+                else parent_config.control_plane == "direct"
+                and parent_config.task.adapter == "coding"
+            )
+        if not isolate:
             return self.spawn(parent_id, instruction, **options)
         child = self.spawn(parent_id, instruction, _defer_workspace=True, **options)
         job = asyncio.create_task(
@@ -457,11 +525,33 @@ class Runtime(MemoryServices):
             },
         }
 
-    def message(self, sender_id, recipient_id, body):
+    def message(
+        self, sender_id, recipient_id, body, *, delivery="boundary", causal_request_id=None
+    ):
         if sender_id:
             self.store.ensure_related(sender_id, recipient_id)
         with self.store.transaction():
-            mid = self.store.send(sender_id, recipient_id, body)
+            recipient = self.store.session(recipient_id)
+            if (
+                delivery == "idle"
+                and recipient.wake_at is None
+                and (
+                    recipient.outcome == Outcome.COMPLETED
+                    or not recipient.runnable
+                    and not recipient.pending_turn
+                    and recipient_id not in self.tasks
+                )
+            ):
+                # The requested idle boundary has already been reached. Mark
+                # ready before admission so the first new request sees this input.
+                delivery = "boundary"
+            mid = self.store.send(
+                sender_id,
+                recipient_id,
+                body,
+                delivery=delivery,
+                causal_request_id=causal_request_id,
+            )
             if sender_id is None and body.strip() == "/refine":
                 self.request_refinement(
                     recipient_id,
@@ -512,6 +602,10 @@ class Runtime(MemoryServices):
         except BudgetBusy:
             # Reservations are temporary; normal invocation admission will wait.
             pass
+        self.store.db.execute(
+            "UPDATE messages SET delivery='boundary' WHERE recipient_id=? AND received_at IS NULL AND delivery='idle'",
+            (sid,),
+        )
         self.store.update(sid, outcome=Outcome.ACTIVE, runnable=True, wake_at=None, result=None)
         self.store.db.execute(
             "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
@@ -528,7 +622,7 @@ class Runtime(MemoryServices):
         self._wake.set()
         return True
 
-    def receive(self, sid):
+    def receive(self, sid, *, include_followups=True):
         cap = self.store.config(sid).context.result_chars
 
         def render(message):
@@ -542,7 +636,7 @@ class Runtime(MemoryServices):
                 }
             )
 
-        return self.store.receive(sid, render, limit=20)
+        return self.store.receive(sid, render, limit=20, include_followups=include_followups)
 
     def interact(self, sid, body):
         """Atomic human input + continuation; no client-side input/resume race."""
@@ -770,6 +864,14 @@ class Runtime(MemoryServices):
         if hasattr(self, "background"):
             self.background.recover()
         self.recover_refinement_requests()
+        self.store.db.execute(
+            "UPDATE model_attempts SET status='interrupted',ended_at=? WHERE status='running'",
+            (now(),),
+        )
+        self.store.db.execute(
+            "UPDATE model_requests SET status='interrupted',ended_at=? WHERE status IN ('running','retrying')",
+            (now(),),
+        )
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
         for row in self.store.db.execute("SELECT * FROM reservations").fetchall():
@@ -783,6 +885,22 @@ class Runtime(MemoryServices):
                         estimated_calls=1,
                     ),
                     parent=row["id"],
+                )
+                self.store.db.execute(
+                    "UPDATE model_attempts SET usage=?,failure=? WHERE event_id=?",
+                    (
+                        encode(
+                            Usage(
+                                input_tokens=row["input_tokens"],
+                                output_tokens=row["output_tokens"],
+                                cost=row["cost"],
+                                estimated_calls=1,
+                                model_calls=1,
+                            ).model_dump()
+                        ),
+                        encode({"code": "runtime_restart", "uncertain": True}),
+                        row["id"],
+                    ),
                 )
                 self.store.db.execute("DELETE FROM reservations WHERE id=?", (row["id"],))
                 self.store.event(
@@ -977,8 +1095,8 @@ class Runtime(MemoryServices):
                     await self.auto_refine(sid)
                     return
                 self._check_limits(sid, resource="turns")
-                self.store.apply_refinements(sid)
-                self.receive(sid)
+                self.apply_pending_refinements(sid)
+                self.receive(sid, include_followups=not session.runnable or session.turns == 0)
                 await self._prepare(sid)
                 await self.auto_refine(sid)
                 self._check_limits(sid, resource="turns")
@@ -1072,8 +1190,34 @@ class Runtime(MemoryServices):
             verifier_ok = verification is not None and verification.passed
             if verification_error and config.task.require_verifier:
                 explicit_ok = False
+            delivered = self.receive(
+                sid, include_followups=explicit_ok or verifier_ok or not response.actions
+            )
+            if delivered:
+                if (
+                    (explicit_ok or verifier_ok)
+                    and session.parent_id
+                    and any(m["sender_id"] in {None, session.parent_id} for m in delivered)
+                ):
+                    self.store.event(
+                        sid,
+                        "subagent_continued",
+                        {
+                            "message_id": delivered[0]["id"],
+                            "previous_outcome": "active",
+                            "boundary": "completion",
+                            "kernel_id": session.kernel_id,
+                        },
+                    )
+                explicit_ok = verifier_ok = False
+                self.store.update(sid, runnable=True, wake_at=None)
             if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
                 await self.auto_refine(sid, trigger="completion")
+                late_delivery = self.receive(sid)
+                if late_delivery:
+                    delivered.extend(late_delivery)
+                    explicit_ok = verifier_ok = False
+                    self.store.update(sid, runnable=True, wake_at=None)
             with self.store.transaction():
                 children_active = self._active_descendants(sid)
                 if (
@@ -1097,7 +1241,7 @@ class Runtime(MemoryServices):
                     )
                     self.defer(sid, 0.2)
                 elif explicit_ok or verifier_ok:
-                    self.store.apply_refinements(sid)
+                    self.apply_pending_refinements(sid)
                     if self.store.session(sid).mode == "interactive":
                         self.store.update(sid, result=completion or "Task verifier passed")
                         self.store.event(
@@ -1117,20 +1261,19 @@ class Runtime(MemoryServices):
                         self.message(
                             sid,
                             self.store.session(sid).parent_id,
-                            (
-                                "Child session completed: "
-                                + sid
-                                + ". Results require an explicit message or artifact."
-                                if config.control_plane == "python"
-                                else "Child completed: " + (completion or "Task verifier passed")
-                            ),
+                            "Child completed: "
+                            + sid
+                            + "\n"
+                            + (completion or "Task verifier passed")[:64000],
+                            causal_request_id=self.store.last_request(sid, trajectory=True),
                         )
                 current = self.store.session(sid)
                 self.store.update(sid, pending_turn=None, turns=current.turns + 1)
+                self.apply_pending_refinements(sid)
                 self._continue_completed_child(sid)
                 self.store.event(sid, "turn_completed", {"turn": current.turns})
                 if current.mode == "interactive":
-                    if not response.actions:
+                    if not response.actions and not delivered:
                         self.store.update(sid, runnable=False, wake_at=None)
                         self.store.event(sid, "conversation_reply", {"verified": False})
                     # Interventions arriving during a response or verifier must not
@@ -1138,7 +1281,9 @@ class Runtime(MemoryServices):
                     if self.store.messages(sid, pending=True, limit=1) and not current.paused:
                         self.store.update(sid, runnable=True, wake_at=None)
                 if current.mode == "heartbeat" and current.outcome == Outcome.ACTIVE:
-                    pending_input = bool(self.store.messages(sid, pending=True, limit=1))
+                    pending_input = bool(
+                        delivered or self.store.messages(sid, pending=True, limit=1)
+                    )
                     self.store.update(sid, runnable=pending_input and not current.paused)
         except TurnAdmissionLimit as exc:
             root_id = self.store.session(sid).root_id
@@ -1181,7 +1326,10 @@ class Runtime(MemoryServices):
             parent = self.store.session(sid).parent_id
             if parent:
                 self.message(
-                    sid, parent, f"Child {sid} failed ({failure.category}): {failure.message}"
+                    sid,
+                    parent,
+                    f"Child {sid} failed ({failure.category}): {failure.message}",
+                    causal_request_id=self.store.last_request(sid, trajectory=True),
                 )
         finally:
             self._admitted_turns.discard(sid)
@@ -1322,6 +1470,19 @@ class Runtime(MemoryServices):
         raise AssertionError("Unreachable context recovery loop")
 
     async def _model_call(self, sid, request, *, persist_turn=True):
+        request = request.model_copy(deep=True, update={"request_id": new_id()})
+        try:
+            return await self._model_call_with_retries(sid, request, persist_turn=persist_turn)
+        except BaseException:
+            # Admission failure or cancellation during retry backoff also closes
+            # the logical request, even though no new transport attempt started.
+            self.store.db.execute(
+                "UPDATE model_requests SET status='failed',ended_at=? WHERE id=? AND status IN ('running','retrying')",
+                (now(), request.request_id),
+            )
+            raise
+
+    async def _model_call_with_retries(self, sid, request, *, persist_turn=True):
         config = self.store.config(sid)
         session = self.store.session(sid)
         size, provider = request.input_token_bound, request.config
@@ -1340,6 +1501,9 @@ class Runtime(MemoryServices):
                     "output_limit_enforcement": "provider model token limit; cumulative runtime token budget",
                 },
             )
+        # One logical identity per body; transport retries below reuse it.
+        request_artifact = self.artifacts.put(sid, request.public_dump())
+        registered = False
         for attempt in range(config.retry.attempts):
             while True:
                 try:
@@ -1347,11 +1511,14 @@ class Runtime(MemoryServices):
                         self._check_limits(
                             sid, resource="model_calls", input_bound=size, provider=provider
                         )
-                        request_artifact = self.artifacts.put(sid, request.public_dump())
+                        if not registered:
+                            self.store.begin_request(request, request_artifact)
+                            registered = True
                         eid = self.store.event(
                             sid,
                             "model_invocation_started",
                             {
+                                "request_id": request.request_id,
                                 "attempt": attempt + 1,
                                 "request_artifact": request_artifact,
                                 "turn": session.turns,
@@ -1359,6 +1526,22 @@ class Runtime(MemoryServices):
                                 "model": provider.model,
                                 "purpose": request.metadata.get("purpose", "agent"),
                             },
+                        )
+                        self.store.db.execute(
+                            "INSERT INTO model_attempts VALUES(?,?,?,?,?,?,?)",
+                            (
+                                eid,
+                                request.request_id,
+                                attempt + 1,
+                                "running",
+                                encode(Usage(model_calls=1).model_dump()),
+                                None,
+                                None,
+                            ),
+                        )
+                        self.store.db.execute(
+                            "UPDATE model_requests SET status='running' WHERE id=?",
+                            (request.request_id,),
                         )
                         cost = (
                             size * (provider.input_cost_per_million or 0)
@@ -1402,7 +1585,9 @@ class Runtime(MemoryServices):
                         ),
                     )
                 ):
-                    response = await self.providers[provider.name].invoke(request, emit)
+                    response = await self.providers[provider.name].invoke(
+                        request.model_copy(deep=True), emit
+                    )
                 if buffer:
                     self.store.event(
                         sid,
@@ -1422,6 +1607,12 @@ class Runtime(MemoryServices):
                     self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
                     response_event = self.store.event(
                         sid, "model_response", response.model_dump(mode="json"), parent=eid
+                    )
+                    measured = response.usage.model_copy(
+                        update={"model_calls": 1, "retries": int(attempt > 0)}
+                    )
+                    self.store.finish_request_attempt(
+                        request.request_id, eid, measured, response_event=response_event
                     )
                     if response.provider_items:
                         self.store.db.execute(
@@ -1463,6 +1654,19 @@ class Runtime(MemoryServices):
                         parent=eid,
                     )
                     self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
+                    self.store.finish_request_attempt(
+                        request.request_id,
+                        eid,
+                        Usage(
+                            input_tokens=size,
+                            output_tokens=provider.max_output_tokens,
+                            cost=cost,
+                            estimated_calls=1,
+                            model_calls=1,
+                            retries=int(attempt > 0),
+                        ),
+                        failure={"code": "cancelled", "uncertain": True},
+                    )
                 raise
             except Exception as exc:
                 failure = (
@@ -1490,6 +1694,21 @@ class Runtime(MemoryServices):
                     )
                     self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
                     self.store.event(sid, "failure", failure.model_dump(), parent=eid)
+                    self.store.finish_request_attempt(
+                        request.request_id,
+                        eid,
+                        Usage(
+                            input_tokens=size,
+                            output_tokens=provider.max_output_tokens,
+                            cost=cost,
+                            estimated_calls=1,
+                            model_calls=1,
+                            retries=int(attempt > 0),
+                        ),
+                        failure=failure.model_dump(),
+                        retry=failure.retryable and attempt + 1 < config.retry.attempts,
+                    )
+
                 if (
                     failure.code
                     in {"context_overflow", "context_length_exceeded", "context_capacity"}
@@ -1858,6 +2077,10 @@ class Runtime(MemoryServices):
         ids = [sid, *self._active_descendants(sid)] if tree else [sid]
         for target in ids:
             self.store.finish(target, Outcome.CANCELLED, "Stopped by user")
+            self.cancel_refinements(target, "Session stopped")
+            for refinement_task, refinement_sid in list(self._active_refinements.items()):
+                if refinement_sid == target and refinement_task is not asyncio.current_task():
+                    refinement_task.cancel()
             if task := self.tasks.get(target):
                 task.cancel()
         await asyncio.gather(
@@ -2003,7 +2226,7 @@ class Runtime(MemoryServices):
         if self._scheduler_task:
             await self._scheduler_task
             self._scheduler_task = None
-        tasks = list(self.tasks.values())
+        tasks = list(set(self.tasks.values()) | set(self._active_refinements))
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

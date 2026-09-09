@@ -100,6 +100,11 @@ class ToolRegistry:
         name = tool.name
         return (
             tool
+            and (
+                config.active_tool_names is None
+                or name not in self.entries  # Host RPCs inherit the admitted envelope's scope.
+                or name in config.active_tool_names
+            )
             and set(tool.permissions) <= set(config.permissions)
             and (not config.execution.read_only or "workspace.write" not in tool.permissions)
             and (
@@ -223,11 +228,16 @@ class SpawnArgs(Record):
     spec_id: str | None = None
     role: str = Field(default="agent", max_length=100)
     isolate: bool | None = None
+    model: str | None = None
+    thinking: str | None = None
+    adapter: str | None = None
+    purpose: str | None = None
 
 
 class MessageArgs(Record):
     recipient_id: str
     body: str = Field(max_length=256000)
+    delivery: str = "boundary"
 
 
 class InspectArgs(Record):
@@ -344,18 +354,30 @@ def builtins() -> ToolRegistry:
         if not instruction.strip():
             raise ValueError("An instruction or subagent specification is required")
         session = c.runtime.spawn(
-            c.session_id, instruction, name=a.name, role=a.role, isolate=a.isolate
+            c.session_id,
+            instruction,
+            name=a.name,
+            role=a.role,
+            isolate=a.isolate,
+            model=a.model,
+            thinking=a.thinking,
+            adapter=a.adapter,
+            purpose=a.purpose,
         )
         return {"session_id": session.id, "name": session.name, "parent_id": session.parent_id}
 
     async def message(c, a):
-        return {"message_id": c.runtime.message(c.session_id, a.recipient_id, a.body)}
+        return {
+            "message_id": c.runtime.message(
+                c.session_id, a.recipient_id, a.body, delivery=a.delivery
+            )
+        }
 
     async def related(c, a):
         return c.runtime.related(c.session_id)
 
     async def receive(c, a):
-        return c.runtime.receive(c.session_id)
+        return c.runtime.receive(c.session_id, include_followups=False)
 
     async def inspect_session(c, a):
         sid = a.session_id or c.session_id

@@ -24,6 +24,14 @@ async def test_automatic_refinement_uses_evidence_routing_and_versioned_validati
 
     class Refiner:
         async def invoke(self, request, emit):
+            if request.metadata["purpose"] == "refinement_review":
+                assert request.config.model == "fast-test"
+                return ModelResponse(
+                    text=json.dumps(
+                        {"shouldRefine": True, "rationale": "Observed operator failure"}
+                    ),
+                    usage=Usage(input_tokens=50, output_tokens=40),
+                )
             assert request.metadata["purpose"] == "refinement"
             assert request.config.model == "fast-test"
             evidence = json.loads(request.messages[-1]["content"])["evidence"]
@@ -47,13 +55,13 @@ async def test_automatic_refinement_uses_evidence_routing_and_versioned_validati
         assert len(states) == 1 and states[0]["version"] == 1
         assert states[0]["provenance"]["source_events"]
         assert runtime.store.events(session.id, kind="refinement_rejected")
-        assert runtime.store.usage(session.id).model_calls == 1
-        assert runtime.store.usage(session.id).input_tokens == 50
+        assert runtime.store.usage(session.id).model_calls == 2
+        assert runtime.store.usage(session.id).input_tokens == 100
         assert not runtime.store.session(session.id).pending_turn
         decision = runtime.store.events(session.id, kind="model_routing")[-1]["payload"]
         assert decision["role"] == "refinement" and decision["alias"] == "fast"
         await runtime.auto_refine(session.id, trigger="completion")
-        assert runtime.store.usage(session.id).model_calls == 1
+        assert runtime.store.usage(session.id).model_calls == 2
     finally:
         await runtime.shutdown()
 
@@ -215,7 +223,7 @@ async def test_explicit_refinement_request_runs_at_boundary_without_periodic_pol
 ):
     runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
     runtime.providers["test"] = ScriptedProvider(
-        {"root": [ModelResponse(text='{"proposals": []}')]}
+        {"root": [ModelResponse(text='{"shouldRefine": false, "rationale": "No reusable lesson"}')]}
     )
     try:
         runtime.message(None, session.id, "/refine")

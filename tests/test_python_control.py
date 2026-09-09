@@ -94,7 +94,8 @@ async def test_python_children_share_workspace_unless_isolation_explicit(
         isolated = runtime.spawn(root.id, "isolated", isolate=True)
         assert shared.workspace.path == root.workspace.path
         assert isolated.workspace.path != root.workspace.path
-        assert runtime.store.config(shared.id).task.verifier == "none"
+        assert runtime.store.config(shared.id).task.adapter == "coding"
+        assert runtime.store.config(shared.id).task.verifier == "coding"
         assert runtime.store.config(isolated.id).task.verifier == "coding"
         assert await asyncio.to_thread(Path(isolated.workspace.path, "mathops.py").is_file)
     finally:

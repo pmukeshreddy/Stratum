@@ -109,9 +109,14 @@ class EvidenceReducer:
 
     async def invoke(self, request, emit):
         self.requests.append(request)
-        if self.interrupt and len(self.requests) == 2:
+        if self.interrupt and len(self.requests) == 3:
             raise asyncio.CancelledError()
         evidence = request.messages[-1]["content"]
+        if request.metadata.get("purpose") == "refinement_review":
+            return ModelResponse(
+                text=encode({"shouldRefine": True, "rationale": "Evidence has reusable lessons"}),
+                usage=Usage(input_tokens=30, output_tokens=10),
+            )
         if '"proposals"' in request.messages[0]["content"]:
             records = json.loads(evidence)["evidence"]
             text = {
@@ -199,8 +204,8 @@ async def test_interrupted_refinement_chunks_keep_provenance_and_usage(tmp_path,
         runtime.store.event(root.id, "python_result", {"stdout": "evidence " * 40000})
         with pytest.raises(asyncio.CancelledError):
             await runtime._refinement_pass(root.id, "completion")
-        assert len(provider.requests) == 2
-        assert runtime.store.usage(root.id, tree=True).model_calls == 2
+        assert len(provider.requests) == 3
+        assert runtime.store.usage(root.id, tree=True).model_calls == 3
         assert runtime.store.events(root.id, kind="refinement_evidence_chunk")
         assert runtime.store.events(root.id, kind="refinement_status")[-1]["payload"]["uncertain"]
         assert runtime.store.states(root.id) == []

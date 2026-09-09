@@ -142,10 +142,18 @@ def test_compaction_reference_cannot_embed_retained_conversation(tmp_path, confi
         assert "artifacts.load" in summary
 
 
-async def test_automatic_refinement_needs_learning_signal_not_just_turn_count(tmp_path, config):
+async def test_periodic_checkpoint_reviews_routine_work_before_deciding_to_refine(tmp_path, config):
     config.refinement.automatic = True
     config.refinement.every_turns = 20
-    provider = ScriptedProvider({"root": [ModelResponse(text='{"proposals":[]}')]})
+    provider = ScriptedProvider(
+        {
+            "root": [
+                ModelResponse(
+                    text='{"shouldRefine": false, "rationale": "Routine work has no reusable lesson"}'
+                )
+            ]
+        }
+    )
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     root = runtime.create("Inspect evidence", tmp_path, config=config)
     try:
@@ -154,7 +162,9 @@ async def test_automatic_refinement_needs_learning_signal_not_just_turn_count(tm
             root.id, "python_result", {"stdout": "Routine observation: 12", "error": None}
         )
         await runtime.auto_refine(root.id)
-        assert provider.requests == []
+        assert len(provider.requests) == 1
+        assert provider.requests[0].metadata["purpose"] == "refinement_review"
+        assert runtime.store.states(root.id) == []
     finally:
         await runtime.shutdown()
 

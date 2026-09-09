@@ -1,6 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 10
+VERSION = 11
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -115,4 +115,30 @@ def migrate(db, previous, timestamp):
             "CREATE INDEX semantic_root ON semantic_evidence(model,root_id,seq);"
             "CREATE TABLE semantic_cursors(root_id TEXT,model TEXT,seq INTEGER,PRIMARY KEY(root_id,model));"
             f"INSERT INTO schema_migrations VALUES(10,{timestamp}); PRAGMA user_version=10; COMMIT;"
+        )
+
+    if previous < 11:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "CREATE TABLE model_requests(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
+            "purpose TEXT NOT NULL, body_hash TEXT NOT NULL, body_artifact TEXT NOT NULL, provider TEXT NOT NULL, "
+            "model TEXT NOT NULL, status TEXT NOT NULL, started_at REAL NOT NULL, ended_at REAL, response_event TEXT, inbound TEXT NOT NULL);"
+            "CREATE INDEX model_request_session ON model_requests(session_id,started_at);"
+            "CREATE TABLE model_attempts(event_id TEXT PRIMARY KEY REFERENCES events(id), request_id TEXT NOT NULL REFERENCES model_requests(id), "
+            "attempt INTEGER NOT NULL, status TEXT NOT NULL, usage TEXT NOT NULL, failure TEXT, ended_at REAL);"
+            "CREATE TABLE request_edges(source TEXT NOT NULL REFERENCES model_requests(id), target TEXT NOT NULL REFERENCES model_requests(id), "
+            "kind TEXT NOT NULL, PRIMARY KEY(source,target,kind));"
+            "CREATE TABLE pending_request_edges(session_id TEXT NOT NULL REFERENCES sessions(id), source TEXT NOT NULL REFERENCES model_requests(id), "
+            "kind TEXT NOT NULL, PRIMARY KEY(session_id,source,kind));"
+            "CREATE TABLE conversation_blocks(session_id TEXT NOT NULL REFERENCES sessions(id), event_id TEXT NOT NULL REFERENCES events(id), "
+            "messages TEXT NOT NULL, PRIMARY KEY(session_id,event_id));"
+            "INSERT OR IGNORE INTO conversation_blocks SELECT s.id,json_extract(b.value,'$.event_id'),json_extract(b.value,'$.messages') "
+            "FROM sessions s,json_each(s.body,'$.context') b JOIN events e ON e.id=json_extract(b.value,'$.event_id');"
+            "ALTER TABLE messages ADD COLUMN delivery TEXT NOT NULL DEFAULT 'boundary';"
+            "ALTER TABLE messages ADD COLUMN causal_request_id TEXT;"
+            "ALTER TABLE refinements ADD COLUMN baseline TEXT;"
+            "CREATE TABLE refinement_runs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
+            "status TEXT NOT NULL, body TEXT NOT NULL);"
+            "CREATE INDEX refinement_run_session ON refinement_runs(session_id,status);"
+            f"INSERT INTO schema_migrations VALUES(11,{timestamp}); PRAGMA user_version=11; COMMIT;"
         )

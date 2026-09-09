@@ -204,6 +204,10 @@ async def test_refiner_knows_existing_memory_and_later_task_retrieves_it(tmp_pat
             async def invoke(self, request, emit):
                 evidence = json.loads(request.messages[-1]["content"])
                 assert entry in encode(evidence["existing_state"])
+                if request.metadata["purpose"] == "refinement_review":
+                    return ModelResponse(
+                        text=encode({"shouldRefine": True, "rationale": "Checksum lesson changed"})
+                    )
                 return ModelResponse(
                     text=json.dumps(
                         {

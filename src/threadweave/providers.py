@@ -51,6 +51,9 @@ class ChatProvider:
                 f"Set {config.api_key_env} in the daemon environment",
             )
         headers = {"Authorization": f"Bearer {key}"} if key else {}
+        headers.update(
+            {"X-Client-Request-Id": request.request_id, "Idempotency-Key": request.request_id}
+        )
         params = dict(config.parameters)
         # These fields are owned by the harness, including the reserved token maximum.
         for reserved in (

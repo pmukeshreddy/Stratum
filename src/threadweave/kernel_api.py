@@ -112,11 +112,27 @@ class Recursive:
         self.host, self.harness = host, Harness(host)
 
     async def __call__(
-        self, prompt=None, *args, name=None, model=None, thinking=None, purpose="shared"
+        self,
+        prompt=None,
+        *args,
+        name=None,
+        model=None,
+        thinking=None,
+        purpose="shared",
+        isolate=None,
+        adapter=None,
     ):
         if not isinstance(prompt, str) or not prompt.strip() or args:
             raise ValueError(self.help())
-        return await self.run(prompt, name=name, model=model, thinking=thinking, purpose=purpose)
+        return await self.run(
+            prompt,
+            name=name,
+            model=model,
+            thinking=thinking,
+            purpose=purpose,
+            isolate=isolate,
+            adapter=adapter,
+        )
 
     def help(self):
         return 'await rlm("Trace cause", name="review", purpose="research"|"candidate"|"shared") returns a HANDLE, not an answer.\nawait agents.wait(seconds=30) defers your next model turn until a message or timeout; do not spend model turns polling.\nawait agent_message.send("findings", receiver_role="parent"); await agent_message.receive().\nawait agent_observe.get(handle.session_id); await agents.candidate(handle, accept=False) inspects, accept=True applies.'
@@ -124,9 +140,26 @@ class Recursive:
     def __repr__(self):
         return self.help()
 
-    async def run(self, prompt, *, name=None, model=None, thinking=None, purpose="shared"):
+    async def run(
+        self,
+        prompt,
+        *,
+        name=None,
+        model=None,
+        thinking=None,
+        purpose="shared",
+        isolate=None,
+        adapter=None,
+    ):
         result = await self.host.acall(
-            "rlm.run", prompt=prompt, name=name, model=model, thinking=thinking, purpose=purpose
+            "rlm.run",
+            prompt=prompt,
+            name=name,
+            model=model,
+            thinking=thinking,
+            purpose=purpose,
+            isolate=isolate,
+            adapter=adapter,
         )
         return AgentHandle(**result)
 
@@ -224,6 +257,12 @@ class Observation:
 
     def help(self):
         return "await agent_observe.get(session_id); await agent_observe.list_agents(); await agent_observe.recent_messages(session_id, limit=8)"
+
+    async def requests(self, target):
+        return await self.host.acall("agent_observe.requests", target=target)
+
+    async def recent(self, target, limit=8, max_chars=800):
+        return await self.recent_messages(target, limit=limit, max_chars=max_chars)
 
     async def recent_messages(self, target, limit=8, max_chars=800):
         return await self.host.acall(

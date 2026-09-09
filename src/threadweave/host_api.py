@@ -226,7 +226,9 @@ async def dispatch(context, request):
                 s["name"] == name and s["parent_id"] == sid for s in runtime.related(sid)
             ):
                 raise ValueError("Child name already exists")
-            provider = config.provider.model_copy(deep=True)
+            from .routing import route
+
+            provider = route(store, sid, session.role).model_copy(deep=True)
             if p.get("model"):
                 selected = p["model"]
                 choices = {
@@ -251,15 +253,16 @@ async def dispatch(context, request):
                 sid,
                 p["prompt"],
                 name=name,
-                isolate=False,
-                provider=provider,
+                isolate=p.get("isolate"),
+                provider=provider if p.get("model") or p.get("thinking") else None,
+                adapter=p.get("adapter"),
                 purpose=p.get("purpose", "shared"),
             )
             return {
                 "session_id": child.id,
                 "name": child.name,
                 "session_dir": str(store.directory / "kernels" / child.kernel_id),
-                "model": provider.model,
+                "model": store.config(child.id).provider.model,
             }
     if op.startswith("agent_message."):
         permission(context, "agents")
@@ -337,6 +340,15 @@ async def dispatch(context, request):
         if len(matches) != 1:
             raise ValueError("Session is not visible or target is ambiguous")
         observed = matches[0]["id"]
+        if op == "agent_observe.requests":
+            graph = store.request_graph(observed)
+            permitted = {s["id"] for s in visible}
+            graph["requests"] = [r for r in graph["requests"] if r["session_id"] in permitted]
+            ids = {r["id"] for r in graph["requests"]}
+            graph["edges"] = [
+                e for e in graph["edges"] if e["source"] in ids and e["target"] in ids
+            ]
+            return graph
         if op == "agent_observe.get":
             return runtime.inspect(observed)
         if op == "agent_observe.recent":
@@ -350,9 +362,7 @@ async def dispatch(context, request):
                 raise ValueError("limit must be 1..50 and max_chars 80..2000")
             return {
                 "session_id": observed,
-                "messages": [
-                    {**m, "body": m["body"][:chars]} for m in store.messages(observed, limit=limit)
-                ],
+                "messages": store.trajectory(observed, limit=limit, max_chars=chars),
             }
     if op == "edit":
         permission(context, "workspace.write")

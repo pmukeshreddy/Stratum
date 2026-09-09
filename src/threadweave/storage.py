@@ -23,6 +23,8 @@ from .models import (
     new_id,
     now,
 )
+from .provenance import RequestHistory
+from .trajectory import TrajectoryHistory
 
 log = logging.getLogger("threadweave.events")
 
@@ -109,7 +111,13 @@ CREATE TABLE IF NOT EXISTS schedules(
 """
 
 
-class Store:
+class StateConflict(ValueError):
+    def __init__(self, entry_id, baseline, current):
+        super().__init__(f"State entry changed during refinement planning: {entry_id}")
+        self.details = {"entry_id": entry_id, "baseline": baseline, "current": current}
+
+
+class Store(RequestHistory, TrajectoryHistory):
     def __init__(self, directory: str | Path):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -216,6 +224,8 @@ class Store:
         *,
         name="root",
         parent_id=None,
+        spawned_by_request_id=None,
+        depth=0,
         mode="autonomous",
         branch_from=None,
         branch_event=None,
@@ -228,6 +238,8 @@ class Store:
         session = Session(
             id=sid,
             parent_id=parent_id,
+            spawned_by_request_id=spawned_by_request_id,
+            depth=depth,
             root_id=root_id,
             name=name,
             role=role,
@@ -376,9 +388,14 @@ class Store:
         return self._event_row(row)
 
     def add_context(self, sid: str, event_id: str, messages: list[dict]):
-        session = self.session(sid)
-        session.context.append({"event_id": event_id, "messages": messages})
-        self.update(sid, context=session.context)
+        with self.transaction():
+            session = self.session(sid)
+            session.context.append({"event_id": event_id, "messages": messages})
+            self.db.execute(
+                "INSERT OR IGNORE INTO conversation_blocks VALUES(?,?,?)",
+                (sid, event_id, encode(messages)),
+            )
+            self.update(sid, context=session.context)
 
     def charge(self, sid: str, usage: Usage, *, parent=None):
         with self.transaction():
@@ -444,7 +461,17 @@ class Store:
         ).fetchone()
         return row[0], row[1]
 
-    def send(self, sender_id: str | None, recipient_id: str, body: str) -> str:
+    def send(
+        self,
+        sender_id: str | None,
+        recipient_id: str,
+        body: str,
+        *,
+        delivery="boundary",
+        causal_request_id=None,
+    ) -> str:
+        if delivery not in {"boundary", "idle"}:
+            raise ValueError("delivery must be boundary or idle")
         if len(body.encode()) > 256000:
             raise ValueError("Messages are limited to 256 KB; use artifacts for larger values")
         self.session(recipient_id)
@@ -458,20 +485,24 @@ class Store:
                     "message_id": mid,
                     "sender_id": sender_id,
                     "recipient_id": recipient_id,
+                    "delivery": delivery,
+                    "causal_request_id": causal_request_id,
                     "body": body,
                 },
             )
             self.db.execute(
-                "INSERT INTO messages VALUES(?,?,?,?,?,?,?)",
-                (mid, sender_id, recipient_id, body, now(), None, eid),
+                "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)",
+                (mid, sender_id, recipient_id, body, now(), None, eid, delivery, causal_request_id),
             )
         return mid
 
-    def messages(self, sid: str, *, pending=False, limit=30) -> list[dict]:
+    def messages(self, sid: str, *, pending=False, limit=30, include_followups=True) -> list[dict]:
         self.session(sid)
         if type(limit) is not int or limit < 1:
             raise ValueError("Message limit must be a positive integer; at most 100 are returned")
         condition = " AND received_at IS NULL" if pending else ""
+        if not include_followups:
+            condition += " AND delivery='boundary'"
         order = "ASC" if pending else "DESC"
         rows = self.db.execute(
             f"SELECT * FROM messages WHERE recipient_id=?{condition} "
@@ -480,15 +511,19 @@ class Store:
         )
         return [dict(r) for r in rows]
 
-    def receive(self, sid: str, render, *, limit=30) -> list[dict]:
+    def receive(self, sid: str, render, *, limit=30, include_followups=True) -> list[dict]:
         with self.transaction():
-            messages = self.messages(sid, pending=True, limit=limit)
+            messages = self.messages(
+                sid, pending=True, limit=limit, include_followups=include_followups
+            )
             for message in messages:
                 message["received_at"] = now()
                 eid = self.event(
                     sid, "agent_message_received", message, parent=message["source_event"]
                 )
                 self.add_context(sid, eid, [{"role": "user", "content": render(message)}])
+                if message.get("causal_request_id"):
+                    self.queue_request_edge(sid, message["causal_request_id"], "subagent_return")
                 self.db.execute(
                     "UPDATE messages SET received_at=? WHERE id=?",
                     (message["received_at"], message["id"]),
@@ -514,7 +549,7 @@ class Store:
         ).fetchall()
         return [self.state(sid, r[0]) for r in rows]
 
-    def queue_refinement(self, sid: str, edit: StateEdit) -> str:
+    def queue_refinement(self, sid: str, edit: StateEdit, *, baseline=None) -> str:
         config = self.config(sid)
         if not config.refinement.enabled:
             raise PermissionError("Refinement is disabled")
@@ -539,8 +574,17 @@ class Store:
                 parent=edit.source_events[-1],
             )
             self.db.execute(
-                "INSERT INTO refinements VALUES(?,?,?,?,?,NULL)",
+                "INSERT INTO refinements(id,session_id,edit,status,source_event,error) VALUES(?,?,?,?,?,NULL)",
                 (rid, sid, edit.model_dump_json(), "pending", eid),
+            )
+            snapshot = (
+                baseline
+                if baseline is not None
+                else {e["id"]: e for e in self.states(sid, include_deleted=True)}
+            )
+            self.db.execute(
+                "UPDATE refinements SET baseline=? WHERE id=?",
+                (encode(snapshot.get(edit.entry_id)), rid),
             )
         return rid
 
@@ -550,34 +594,54 @@ class Store:
         ).fetchall()
         if request_ids is not None:
             rows = [r for r in rows if r["id"] in request_ids]
+        if not rows or (hasattr(self, "refinement_guard") and not self.refinement_guard(sid)):
+            return []
         applied = []
-        for row in rows:
-            try:
-                with self.transaction():
+        try:
+            with self.transaction():
+                # Obtain SQLite's writer lock BEFORE checking any baseline. Other
+                # connections cannot change state between comparison and commit.
+                self.db.execute("UPDATE refinements SET status=status WHERE id=?", (rows[0]["id"],))
+                for row in rows:
                     edit = StateEdit.model_validate_json(row["edit"])
-                    entry_id = self._apply_edit(sid, edit, row["source_event"])
+                    if edit.entry_id:
+                        current = self.state(sid, edit.entry_id)
+                        baseline = json.loads(row["baseline"]) if row["baseline"] else None
+                        if baseline is None or current != baseline:
+                            raise StateConflict(edit.entry_id, baseline, current)
+                for row in rows:
+                    edit = StateEdit.model_validate_json(row["edit"])
+                    applied.append(self._apply_edit(sid, edit, row["source_event"]))
                     self.db.execute(
                         "UPDATE refinements SET status='applied' WHERE id=?", (row["id"],)
                     )
-                    applied.append(entry_id)
-            except (ValueError, KeyError, PermissionError) as exc:
-                self.db.execute(
-                    "UPDATE refinements SET status='rejected',error=? WHERE id=?",
-                    (str(exc), row["id"]),
-                )
-                self.event(
-                    sid,
-                    "refinement_rejected",
-                    {"id": row["id"], "error": str(exc)},
-                    parent=row["source_event"],
-                )
+        except (ValueError, KeyError, PermissionError) as exc:
+            applied = []
+            with self.transaction():
+                for row in rows:
+                    self.db.execute(
+                        "UPDATE refinements SET status=?,error=? WHERE id=?",
+                        (
+                            "conflicted" if isinstance(exc, StateConflict) else "rejected",
+                            str(exc),
+                            row["id"],
+                        ),
+                    )
+                    self.event(
+                        sid,
+                        "refinement_conflict"
+                        if isinstance(exc, StateConflict)
+                        else "refinement_rejected",
+                        {"id": row["id"], "error": str(exc), **getattr(exc, "details", {})},
+                        parent=row["source_event"],
+                    )
         return applied
 
     def pending_refinement_requests(self, sid):
         return [
             dict(row)
             for row in self.db.execute(
-                "SELECT * FROM refinement_requests WHERE session_id=? AND status='pending' ORDER BY rowid",
+                "SELECT * FROM refinement_requests WHERE session_id=? AND status IN ('pending','waiting_to_apply') ORDER BY rowid",
                 (sid,),
             )
         ]

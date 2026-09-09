@@ -12,6 +12,7 @@ from threadweave.repository import RepositoryIndex
 from threadweave.snapshots import SnapshotBlobs
 from threadweave.storage import Store
 
+from .conftest import eventually
 from .test_kernel import bridge
 
 
@@ -21,9 +22,15 @@ async def test_targeted_interrupt_preserves_live_identity_and_receipt(tmp_path, 
     try:
         await kernel.execute(new_id(), "values = [123]", 5)
         pid, execution = kernel.process.pid, new_id()
-        job = asyncio.create_task(kernel.execute(execution, "values.append(456)\n" + wait, 30))
-        while not (tmp_path / "kernel" / f"{execution}.stdout").exists():  # noqa: ASYNC110
-            await asyncio.sleep(0.01)
+        job = asyncio.create_task(
+            kernel.execute(
+                execution,
+                "values.append(456)\nprint('MUTATION_COMMITTED', flush=True)\n" + wait,
+                30,
+            )
+        )
+        stdout = tmp_path / "kernel" / f"{execution}.stdout"
+        await eventually(lambda: stdout.exists() and "MUTATION_COMMITTED" in stdout.read_text())
         assert await kernel.interrupt(execution)
         assert (await job)["error"]
         assert kernel.process.pid == pid

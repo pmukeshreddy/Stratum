@@ -283,13 +283,18 @@ class EvidenceProvider:
         self.requests, self.invalid, self.gate = [], invalid, gate
 
     async def invoke(self, request, emit):
-        assert request.metadata["purpose"] == "refinement"
+        assert request.metadata["purpose"] in {"refinement", "refinement_review"}
         self.requests.append(request)
         if self.gate:
             self.gate[0].set()
             await self.gate[1].wait()
         if self.invalid:
             return ModelResponse(text="not json")
+        if request.metadata["purpose"] == "refinement_review":
+            return ModelResponse(
+                text=json.dumps({"shouldRefine": True, "rationale": "Observed computation"}),
+                usage=Usage(input_tokens=40, output_tokens=20),
+            )
         evidence = json.loads(request.messages[-1]["content"])["evidence"]
         return ModelResponse(
             text=json.dumps(
@@ -349,7 +354,7 @@ async def test_idle_chat_refine_applies_once_and_recovers_versioned_state(tmp_pa
         await runtime.start()
         result = await settled_request(runtime, sid, rid)
         assert result["status"] == "applied" and result["applied_count"] == 1
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 2
         assert runtime.store.session(sid).turns == 0
         assert not runtime.store.events(sid, kind="environment_prepared")
         entry = runtime.store.state(sid, result["entry_ids"][0])
@@ -370,7 +375,7 @@ async def test_idle_chat_refine_applies_once_and_recovers_versioned_state(tmp_pa
         )
         rid2 = runtime.request_refinement(sid, source="human")["request_id"]
         assert (await settled_request(runtime, sid, rid2))["status"] == "skipped"
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 2
     finally:
         await runtime.shutdown()
         daemon.lock.close()
@@ -414,7 +419,7 @@ async def test_refine_during_model_turn_waits_for_boundary(tmp_path, python_conf
 
     class Provider:
         async def invoke(self, request, emit):
-            if request.metadata.get("purpose") == "refinement":
+            if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
                 assert release.is_set()
                 return await refiner.invoke(request, emit)
             entered.set()
@@ -445,7 +450,7 @@ async def test_python_refine_paused_request_survives_restart(tmp_path, python_co
 
     class ResumableProvider:
         async def invoke(self, request, emit):
-            if request.metadata.get("purpose") == "refinement":
+            if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
                 return await provider.invoke(request, emit)
             return ModelResponse(text="Resumed")
 
@@ -466,7 +471,7 @@ async def test_python_refine_paused_request_survives_restart(tmp_path, python_co
         assert runtime.store.refinement_request(root.id, rid)["status"] == "requested"
         runtime.resume(root.id)
         assert (await settled_request(runtime, root.id, rid))["status"] == "applied"
-        assert len(provider.requests) == 1
+        assert len(provider.requests) == 2
     finally:
         await runtime.shutdown()
 
@@ -586,7 +591,7 @@ async def test_new_refinement_request_during_pass_is_not_lost(tmp_path, python_c
         release.set()
         assert (await settled_request(runtime, root.id, rid1))["status"] == "applied"
         assert (await settled_request(runtime, root.id, rid2))["status"] == "applied"
-        assert len(provider.requests) == 2
+        assert len(provider.requests) == 4
         assert len(runtime.store.states(root.id)) == 2
     finally:
         release.set()

@@ -403,6 +403,12 @@ class Context:
                 ),
             )
             self.store.update(sid, context=session.context[count:], summary=summary)
+            if provenance:
+                request = self.store.db.execute(
+                    "SELECT id FROM model_requests WHERE response_event=?", (provenance,)
+                ).fetchone()
+                if request:
+                    self.store.commit_compaction(sid, request[0])
             return eid
 
     def assemble(self, sid: str, tools: list[dict], *, input_budget=None) -> tuple[list[dict], int]:

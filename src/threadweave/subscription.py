@@ -163,6 +163,7 @@ class SubscriptionProvider:
             "auth_settings": settings,
             "refresh_lock": str(executable.parent / "refresh.lock"),
             "body": body,
+            "request_id": request.request_id,
         }
         try:
             async with asyncio.timeout(config.timeout_seconds):
