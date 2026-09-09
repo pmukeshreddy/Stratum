@@ -177,7 +177,7 @@ async def test_buffalo_continuation_retains_live_python_and_session(
 ):
     import threadweave.evals.harness as harness
 
-    python_config.refinement.automatic = False
+    python_config.refinement.enabled = False
     provider = ScriptedProvider(
         {
             "root": [

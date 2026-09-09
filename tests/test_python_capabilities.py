@@ -98,28 +98,31 @@ def package(workspace, name, code, permissions="[python]"):
     return module
 
 
-async def test_skills_discovery_bootstrap_execution_provenance_and_rollback(
-    tmp_path, python_config
-):
+async def test_skills_discovery_callable_references_and_module_execution(tmp_path, python_config):
+    from .test_continual_harness import edit, proposal
+
     package(tmp_path, "parity-procedure", "async def run(value=1):\n    return value + 10\n")
-    package(tmp_path, "parity-library", "print('skill import log')\nconstant = 23\n")
-    package(tmp_path, "parity-unavailable", "import missing_dependency_937\n")
+    package(tmp_path, "parity-library", "constant = 23\n")
     runtime = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     try:
         root = runtime.create("skills", tmp_path, config=python_config)
+        runtime.store.harness.apply(
+            root.id,
+            proposal(
+                edit(
+                    "skill",
+                    id="add_ten",
+                    reference={"type": "python", "import": "parity_procedure", "callable": "run"},
+                )
+            ),
+            id="refine_fixture",
+        )
         await cell(
             runtime,
             root.id,
-            "assert await parity_procedure(2) == 12\nassert parity_library.constant == 23\nassert await skills.run('parity-procedure', value=3) == 13\nassert skills.load('parity-library').constant == 23\ntry:\n    await parity_unavailable()\nexcept RuntimeError as error:\n    assert 'missing_dependency' in str(error)\nelse:\n    raise AssertionError('Expected import diagnostic')\nentry = harness.create_skill('Skill', {'name':'parity_stored','description':'retained code','code':'skill_result = 17'}, id='stable-skill')\nassert harness.get('skill','stable-skill').version == 1\nassert await skills.run('parity_stored') == 17\nharness.delete_skill('stable-skill')\nassert harness.get('skill','stable-skill').deleted\nharness.rollback('skill','stable-skill',1)\nassert not harness.get('skill','stable-skill').deleted\nassert harness.get('skill','stable-skill').version == 3",
+            "assert await parity_procedure(2) == 12\nassert skills.load('parity-library').constant == 23\nassert harness.get('skill','add_ten').reference['import'] == 'parity_procedure'\nassert await parity_procedure(7) == 17",
         )
-        assert runtime.store.db.execute("SELECT COUNT(*) FROM skill_outcomes").fetchone()[0] == 2
-        states = runtime.store.states(root.id)
-        assert states[0]["provenance"]["source_events"] and states[0]["intended_effect"]
-        await cell(
-            runtime,
-            root.id,
-            "ref = harness.create_skill('Reference procedure', 'Add ten', reference={'type':'python','import':'parity_procedure','callable':'run'}, arguments={'value':7})\nassert await skills.run('Reference procedure') == 17",
-        )
+        assert "code" not in runtime.store.harness.get(root.id, "skill", "add_ten")
     finally:
         await runtime.shutdown()
 

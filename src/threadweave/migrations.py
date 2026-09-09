@@ -2,6 +2,8 @@
 
 VERSION = 12
 
+LEGACY_HARNESS_SCHEMA = "CREATE TABLE IF NOT EXISTS state_entries(\n id TEXT PRIMARY KEY, owner_id TEXT REFERENCES sessions(id), kind TEXT NOT NULL,\n current_version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS state_versions(\n entry_id TEXT NOT NULL REFERENCES state_entries(id), version INTEGER NOT NULL,\n body TEXT NOT NULL, PRIMARY KEY(entry_id, version)\n);\nCREATE TRIGGER IF NOT EXISTS versions_immutable_update BEFORE UPDATE ON state_versions\nBEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;\nCREATE TRIGGER IF NOT EXISTS versions_immutable_delete BEFORE DELETE ON state_versions\nBEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;\nCREATE TABLE IF NOT EXISTS refinements(\n id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),\n edit TEXT NOT NULL, status TEXT NOT NULL, source_event TEXT NOT NULL, error TEXT\n);\n"
+
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
  workspace TEXT NOT NULL, path TEXT NOT NULL, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL,

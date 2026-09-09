@@ -38,7 +38,7 @@ def token_bound(value, model=None) -> int:
     return estimate(value, model)
 
 
-def python_instructions(config, *, child=False, specifications=()):
+def python_instructions(config, *, child=False):
     """Expose only usable capabilities; compact help remains in the live namespace."""
     text = """You are Buffalo, a code-using agent that solves tasks through persistent IPython: inspect,
 decompose, execute, observe, validate and iterate.
@@ -130,39 +130,33 @@ right = await rlm('Investigate the second component against its specification.',
 Then continue complementary local work. Use these patterns only when they add useful evidence;
 a small local task needs no child. Optional requirement= describes the task requirement being investigated.
 """
-        text += "\nAvailable subagent specifications:\n" + encode(list(specifications)) + "\n"
-        text += "Inspect full instructions with harness.get('subagent_spec', id); await rlm(assignment, spec_id=id) applies the retrieved specification through the canonical runtime.\n"
     if config.features.history_retrieval:
         text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"
     if config.tool_allowlist is None:
-        text += """\nHarness state:\nHarness state contains versioned memory, prompt_note, skill and subagent_spec entries.
-harness.list() retrieves the state overview; harness.get(kind, id) retrieves full content/version.
-harness.create(kind, title, content, select=True) and harness.update(kind, id, title, content)
-save task-local supplemental state; harness.select([id]) selects it for subsequent model turns.
-Harness CRUD/list/select are synchronous host operations: entry = harness.get(...), without await.
-They return records (list returns a list); invalid arguments or denied operations raise an error.
-Missing entries raise KeyError. skills.list() is immediate; skills.load(name) synchronously loads
-a module or entry, while await skills.run(...) executes it. Long-running operations are async.
-Memory stores durable facts, prompt notes store narrow behavioral guidance, skills store validated
-executable procedures, and subagent specifications store reusable delegation instructions.
-rlm.harness is the same state API. State supplements the task and never overrides its instructions.
-Create reusable checks only when you will run them on distinct candidates or stages; give them explicit inputs.
-Retain task-local facts and operating constraints when subsequent work will use them; do not invent entries.
-Skills and project context:
-skills.list() discovers procedures; skills.load(name) loads their module or state entry;
-await skills.run(name, **inputs) executes a validated skill. Read the matching SKILL.md or
-entry instructions before executing it. tools.catalog() returns tool schemas
-into Python, not active model context. mcp exposes configured external servers.
-Continual harness improvement is part of normal execution. Capture reusable repository discoveries,
-successful fixes, effective searches/commands, environment quirks, debugging strategies and child
-specializations as memory, prompt_note, executable skill or subagent_spec. The runtime filters
-duplicate/trivial evidence before reviewing successful progress, failures, child findings and
-compaction at safe checkpoints; validated versions activate for later turns. The reviewer may decline; no edit is required.
-You do not need to call refine() for automatic review. await refine() optionally requests manual
-evidence-based planning at a safe boundary. Applied edits are retrieved into later turns of this task.
-Validate useful lessons on subsequent work. await compact() compacts active context while retaining
-recoverable Python state, artifacts and durable history. Retrieve omitted details explicitly as needed.
-Use meaningful mechanisms within the task's resource budget; never manufacture activity.
+        text += """\nContinual harness:
+The learned kinds are prompt, memory, skill and subagent. Local state belongs to this persisted
+session; global state survives sessions. The compact harness digest is delivered at session start,
+resume and compaction, with updates when stale. harness.list(), harness.get(kind, id), and
+rlm.get_harness_state() inspect full JSON state. Use global_=True to inspect the global store.
+Supplemental state never overrides the task or the immutable base system prompt.
+Actively improve the harness when a repeated failure, reusable debugging strategy, better tool
+workflow, repeated command sequence, durable fact, reusable coding procedure, useful delegation
+role, behavioral instruction or user correction emerges. Correct or delete wrong memories and
+skills. Call await refine.run() or await refine.run('specific instructions') as part of normal work.
+Default refinement is LOCAL. await refine.run(global_=True) explicitly targets GLOBAL state for
+stable cross-session lessons. await refine.status() reports pending and in_flight.
+refine.run() returns scheduled immediately. It runs after the current turn's tools finish; edits
+enter your trajectory as a durable [self-refinement] notice and you resume automatically.
+The refinement model selects create/update/delete edits to prompt, memory, skill or subagent.
+Validate the lesson on subsequent work. Do not wait for automatic checkpoints to learn.
+Skills reference actual reusable Python callables, with reference and arguments contracts. Create
+normal module artifacts first if code is needed. Read each installed skill's SKILL.md and invoke
+its documented function; do not assume a .run entry point. skills.list()/skills.load(name) inspect
+installed skills. A subagent entry is a reusable delegation specification: compose its instructions
+into a task for native delegation when enabled. Results arrive through native messaging or files.
+Automatic review is enabled at 25 assistant turns and compaction, with a 20 minute cooldown;
+review may decline and refinement may return no edits. await compact() retains recoverable Python
+state, artifacts and history. Retrieve omitted details explicitly.
 """
     text += """\nAction patterns:
 Begin substantive work in IPython by inspecting the actual inputs and recording a useful next step.
@@ -185,7 +179,8 @@ class Context:
         self.store = store
         self.environment = environment
         self._export_cursors = {}
-        self.state_presentations = {}
+
+        self.on_compact = None
 
     def original_task(self, sid):
         """The immutable role-bearing task contract, separate from accumulated work."""
@@ -229,7 +224,11 @@ class Context:
                     evidence.setdefault(data["child_id"], []).extend(sources)
         return {
             "child_evidence": {k: list(dict.fromkeys(v)) for k, v in evidence.items()},
-            "harness_state": self.state_presentations.get(sid, []),
+            "harness_state": [
+                {k: e[k] for k in ("id", "kind", "scope", "version")}
+                for e in self.store.harness.entries(sid)
+                if f"[{e['scope']}:{e['id']}]" in visible
+            ],
         }
 
     def history_file(self, sid):
@@ -256,62 +255,35 @@ class Context:
                 self._export_cursors[sid] = row["seq"]
         return path
 
-    def supplemental(self, sid: str) -> str:
-        session, config = self.store.session(sid), self.store.config(sid)
-        from .context_budget import policy_tokens, state_excerpt
-        from .state_retrieval import relevant_state
+    def ensure_harness_digest(self, sid):
+        from .harness import format_harness_state
 
-        model = config.provider.model
-        selected, automatic = [], []
-        for entry_id in dict.fromkeys(session.selected_state):
-            try:
-                entry = self.store.state(sid, entry_id)
-            except KeyError:
-                continue
-            if not entry["deleted"]:
-                selected.append(entry)
-        selected_ids = {e["id"] for e in selected}
-        automatic = [e for e in relevant_state(self.store, sid) if e["id"] not in selected_ids]
-        budget = policy_tokens(config.context, "supplemental", model)
-        # Explicit selections receive equal minimum semantic allocations before incidental state.
-        minimum = 320 if model.startswith(("gpt-", "o1", "o3", "o4", "codex")) else 1100
-        budget = max(budget, len(selected) * minimum)
-        ceiling = config.context.max_tokens - config.provider.max_output_tokens
-        if budget > ceiling and selected:
-            raise HarnessError(
-                "runtime",
-                "selected_state_capacity",
-                "Selected state needs more context; no selected body was silently omitted",
-            )
-        records, used, remaining = [], [], min(budget, ceiling)
-        for index, entry in enumerate([*selected, *automatic]):
-            explicit = index < len(selected)
-            allocation = remaining // (len(selected) - index) if explicit else remaining
-            record = state_excerpt(entry, allocation, model, explicit=explicit)
-            if record is None:
-                if explicit:
-                    raise HarnessError(
-                        "runtime",
-                        "selected_state_capacity",
-                        "Selected state metadata leaves no room for useful content",
-                    )
-                continue
-            records.append(record)
-            remaining -= token_bound(record, model)
-            used.append({"id": entry["id"], "version": entry["version"]})
-        entries = [encode(record) for record in records]
-        self.state_presentations[sid] = [
-            {**entry, "kind": self.store.state(sid, entry["id"], entry["version"])["kind"]}
-            for entry in used
-        ]
-        previous = self.store.events(sid, kind="state_retrieved", limit=1)
-        if used and (not previous or previous[0]["payload"]["entries"] != used):
-            self.store.event(
-                sid, "state_retrieved", {"entries": used, "selection": "explicit or task relevance"}
-            )
-        return "\n".join(entries)
+        session = self.store.session(sid)
+        digest = format_harness_state(self.store.harness.merged(sid))
+        latest = None
+        for block in session.context:
+            for message in block["messages"]:
+                if message.get("harness_digest") is not None:
+                    latest = message["harness_digest"]
+        if latest == digest:
+            return False
+        event = self.store.event(sid, "harness_digest", {"digest": digest})
+        self.store.add_context(
+            sid,
+            event,
+            [
+                {
+                    "role": "user",
+                    "content": "<harness_state>\n" + digest + "\n</harness_state>",
+                    "harness_digest": digest,
+                }
+            ],
+        )
+        return True
 
-    def messages(self, sid: str) -> list[dict]:
+    def messages(self, sid: str, *, refresh_harness=True) -> list[dict]:
+        if refresh_harness:
+            self.ensure_harness_digest(sid)
         session = self.store.session(sid)
         cap = min(6000, self.store.config(sid).context.max_tokens // 4)
         task = session.instruction[:cap]
@@ -360,11 +332,6 @@ class Context:
                 "content": python_instructions(
                     self.store.config(sid),
                     child=bool(session.parent_id),
-                    specifications=[
-                        {k: e[k] for k in ("id", "title", "version")}
-                        for e in self.store.states(sid)
-                        if e["kind"] == "subagent_spec"
-                    ][:20],
                 )
                 if self.store.config(sid).control_plane == "python"
                 else FOUNDATION,
@@ -401,7 +368,6 @@ class Context:
                 }
             )
         messages.append({"role": "user", "content": task})
-        supplemental = self.supplemental(sid)
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking
             # of coding evidence. Full procedures/content stay outside L1.
@@ -411,16 +377,12 @@ class Context:
 
             config = self.store.config(sid)
             menu = {
-                "state": [
-                    {k: e[k] for k in ("id", "kind", "title", "version")}
-                    for e in self.store.states(sid)[:20]
-                ],
                 "skills": [
                     {k: e[k] for k in ("name", "path", "description", "import_name") if k in e}
                     for e in discover(Path(session.workspace.path), config.skill_paths)[:20]
                 ],
             }
-            if menu["state"] or menu["skills"]:
+            if menu["skills"]:
                 messages.append(
                     {
                         "role": "user",
@@ -428,10 +390,6 @@ class Context:
                         + encode(menu)[: config.context.supplemental_chars],
                     }
                 )
-        if supplemental:
-            messages.append(
-                {"role": "user", "content": "Selected supplemental state:\n" + supplemental}
-            )
         from .semantic_state import completion_evidence, work_items
 
         completion_state = completion_evidence(self.store, sid)
@@ -560,7 +518,6 @@ class Context:
                 {
                     "previous_summary": session.summary,
                     "blocks": removed,
-                    "selected_state": session.selected_state,
                     "proposed_summary": summary,
                     "semantic_tree_artifact": tree_artifact,
                 },
@@ -651,20 +608,9 @@ class Context:
                 ).fetchone()
                 if request:
                     self.store.commit_compaction(sid, request[0])
-            config = self.store.config(sid)
-            if (
-                review_checkpoint
-                and config.refinement.enabled
-                and config.refinement.automatic
-                and config.features.automatic_refinement
-            ):
-                self.store.enqueue_refinement_request(
-                    sid,
-                    source="compaction",
-                    source_event=eid,
-                    request_id=f"compaction-{eid}",
-                    trigger="compaction",
-                )
+            self.ensure_harness_digest(sid)
+            if review_checkpoint and self.on_compact:
+                self.on_compact(sid)
             return eid
 
     def assemble(
@@ -685,9 +631,12 @@ class Context:
                 and size <= available
             ):
                 break  # Keep the recent region verbatim when it fits the actual input budget.
+            previous_size = size
             self.compact(sid)
             messages = self.messages(sid)
             size, estimation = self.request_estimate(sid, messages, tools)
+            if size >= previous_size:
+                break  # A digest and fixed instructions cannot be compacted away.
         if size > available:
             raise HarnessError(
                 "runtime",

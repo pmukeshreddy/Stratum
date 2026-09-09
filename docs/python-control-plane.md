@@ -103,41 +103,46 @@ lifecycle notice, not an implicit answer; useful results require explicit messag
 ## Continual state and skills
 
 ```python
-entry = harness.create_memory("Observation", "Retained fact", id="observation")
-harness.update_memory("observation", "Observation", "Corrected fact")
-harness.rollback("memory", "observation", 1)
-harness.select([entry.id])
+await refine.status()
+await refine.run()
+await refine.run("Correct the project validation lesson")
+await refine.run(global_=True)
 
-procedure = harness.create_skill(
-    "Increment",
-    {
-        "name": "increment",
-        "description": "Increment the retained counter",
-        "code": "counter += 1\nskill_result = counter",
-        "required_permissions": ["python"],
-    },
-)
-counter = 0
-answer = await skills.run("increment")
+harness.list()
+harness.get("memory", "lesson")
+rlm.get_harness_state()
 ```
 
-Memory/prompt/subagent entries use text/instruction contents. Explicit CRUD commits
-immediately, including within the same Python cell. Versions carry source event,
-author, intended effect, deletion and rollback provenance. Optional global writes
-require `refinement.allow_global_writes`; foundational policy is not editable.
-Automatic refinement remains optional and applies validated proposals at safe
-boundaries. `await refine()` requests that pass; it does not fabricate new state.
+The continual harness uses `harness_state.json` as its only active learned state,
+with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
+`DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
+Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
+learned state is imported once; old tables have no runtime readers or writers.
 
-Discover SKILL.md under workspace `.agents/skills`, `.threadweave/skills`, user
-`$XDG_CONFIG_HOME/threadweave/skills`, and configured `skill_paths`. Python skill
-packages contain `pyproject.toml` and `src/<name_underscored>/__init__.py`. Bootstrap
-imports permitted packages; modules defining `run` are also callable. Markdown
-skills are readable instructions, not executable blobs. `skills.list/load/run`
-expose discovery, reading/import and execution. Install declared dependencies in
-the kernel environment explicitly; import failures remain visible. Skill module
-and source hashes detect updates. Stored Python references accept import/callable
-and default arguments; executable code/input schemas/permissions are validated.
-`skills.run` records outcomes and quarantines repeatedly failing versions.
+`await refine.run()` schedules local refinement; optional instructions focus the
+planner, and `global_=True` explicitly requests global changes. `await refine.status()`
+returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
+before it continues. Zero-edit proposals produce no update notice. Automatic review
+is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
+findings are ordinary trajectory evidence, not separate refinement triggers.
+
+A compact merged digest enters context at session start, resume, compaction, and
+stale-state detection. Unchanged digests are deduplicated. The base system prompt
+stays unchanged after learning. Colliding global/local IDs remain visible with
+scope labels; local guidance can override global guidance within the session.
+Skills reference existing Python callables and their argument contracts; reusable
+subagent specifications execute through native `rlm` delegation.
+
+See [the source/test parity matrix](continual-harness-parity.md) and
+[the deterministic session trace](continual-harness-trace.json).
+
+Installed skills remain ordinary Python modules. Read SKILL.md and invoke the
+documented callable directly; `skills.list()` and `skills.load(name)` provide
+inspection and importing. A learned skill's JSON holds a Python `reference` and
+an `arguments` contract, never executable implementation text. Harness inspection
+is read-only. `refine.run` schedules all model-driven create/update/delete planning
+and application at a safe turn boundary.
 
 ## MCP configuration
 
@@ -215,8 +220,8 @@ byte-for-byte API equivalence to every reference extension. Important limits:
   interactive MCP OAuth provisioning is not implemented. Codex subscription OAuth
   remains handled by the existing official Codex authentication integration.
 - SKILL.md package dependencies are explicitly installed by the operator/model,
-  not automatically installed during bootstrap. `skills.run` tracks outcomes;
-  direct imported-module calls are ordinary Python execution.
+  not automatically installed during bootstrap. Documented callable invocations
+  are ordinary Python execution.
 - `rlm.delete_subagent` cancels/unloads a child and preserves durable history and
   topology instead of deleting its registry entry. Observation is limited to
   related sessions, not every unrelated session owned by the daemon.

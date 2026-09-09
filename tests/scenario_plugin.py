@@ -15,6 +15,27 @@ class RecoveryScenario:
 
     async def invoke(self, request, emit):
         await asyncio.sleep(0.08)
+        if request.metadata.get("purpose") == "refinement":
+            import json
+
+            return ModelResponse(
+                text=json.dumps(
+                    {
+                        "summary": "Retained computation",
+                        "edits": [
+                            {
+                                "action": "create",
+                                "kind": "memory",
+                                "id": "values",
+                                "title": "Values",
+                                "content": "The working values contain integers 0 through 999.",
+                            }
+                        ],
+                    }
+                )
+            )
+        if request.metadata.get("purpose") == "refinement_review":
+            return ModelResponse(text='{"shouldRefine":false,"rationale":"Already retained"}')
         turn = request.turn
         from pathlib import Path
 
@@ -78,23 +99,10 @@ class RecoveryScenario:
         elif turn == 0:
             actions = [action("python", code="values = list(range(1000))\nlen(values)")]
         elif turn == 1:
-            source = self.runtime.store.events(request.session_id, kind="python_result", limit=1)[
-                0
-            ]["id"]
             actions = [
                 action("agent_spawn", instruction="Compute left", name="left"),
                 action("agent_spawn", instruction="Compute right", name="right"),
-                action(
-                    "refine",
-                    edit={
-                        "kind": "memory",
-                        "title": "Retained computation",
-                        "content": {"text": "The working values contain integers 0 through 999."},
-                        "source_events": [source],
-                        "intended_effect": "Remember the computation",
-                        "select": True,
-                    },
-                ),
+                action("refine", instructions="Remember the retained computation"),
             ]
         elif turn == 2:
             actions = [action("agent_wait", seconds=300)]

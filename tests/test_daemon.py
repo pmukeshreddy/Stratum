@@ -98,7 +98,7 @@ async def test_real_daemon_kill_restart_recovers_full_recursive_trajectory(tmp_p
         before = Store(data)
         event_ids = [r[0] for r in before.db.execute("SELECT id FROM events")]
         assert before.events(sid, kind="context_compaction")
-        assert before.states(sid)[0]["kind"] == "memory"
+        assert before.harness.entries(sid)[0]["kind"] == "memory"
         assert before.db.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] >= 1
         before.close()
         queued = await request(
@@ -129,7 +129,7 @@ async def test_real_daemon_kill_restart_recovers_full_recursive_trajectory(tmp_p
         )
         assert persisted.events(sid, kind="recovery")
         assert persisted.events(sid, kind="verifier_result")[-1]["payload"]["passed"]
-        assert persisted.states(sid)[0]["version"] == 1
+        assert persisted.harness.entries(sid)[0]["version"] == 1
         for member in persisted.sessions(root_id=sid):
             assert member.outcome == "completed"
             assert persisted.events(member.id, kind="kernel_recovery")

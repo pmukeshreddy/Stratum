@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from pydantic import Field
 
-from .models import Record, StateEdit, new_id, now
+from .models import Record, new_id, now
 from .storage import encode
 
 
@@ -33,7 +32,7 @@ def resolve_capability(request, registry=None):
         permissions = ("mcp",)
     elif op.startswith(("rlm.", "agent_message.", "agent_observe.")):
         permissions = ("agents",)
-    elif op.startswith(("harness.", "skills.")):
+    elif op.startswith(("harness.", "skills.", "refine.")):
         permissions = ("state",)
     elif (
         op == "catalog"
@@ -44,8 +43,6 @@ def resolve_capability(request, registry=None):
         permissions = ()
     else:
         raise ValueError(f"Unknown host operation: {op}")
-    if op == "skills.prepare":
-        permissions = ("state", "python")
     return Tool(
         op,
         "Internal Python capability",
@@ -61,136 +58,26 @@ def permission(context, name):
         raise PermissionError(f"Capability requires {name} permission")
 
 
-def kind_name(kind):
-    kinds = {
-        "memory": "memory",
-        "prompt": "prompt_note",
-        "prompt_note": "prompt_note",
-        "skill": "skill",
-        "subagent": "subagent_spec",
-        "subagent_spec": "subagent_spec",
-    }
-    if kind not in kinds:
-        raise ValueError(f"Unknown harness category: {kind}")
-    return kinds[kind]
-
-
-def state_entry(context, kind, id, global_=False, version=None):
-    store = context.runtime.store
-    entries = store.states(context.session_id, include_deleted=True)
-    for entry in entries:
-        if (
-            entry["kind"] == kind_name(kind)
-            and (entry["owner_id"] is None) == global_
-            and (entry["id"] == id or entry["content"].get("harness_id") == id)
-        ):
-            return store.state(context.session_id, entry["id"], version)
-    return None
-
-
 def harness(context, operation, payload):
     permission(context, "state")
     store, sid = context.runtime.store, context.session_id
     p = dict(payload)
     kind, global_ = p.pop("kind", None), p.pop("global_", False)
+    if not isinstance(global_, bool):
+        raise TypeError("global_ must be bool")
+    state = store.harness.load(None if global_ else sid)
+    if operation == "overview":
+        return store.harness.merged(sid)
     if operation == "list":
-        entries = [
+        return [
             e
-            for e in store.states(sid)
-            if (kind is None or e["kind"] == kind_name(kind)) and (e["owner_id"] is None) == global_
+            for k, entries in state["entries"].items()
+            if kind is None or k == kind
+            for e in entries.values()
         ]
-        for entry in entries:
-            store.event(
-                sid,
-                "harness_state_retrieved",
-                {"entry_id": entry["id"], "kind": entry["kind"], "version": entry["version"]},
-                parent=context.source_event,
-            )
-        return entries
-    kind = kind_name(kind)
-    identifier = p.pop("id", None)
-    current = state_entry(context, kind, identifier, global_) if identifier else None
     if operation == "get":
-        entry = state_entry(context, kind, identifier, global_, p.get("version"))
-        if entry:
-            store.event(
-                sid,
-                "harness_state_retrieved",
-                {"entry_id": entry["id"], "kind": entry["kind"], "version": entry["version"]},
-                parent=context.source_event,
-            )
-        return entry
-    if operation == "create" and current:
-        raise ValueError("Harness entry already exists")
-    if operation in {"update", "delete", "rollback"} and not current:
-        raise KeyError(f"Harness entry not found: {identifier}")
-    content = p.pop("content", None)
-    title = p.pop("title", current["title"] if current else "")
-    if content is None:
-        content = current["content"] if current else {}
-    if isinstance(content, str):
-        if kind == "skill":
-            reference = p.pop(
-                "reference", current["content"].get("reference", {}) if current else {}
-            )
-            module = reference.get(
-                "import", reference.get("module", reference.get("python_import"))
-            )
-            function = reference.get("callable", "run")
-            if not module or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module):
-                raise ValueError(
-                    "Skill requires executable content or reference={'module': 'import_name'}"
-                )
-            if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", function):
-                raise ValueError("Skill callable must be a Python attribute path")
-            target = function if function.startswith(module + ".") else module + "." + function
-            arguments = p.pop(
-                "arguments", current["content"].get("arguments", {}) if current else {}
-            )
-            content = {
-                "name": title,
-                "description": content,
-                "inputs": {"type": "object", "additionalProperties": True},
-                "required_permissions": ["python"],
-                "reference": reference,
-                "arguments": arguments,
-                "code": f"import {module}, inspect\nskill_result = {target}(**({arguments!r} | skill_inputs))\nif inspect.isawaitable(skill_result):\n    skill_result = await skill_result",
-            }
-        else:
-            content = {"instruction" if kind == "subagent_spec" else "text": content}
-    content = dict(content)
-    # Skills have a validated executable schema; other entries retain reference-like grouping.
-    content["harness_id"] = identifier or (
-        current["content"].get("harness_id") if current else None
-    )
-    if "path" in p:
-        content["path"] = p.pop("path")
-    metadata = p.pop("metadata", {})
-    edit = StateEdit(
-        entry_id=current["id"] if current else None,
-        kind=kind,
-        scope="global" if global_ else "session",
-        title=title,
-        content=content,
-        operation={"create": "upsert", "update": "upsert"}.get(operation, operation),
-        rollback_version=p.pop("version", None),
-        expected_version=current["version"] if current else None,
-        source_events=p.pop("source_events", metadata.get("source_events", [context.source_event])),
-        intended_effect=p.pop(
-            "intended_effect", metadata.get("intended_effect", title or operation)
-        ),
-        select=p.pop("select", False),
-    )
-    p.pop("source", None)
-    if p:
-        raise ValueError(f"Unknown harness options: {sorted(p)}")
-    # Explicit API CRUD is immediately visible in this cell; L1 selection happens only
-    # at the next model boundary. Autonomous refinement remains queued and validated.
-    with store.transaction():
-        rid = store.queue_refinement(sid, edit)
-        entry_id = store._apply_edit(sid, edit, context.source_event)
-        store.db.execute("UPDATE refinements SET status='applied' WHERE id=?", (rid,))
-    return store.state(sid, entry_id)
+        return store.harness.get(sid, kind, p["id"], global_=global_)
+    raise ValueError(f"Unknown harness operation: {operation}")
 
 
 async def dispatch(context, request):
@@ -265,12 +152,6 @@ async def dispatch(context, request):
             name = p.get("name")
             prompt = p["prompt"]
             requirement = p.get("requirement") or session.instruction
-            spec = None
-            if p.get("spec_id"):
-                spec = store.state(sid, p["spec_id"])
-                if spec["kind"] != "subagent_spec" or spec["deleted"]:
-                    raise ValueError("A live subagent_spec entry is required")
-                prompt = spec["content"]["instruction"] + "\n" + prompt
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("A nonempty assignment is required")
             if name and any(
@@ -321,13 +202,6 @@ async def dispatch(context, request):
                 },
                 parent=context.source_event,
             )
-            if spec:
-                store.event(
-                    sid,
-                    "subagent_spec_used",
-                    {"entry_id": spec["id"], "version": spec["version"], "child_id": child.id},
-                    parent=context.source_event,
-                )
             return {
                 "session_id": child.id,
                 "name": child.name,
@@ -392,15 +266,16 @@ async def dispatch(context, request):
                     for s in targets
                 ]
             }
+    if op.startswith("refine."):
+        permission(context, "state")
+        if session.depth != 0:
+            raise PermissionError("Refinement is available only to root sessions")
+        if op == "refine.status":
+            return runtime.refinement_status(sid)
+        if op == "refine.run":
+            return runtime.request_refinement(sid, **p)
+        raise ValueError(f"Unknown refinement operation: {op}")
     if op.startswith("harness."):
-        if op == "harness.refine":
-            permission(context, "state")
-            return runtime.request_refinement(
-                sid,
-                source="python",
-                request_id=context.action_id,
-                source_event=context.source_event,
-            )
         return harness(context, op.split(".")[1], p)
     if op.startswith("agent_observe."):
         permission(context, "agents")
@@ -576,104 +451,25 @@ async def dispatch(context, request):
 
 
 def skill_operation(context, operation, p):
-    from .refinement import validate_inputs, validate_skill
     from .skills import discover
 
     permission(context, "state")
     store, sid = context.runtime.store, context.session_id
     config = store.config(sid)
     files = discover(Path(context.session.workspace.path), config.skill_paths)
-    entries = [e for e in store.states(sid) if e["kind"] == "skill"]
     if operation == "list":
-        return files + [
-            {"name": e["content"]["name"], "id": e["id"], "kind": "stored", "version": e["version"]}
-            for e in entries
-        ]
-    if operation == "outcome":
-        ticket = store.event_by_id(p["ticket"])
-        if ticket["session_id"] != sid or ticket["type"] != "skill_started":
-            raise PermissionError("Skill ticket belongs to another execution")
-        data = ticket["payload"]
-        with store.transaction():
-            if store.db.execute(
-                "SELECT 1 FROM skill_outcomes WHERE id=?", (ticket["id"],)
-            ).fetchone():
-                raise ValueError("Skill outcome already recorded")
-            store.db.execute(
-                "INSERT INTO skill_outcomes VALUES(?,?,?,?,?,?)",
-                (
-                    ticket["id"],
-                    sid,
-                    data["entry_id"],
-                    data["version"],
-                    bool(p["passed"]),
-                    encode({"source_event": context.source_event}),
-                ),
-            )
-            store.event(
-                sid,
-                "skill_outcome",
-                {**data, "passed": bool(p["passed"])},
-                parent=context.source_event,
-            )
-        return {"recorded": True}
-    entry = next(
-        (e for e in entries if e["id"] == p["name"] or e["content"]["name"] == p["name"]), None
-    )
+        return files
     file = next((f for f in files if f["name"] == p["name"]), None)
-    if not file and not entry:
-        raise KeyError(f"Skill not found: {p['name']}")
-    if operation == "load":
-        if file and not set(file.get("required_permissions", ["python"])) <= set(
-            config.permissions
-        ):
-            raise PermissionError("Skill requires unavailable permissions")
-        store.event(
-            sid,
-            "skill_loaded",
-            {
-                "entry_id": entry["id"] if entry else file["path"],
-                "version": entry["version"] if entry else file["sha256"],
-            },
-            parent=context.source_event,
+    if file is None:
+        raise KeyError(
+            f"Installed skill not found: {p['name']}; inspect learned callable references with harness.get('skill', id)"
         )
-        if file:
-            return {**file, "text": Path(file["path"]).read_text()}
-        return entry
-    if operation != "prepare":
-        raise ValueError("Unknown skill operation")
-    permission(context, "python")
-    if file:
-        if file.get("error"):
-            raise ValueError(file["error"])
-        if not file.get("import_name"):
-            raise ValueError("Markdown skills are instructions, not executable modules")
-        if not set(file.get("required_permissions", ["python"])) <= set(config.permissions):
-            raise PermissionError("Skill requires unavailable permissions")
-        result, entry_id, version = dict(file), file["path"], file["sha256"]
-    else:
-        result = validate_skill(entry["content"], config.permissions)
-        validate_inputs(result["inputs"], p["inputs"])
-        entry_id, version = entry["id"], entry["version"]
-    store.event(
-        sid,
-        "skill_loaded",
-        {"entry_id": entry_id, "version": version, "operation": "prepare"},
-        parent=context.source_event,
-    )
-    outcomes = store.db.execute(
-        "SELECT passed FROM skill_outcomes WHERE entry_id=? AND version=? ORDER BY rowid DESC LIMIT ?",
-        (entry_id, version, config.refinement.skill_failure_limit),
-    ).fetchall()
-    if len(outcomes) >= config.refinement.skill_failure_limit and not any(r[0] for r in outcomes):
-        raise ValueError("Skill quarantined after repeated failures; update the procedure")
-    result["ticket"] = store.event(
-        sid,
-        "skill_started",
-        {"entry_id": entry_id, "version": version},
-        parent=context.source_event,
-    )
-    return result
+    if operation != "load":
+        raise ValueError("Read the skill instructions and invoke its documented Python callable")
+    if not set(file.get("required_permissions", ["python"])) <= set(config.permissions):
+        raise PermissionError("Skill requires unavailable permissions")
+    store.event(sid, "skill_loaded", {"path": file["path"]}, parent=context.source_event)
+    return {**file, "text": Path(file["path"]).read_text()}
 
 
 def register(registry):

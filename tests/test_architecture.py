@@ -11,7 +11,7 @@ from threadweave.coding_config import update_coding_options
 from threadweave.context import FOUNDATION
 from threadweave.daemon import Daemon
 from threadweave.guardrails import observe
-from threadweave.models import ModelResponse, StateEdit
+from threadweave.models import ModelResponse
 from threadweave.runtime import Runtime
 from threadweave.tools import ToolContext
 
@@ -185,41 +185,18 @@ async def test_root_rlm_messages_layers_refinement_detach_recovery(tmp_path, con
         }
         assert all(m["received_at"] for m in runtime.store.messages(root.id))
         evidence = runtime.store.events(root.id, kind="python_result")[0]["id"]
-        edit = StateEdit(
-            kind="skill",
-            title="Inspect retained x",
-            content={
-                "name": "inspect_x",
-                "description": "Select a scalar without printing large values",
-                "code": "print(x)",
-                "required_permissions": ["python"],
-            },
-            source_events=[evidence],
-            intended_effect="Reuse bounded selection of persistent state",
+        from .test_continual_harness import edit, proposal
+
+        runtime.store.harness.apply(root.id, proposal(edit()), id="learn")
+        runtime.store.harness.apply(
+            root.id, proposal(edit(action="update", content="updated")), id="correct"
         )
-        runtime.store.queue_refinement(root.id, edit)
-        assert not runtime.store.states(root.id)
-        await say("Apply at boundary")
-        entry = runtime.store.states(root.id)[0]
-        assert entry["version"] == 1
-        assert entry["content"]["validation_status"] == "syntax_and_permissions_validated"
-        runtime.store.queue_refinement(
-            root.id,
-            edit.model_copy(
-                update={
-                    "entry_id": entry["id"],
-                    "expected_version": 1,
-                    "content": {**edit.content, "code": "assert x == 123\nprint(x)"},
-                }
-            ),
-        )
-        await say("Apply skill update")
-        assert runtime.store.state(root.id, entry["id"])["version"] == 2
+        entry = runtime.store.harness.get(root.id, "memory", "lesson")
         runtime.context.compact(root.id, count=len(runtime.store.session(root.id).context))
         assert runtime.store.event_by_id(evidence)["type"] == "python_result"
         assert runtime.context.messages(root.id)[0] == {"role": "system", "content": FOUNDATION}
         info = runtime.information(root.id)
-        assert info["L1"]["blocks"] == 0 and "x" in info["L2"]["checkpointed_names"]
+        assert info["L1"]["blocks"] == 1 and "x" in info["L2"]["checkpointed_names"]
         assert len(info["L2"]["children"]) == 2 and info["L3"]["compactions"] > 0
         assert "L2_ONLY_SECRET" not in json.dumps(info)
         await runtime.pause(root.id)
@@ -240,14 +217,13 @@ async def test_root_rlm_messages_layers_refinement_detach_recovery(tmp_path, con
             runtime.store.messages(root.id, pending=True)[0]["body"]
             == "Queued while detached/inactive"
         )
-        assert runtime.store.state(root.id, entry["id"])["version"] == 2
+        assert runtime.store.harness.get(root.id, "memory", entry["id"])["version"] == 2
         assert runtime.store.db.execute(
             "SELECT enabled FROM schedules WHERE id=?", (schedule,)
         ).fetchone()[0]
         assert runtime.store.usage(root.id, tree=True).model_calls == usage.model_calls
-        await say("Reattach and inspect x", [response("skill_run", entry_id=entry["id"])])
+        await say("Reattach and inspect x", [response("python", code="assert x == 123")])
         assert runtime.store.events(root.id, kind="kernel_recovery")[-1]["payload"]["restored"]
-        assert runtime.store.events(root.id, kind="skill_outcome")[-1]["payload"]["passed"]
         assert not runtime.store.events(root.id, kind="python_error", tree=True)
         assert (
             runtime.store.usage(root.id, tree=True).python_executions
@@ -272,45 +248,6 @@ async def test_agents_view_attach_preserves_execution_controls(tmp_path, config,
             assert daemon.runtime.store.goal(root.id)["objective"] == "Persistent objective"
     finally:
         await daemon.runtime.shutdown()
-        daemon.lock.close()
-
-
-@pytest.mark.parametrize(
-    "kind,content",
-    [
-        ("memory", {"text": "A fact"}),
-        ("prompt_note", {"text": "An instruction"}),
-        ("skill", {"name": "procedure", "description": "Compute", "code": "1 + 1"}),
-        ("subagent_spec", {"instruction": "Investigate independently"}),
-    ],
-)
-async def test_continual_categories_at_daemon_boundaries(tmp_path, config, kind, content):
-    daemon = Daemon(tmp_path / "state")
-    runtime = daemon.runtime
-    runtime.providers["mock"] = ScriptedProvider({"root": [ModelResponse(text="Boundary")] * 10})
-    try:
-        root = runtime.create("Reusable state", tmp_path, config=config, mode="interactive")
-        evidence = runtime.store.event(root.id, "observation", {"fact": "source"})
-        edit = StateEdit(
-            kind=kind, content=content, source_events=[evidence], intended_effect="Reuse evidence"
-        )
-        await runtime.start()
-        for turn, operation in enumerate(["upsert", "delete", "rollback"], 1):
-            if turn > 1:
-                entry = runtime.store.states(root.id, include_deleted=True)[0]
-                edit.entry_id = entry["id"]
-                edit.expected_version = entry["version"]
-            edit.operation = operation
-            edit.rollback_version = 1 if operation == "rollback" else None
-            await daemon.dispatch("refine", {"session_id": root.id, "edit": edit.model_dump()})
-            runtime.interact(root.id, f"Apply queued change {turn}")
-            await settle(runtime, root.id, turn)
-            entry = (await daemon.dispatch("states", {"session_id": root.id}))[0]
-            assert entry["version"] == turn and entry["deleted"] == (operation == "delete")
-            assert entry["provenance"]["source_events"] == [evidence]
-        assert runtime.store.state(root.id, entry["id"], 1)["version"] == 1
-    finally:
-        await runtime.shutdown()
         daemon.lock.close()
 
 
@@ -343,7 +280,9 @@ def test_explicit_environment_config_is_not_rewritten(tmp_path):
     assert chat_config(tmp_path, path).task.adapter == "external_simulation"
 
 
-async def test_explicit_model_compaction_in_plain_environment_preserves_l2_l3(runtime, tmp_path, config):
+async def test_explicit_model_compaction_in_plain_environment_preserves_l2_l3(
+    runtime, tmp_path, config
+):
     config.context.max_tokens = 18000
     config.context.recent_blocks = 1
     config.tool_allowlist = ["python", "rlm", "finish"]

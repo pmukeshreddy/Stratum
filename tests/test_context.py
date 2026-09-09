@@ -1,8 +1,8 @@
 import pytest
 
-from threadweave.context import FOUNDATION, Context
-from threadweave.models import StateEdit, Workspace
-from threadweave.storage import Store, encode
+from threadweave.context import Context
+from threadweave.models import Workspace
+from threadweave.storage import Store
 
 from .fakes import TestConfig as RunConfig
 
@@ -50,26 +50,6 @@ def test_compaction_preserves_full_history_and_complete_tool_pairs(tmp_path):
     store = Store(tmp_path / "db")
     assert Context(store).messages(root.id) == messages
     assert store.db.execute("SELECT COUNT(*) FROM compactions").fetchone()[0] > 0
-    store.close()
-
-
-def test_adaptive_content_requires_selection_and_never_changes_foundation(tmp_path):
-    store = Store(tmp_path / "db")
-    root = store.create("Task", Workspace(path=str(tmp_path)), RunConfig())
-    eid = store.event(root.id, "observation", {})
-    edit = StateEdit(
-        content={"text": "unselected retained fact"},
-        source_events=[eid],
-        intended_effect="Remember",
-    )
-    store.queue_refinement(root.id, edit)
-    entry = store.apply_refinements(root.id)[0]
-    assert "unselected retained fact" not in encode(Context(store).messages(root.id))
-    store.update(root.id, selected_state=[entry])
-    messages = Context(store).messages(root.id)
-    assert "unselected retained fact" in encode(messages)
-    assert messages[0] == {"role": "system", "content": FOUNDATION}
-    assert all(m["role"] != "system" for m in messages[1:])
     store.close()
 
 

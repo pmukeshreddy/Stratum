@@ -34,22 +34,12 @@ class TrajectoryHistory:
             "subscription_model_selected",
             "agent_message_sent",
             "user_intervention",
-            "refinement_evidence_chunk",
         }
         if not include_bookkeeping:
             # These receipts duplicate the committed work below. Keep them in the ledger,
             # but do not spend reviewer context on scheduling and accounting machinery.
             ignored.update(
                 {
-                    "refinement_event_seen",
-                    "refinement_prefilter_pass",
-                    "refinement_prefilter_reject",
-                    "refinement_review_called",
-                    "refinement_scheduled",
-                    "refinement_later_consumed",
-                    "refinement_validation_pass",
-                    "refinement_validation_fail",
-                    "refinement_proposed",
                     "kernel_snapshot",
                     "agent_operating_path",
                     "verification_result",
@@ -63,11 +53,6 @@ class TrajectoryHistory:
                     "turn_completed",
                     "environment_prepare",
                     "environment_prepared",
-                    "refinement_requested",
-                    "refinement_status",
-                    "refinement_trigger",
-                    "automatic_refinement",
-                    "manual_refinement",
                 }
             )
         records = []

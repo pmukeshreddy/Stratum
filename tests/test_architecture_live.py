@@ -55,10 +55,8 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
         "workspace_list",
         "finish",
         "refine",
-        "state_list",
-        "state_read",
-        "state_select",
-        "skill_run",
+        "harness_list",
+        "harness_get",
         "history_read",
         "information_inspect",
         "schedule_turn",
@@ -175,7 +173,6 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
                 any(m["sender_id"] == s["id"] and m["received_at"] for m in store.messages(sid))
                 for s in children
             )
-            source = store.events(sid, kind="python_result", limit=1)[0]["id"]
             store.close()
             await send(cli, "/tree")
             await expect(cli, "child-b")
@@ -185,24 +182,11 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
                 "Read existing x in Python after compaction without assigning it. Also inspect your existing child_a and child_b handles; do not recreate children."
             )
             await say(
-                "Store a reusable executable skill via refine: title 'Inspect saved scalar', kind skill, "
-                "content with name inspect_saved_x, description 'Print the existing scalar without dumping working state', "
-                "code 'print(x)', required_permissions ['python']; source_events ['"
-                + source
-                + "']; "
-                "intended_effect 'Reuse explicit bounded selection from persistent REPL'. This is version 1."
+                "Use the refine tool to retain a local memory titled 'Inspect saved scalar': x is a retained scalar; inspect it without printing large working values."
             )
             store = Store(data)
-            skills = [e for e in store.states(sid) if e["kind"] == "skill"]
-            assert len(skills) == 1
-            entry = skills[0]
+            assert any(e["kind"] == "memory" for e in store.harness.entries(sid))
             store.close()
-            await say(
-                f"Update skill entry {entry['id']} using refine with expected_version {entry['version']}, "
-                "kind skill, same name/description/permissions, code 'assert x == 123\\nprint(x)', "
-                f"source_events ['{source}'], intended_effect 'Check the scalar before printing'. "
-                "Use an actual newline between Python statements. Then run that skill with skill_run."
-            )
             await all_idle()
             old_pid = (await request(data, "ping"))["pid"]
             await exit_view()
@@ -232,7 +216,7 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
                 assert {s.id: s.kernel_id for s in store.sessions(root_id=sid)} == identities
                 assert len(store.events(sid, kind="user_intervention")) == len(prompts)
                 assert store.session(sid).outcome == "active"
-                assert store.states(sid)[0]["version"] >= 2
+                assert any(e["kind"] == "memory" for e in store.harness.entries(sid))
                 assert store.events(sid, kind="skill_outcome")[-1]["payload"]["passed"]
                 assert "x" in store.events(sid, kind="kernel_recovery")[-1]["payload"]["restored"]
                 assert not store.events(sid, kind="python_error", tree=True)

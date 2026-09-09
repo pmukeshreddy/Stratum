@@ -108,21 +108,9 @@ class RetryPolicy(Record):
 
 class RefinementPolicy(Record):
     enabled: bool = True
-    allow_global_writes: bool = False
-    selected_entries: list[str] = Field(default_factory=list)
-    automatic: bool = True
-    evaluation_isolation: bool = False
-    every_turns: int = Field(default=10, ge=1)
-    progress_every_turns: int = Field(default=3, ge=1)
-    on_completion: bool = True
-    verifier_failures: int = Field(default=3, ge=1)
-    max_proposals: int = Field(default=3, ge=1, le=10)
-    skill_failure_limit: int = Field(default=3, ge=1)
-    automatic_budget_seconds: float = Field(default=120, gt=0)
-    continuation_reserve_seconds: float = Field(default=60, ge=0)
-    reasoning: Literal["off", "inherit"] = "off"
-    completion_followup: bool = False
-    root_only: bool = True
+    turn_interval: int = Field(default=25, ge=1)
+    compact: bool = True
+    cooldown_seconds: float = Field(default=20 * 60, ge=0)
 
 
 class KernelStatePolicy(Record):
@@ -157,7 +145,6 @@ class Features(Record):
     persistent_repl: bool = True
     subagents: bool = True
     history_retrieval: bool = True
-    automatic_refinement: bool = True
     experiments: bool = True
     enhanced_code_index: bool = True
     model_compaction: bool = True
@@ -362,7 +349,6 @@ class Session(Record):
     turns: int = 0
     context: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
-    selected_state: list[str] = Field(default_factory=list)
     adapter_context: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -439,17 +425,3 @@ class Verification(Record):
     passed: bool
     details: Any = None
     metrics: dict[str, Any] = Field(default_factory=dict)
-
-
-class StateEdit(Record):
-    entry_id: str | None = None
-    kind: Literal["prompt_note", "memory", "skill", "subagent_spec"] = "memory"
-    scope: Literal["session", "global"] = "session"
-    title: str = Field(default="", max_length=200)
-    content: dict[str, Any] = Field(default_factory=dict)
-    operation: Literal["upsert", "delete", "rollback"] = "upsert"
-    rollback_version: int | None = Field(default=None, ge=1)
-    expected_version: int | None = Field(default=None, ge=1)
-    source_events: list[str] = Field(min_length=1)
-    intended_effect: str = Field(min_length=1, max_length=2000)
-    select: bool = False

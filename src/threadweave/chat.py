@@ -24,7 +24,7 @@ HELP = """/help         Show commands
 /history      Recent conversation and tool activity
 /experiments  Durable experiments
 /compact      Compact active context (pause first if working)
-/refine       Request evidence-based learning at a safe boundary (not a StateEdit)
+/refine       Request evidence-based learning at a safe boundary
 /pause        Interrupt this session's current turn; keep state
 /resume       Continue paused work
 /new          Start a new conversation; keep the old one
@@ -346,7 +346,7 @@ class Chat:
                 {"type": "control_result", "command": command, "result": result}
             )
         elif command == "refine":
-            if result["status"] == "requested":
+            if result.get("scheduled"):
                 await self.notice(
                     "Refinement requested; no changes applied yet. "
                     + (
@@ -356,7 +356,7 @@ class Chat:
                     )
                 )
             else:
-                await self.notice(f"Refinement {result['status']}: {result.get('reason', '')}")
+                await self.notice(f"Refinement not scheduled: {result.get('reason', '')}")
         elif command == "usage":
             usage = result["tree_usage"]
             cost = "subscription / unavailable" if usage["cost"] is None else str(usage["cost"])
@@ -372,17 +372,18 @@ class Chat:
             await self.notice(render_tree(result))
         elif command == "state":
             await self.notice(
-                f"L1 · {result['L1']['blocks']} active blocks · {result['L1']['selected_entries']} selected entries\n"
+                f"L1 · {result['L1']['blocks']} active blocks\n"
                 f"L2 · kernel {result['L2']['kernel_id']} · {len(result['L2']['children'])} children · {result['L2']['checkpointed_variables']} checkpointed variables\n"
-                f"L3 · {result['L3']['events']} events · {result['L3']['artifacts']} artifacts · {result['L3']['pending_messages']} pending messages"
+                f"L3 · {result['L3']['events']} events · {result['L3']['artifacts']} artifacts · {result['L3']['harness_entries']} harness entries · {result['L3']['pending_messages']} pending messages"
             )
         elif command == "states":
-            for entry in result:
+            entries = [entry for kind in result["entries"].values() for entry in kind.values()]
+            for entry in entries:
                 await self.notice(
-                    f"{entry['id']} · {entry['kind']} · v{entry['version']} · {entry['title']}{' · deleted' if entry['deleted'] else ''}"
+                    f"{entry['id']} · {entry['kind']} · {entry['scope']} · v{entry['version']} · {entry['title']}"
                 )
-            if not result:
-                await self.notice("No selected or reusable state entries have been stored.")
+            if not entries:
+                await self.notice("No learned harness entries have been stored.")
         elif command == "diff":
             await self.terminal.write(result["patch"] or "No changes.", code="diff")
             if len(result["patch"]) >= 16000:

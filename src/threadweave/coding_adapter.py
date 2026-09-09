@@ -208,11 +208,10 @@ class CodingAdapter(CodingTask):
         # Keep explicit legacy snapshot behavior; Python-first cells use incremental
         # metadata observation rather than copying all content for every invocation.
         token = {"window": None, "checkpoint": None}
-        if name not in {"python", "ipython", "skill_run"}:
+        if name not in {"python", "ipython"}:
             token["window"] = self.mutations.begin(context)
         if config.control_plane != "direct" or name not in {
             "python",
-            "skill_run",
             "process_run",
             "run_tests",
             "run_targeted_tests",

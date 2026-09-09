@@ -51,7 +51,7 @@ def register(registry):
     async def skills(c, a):
         return [
             {k: e[k] for k in ("id", "title", "version", "content")}
-            for e in c.runtime.store.states(c.session_id)
+            for e in c.runtime.store.harness.entries(c.session_id)
             if e["kind"] == "skill" and a.query.lower() in json.dumps(e).lower()
         ][: a.limit]
 

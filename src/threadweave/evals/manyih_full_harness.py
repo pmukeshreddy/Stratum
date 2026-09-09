@@ -34,10 +34,6 @@ ROOT = Path(__file__).parents[3]
 
 def experiment_config():
     config = run_config()
-    config.refinement.reasoning = "inherit"
-    config.refinement.automatic_budget_seconds = 120
-    config.refinement.continuation_reserve_seconds = 60
-    config.refinement.completion_followup = True
     return config
 
 
@@ -55,7 +51,7 @@ def mechanisms(directory):
         actions = [(n, json.loads(a)) for n, a in db.execute("SELECT name,arguments FROM actions")]
         operations = Counter(a.get("operation") for n, a in actions if n == "host_request")
         sessions = [json.loads(r[0]) for r in db.execute("SELECT body FROM sessions")]
-        statuses = dict(db.execute("SELECT status,count(*) FROM refinement_runs GROUP BY status"))
+        statuses = {"completed": events["refine_complete"], "failed": events["refine_failed"]}
         requests = [
             json.loads(r[0])
             for r in db.execute("SELECT payload FROM events WHERE type='model_request'")
@@ -124,14 +120,13 @@ def audit(output, previous):
             assert record[k] == bool(grade[official_key])
         config = json.loads((directory / "buffalo-config.json").read_text())
         initial = json.loads((directory / "initial-harness-state.json").read_text())
-        assert initial["states"] == [] and initial["selected_state"] == []
+        assert not any(initial["states"]["entries"].values())
         assert Path(initial["state_directory"]) == directory / "state"
-        assert config["refinement"]["completion_followup"]
-        assert config["refinement"]["automatic"] and config["refinement"]["enabled"]
+        assert config["refinement"]["enabled"]
         assert all(config["features"].values())
         assert config["limits"]["wall_seconds"] == TIMEOUT
         assert config["limits"]["concurrency"] == 4
-        assert config["skill_paths"] == [] and config["refinement"]["selected_entries"] == []
+        assert config["skill_paths"] == []
         for line in (directory / "provider-calls.jsonl").read_text().splitlines():
             request = json.loads(line)["request"]
             assert request["config"]["model"] == MODEL
@@ -142,11 +137,11 @@ def audit(output, previous):
                     "persistent",
                     "rlm(",
                     "agent_message",
-                    "prompt_note",
-                    "subagent_spec",
+                    "prompt",
+                    "subagent",
                     "harness.get",
-                    "skills.run",
-                    "refine()",
+                    "skills.load",
+                    "refine.run()",
                     "compact()",
                 ):
                     assert term in foundation, term

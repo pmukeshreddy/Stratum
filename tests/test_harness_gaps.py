@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from threadweave.models import HarnessError, ModelResponse, StateEdit, Usage, new_id
+from threadweave.models import HarnessError, ModelResponse, Usage, new_id
 from threadweave.runtime import Runtime
 from threadweave.storage import encode
 from threadweave.subscription import SubscriptionProvider, responses_input
@@ -93,7 +93,8 @@ async def test_compaction_covers_material_beyond_24000_and_keeps_recent(tmp_path
         archive = runtime.artifacts.load(root.id, compaction["archive_artifact"])
         assert "ZEBRA-937" in encode(archive)
         assert compaction["archive_artifact"] in runtime.store.session(root.id).summary
-        assert runtime.store.session(root.id).context[-1]["messages"] == recent
+        assert runtime.store.session(root.id).context[-2]["messages"] == recent
+        assert "harness_digest" in runtime.store.session(root.id).context[-1]["messages"][0]
     finally:
         await runtime.shutdown()
 
@@ -175,70 +176,6 @@ async def test_repository_instructions_are_loaded_in_hierarchy(tmp_path, config,
             str(repo / p) for p in ("AGENTS.md", "src/AGENTS.md", "src/CLAUDE.md")
         ]
         assert all(x["sha256"] for x in loaded)
-    finally:
-        await runtime.shutdown()
-
-
-async def test_refiner_knows_existing_memory_and_later_task_retrieves_it(tmp_path, config):
-    config.refinement.automatic = True
-    config.refinement.allow_global_writes = True
-    provider = ScriptedProvider({})
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    root = runtime.create("Repair zeta checksum validation", tmp_path, config=config)
-    try:
-        eid = runtime.store.event(
-            root.id, "verifier_result", {"passed": False, "reason": "zeta checksum"}
-        )
-        runtime.store.queue_refinement(
-            root.id,
-            StateEdit(
-                scope="global",
-                title="Zeta checksum",
-                content={"text": "Zeta checksum must include header bytes."},
-                source_events=[eid],
-                intended_effect="Avoid checksum corruption",
-            ),
-        )
-        entry = runtime.store.apply_refinements(root.id)[0]
-
-        class Refiner:
-            async def invoke(self, request, emit):
-                evidence = json.loads(request.messages[-1]["content"])
-                assert entry in encode(evidence["existing_state"])
-                if request.metadata["purpose"] == "refinement_review":
-                    return ModelResponse(
-                        text=encode({"shouldRefine": True, "rationale": "Checksum lesson changed"})
-                    )
-                return ModelResponse(
-                    text=json.dumps(
-                        {
-                            "proposals": [
-                                {
-                                    "entry_id": entry,
-                                    "expected_version": 1,
-                                    "scope": "global",
-                                    "kind": "memory",
-                                    "title": "Zeta checksum",
-                                    "content": {
-                                        "text": "Zeta checksum includes header bytes and payload."
-                                    },
-                                    "source_events": [eid],
-                                    "intended_effect": "Update existing lesson",
-                                }
-                            ]
-                        }
-                    )
-                )
-
-        runtime.providers["mock"] = Refiner()
-        await runtime.auto_refine(root.id, trigger="completion")
-        assert runtime.store.state(root.id, entry)["version"] == 2
-        later = runtime.create("Fix the zeta checksum parser", tmp_path, config=config)
-        assert "includes header bytes and payload" in encode(runtime.context.messages(later.id))
-        unrelated = runtime.create("Draw a cat", tmp_path, config=config)
-        assert "includes header bytes and payload" not in encode(
-            runtime.context.messages(unrelated.id)
-        )
     finally:
         await runtime.shutdown()
 

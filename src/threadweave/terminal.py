@@ -274,20 +274,16 @@ class EventRenderer:
             await terminal.write(prefix + "Paused; persistent state retained.", style="yellow")
         elif kind == "context_compaction":
             await terminal.write(prefix + "● Context compacted; full history retained", style="dim")
-        elif kind == "refinement_status" and payload.get("status") in {
-            "applied",
-            "skipped",
-            "failed",
-        }:
-            status = payload["status"]
-            detail = (
-                f"{payload.get('applied_count', 0)} versioned changes committed"
-                if status == "applied"
-                else payload.get("reason", "")
-            )
+        elif kind == "refine_complete":
+            count = sum(edit["applied"] for edit in payload["appliedEdits"])
             await terminal.write(
-                prefix + f"Refinement {status}: {detail}"[:1200],
-                style="red" if status == "failed" else "dim",
+                prefix
+                + f"Refinement complete: {count} harness changes; {payload['summary']}"[:1200],
+                style="dim",
+            )
+        elif kind == "refine_failed":
+            await terminal.write(
+                prefix + "Refinement failed: " + payload.get("error", "")[:1200], style="red"
             )
         elif kind == "environment_prepare":
             description = (

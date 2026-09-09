@@ -94,15 +94,29 @@ Python values and accumulated budgets are retained. Paused, cancelled, failed an
 resource-exhausted children are not automatically restarted. A failed child does
 not destroy the root.
 
-The Continual Harness retains append-only history and versioned memories,
-executable skills, prompt notes and reusable subagent specifications. `rlm.harness`
-provides immediate, audited CRUD from Python. Automatic refinement proposals are
-validated and applied at turn boundaries. Explicit selection, deletion, rollback
-and optional global scope are supported. Foundational policy and weights are unchanged.
-Interactive `/refine` requests an evidence-based model pass at a safe boundary,
-even when periodic automatic refinement is off. It reports requested, applied,
-skipped or failed; a request is not a claim that learning has occurred. Refinement
-must be enabled, and a pass with no new usable evidence makes no changes.
+The continual harness uses `harness_state.json` as its only active learned state,
+with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
+`DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
+Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
+learned state is imported once; old tables have no runtime readers or writers.
+
+`await refine.run()` schedules local refinement; optional instructions focus the
+planner, and `global_=True` explicitly requests global changes. `await refine.status()`
+returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
+before it continues. Zero-edit proposals produce no update notice. Automatic review
+is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
+findings are ordinary trajectory evidence, not separate refinement triggers.
+
+A compact merged digest enters context at session start, resume, compaction, and
+stale-state detection. Unchanged digests are deduplicated. The base system prompt
+stays unchanged after learning. Colliding global/local IDs remain visible with
+scope labels; local guidance can override global guidance within the session.
+Skills reference existing Python callables and their argument contracts; reusable
+subagent specifications execute through native `rlm` delegation.
+
+See [the source/test parity matrix](docs/continual-harness-parity.md) and
+[the deterministic session trace](docs/continual-harness-trace.json).
 
 Compaction only changes L1. History, REPL values and children remain intact.
 Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,
@@ -124,7 +138,7 @@ status = await agent_observe.get_agent(review.session_id)
 await agent_message.send("Focus on recovery.", receiver_role="child", receiver_name="reviewer")
 result = await bash("uv run pytest -q")
 print(result.exit_code, result.output[-1000:])
-note = harness.create_memory("Observation", "The test command above completed.")
+await refine.run("Retain the reusable testing workflow supported by this trajectory.")
 ```
 
 Files/Path, shell handles, editing, repository retrieval, MCP, skills and durable

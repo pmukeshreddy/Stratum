@@ -48,9 +48,7 @@ def capture(runtime_context, sid):
     children = [child for child in store.sessions() if child.parent_id == sid]
     snapshots = store.events(sid, kind="kernel_snapshot", limit=1)
     refinements = [
-        {k: e[k] for k in ("id", "kind", "version", "title")}
-        for e in store.states(sid)
-        if not e["deleted"]
+        {k: e[k] for k in ("id", "kind", "version", "title")} for e in store.harness.entries(sid)
     ]
     evidence = store.events(sid, kind="verification_evidence", limit=3) + store.events(
         sid, kind="verifier_result", limit=1

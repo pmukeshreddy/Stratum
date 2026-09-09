@@ -234,15 +234,14 @@ async def execute(args):
     elif command == "unschedule":
         show(await request(directory, "unschedule", schedule_id=args.schedule_id))
     elif command == "refine":
-        if args.edit is None:
-            show(await request(directory, "input", session_id=args.session_id, body="/refine"))
-            return 0
         show(
             await request(
                 directory,
                 "refine",
                 session_id=args.session_id,
-                edit=json.loads(args.edit.read_text()),
+                instructions=args.instructions,
+                global_=args.global_,
+                rollback_id=args.rollback,
             )
         )
     elif command == "artifact":
@@ -351,14 +350,11 @@ def parser():
     schedule.add_argument("--instruction", default="Scheduled continuation")
     unschedule = sub.add_parser("unschedule")
     unschedule.add_argument("schedule_id")
-    refine = sub.add_parser("refine", help="Queue an auditable StateEdit JSON document")
+    refine = sub.add_parser("refine", help="Schedule continual harness refinement")
     refine.add_argument("session_id")
-    refine.add_argument(
-        "edit",
-        type=Path,
-        nargs="?",
-        help="StateEdit JSON; omit to request a model refinement at the next turn boundary",
-    )
+    refine.add_argument("instructions", nargs="?")
+    refine.add_argument("--global", dest="global_", action="store_true")
+    refine.add_argument("--rollback", help="Refinement ID to undo")
     artifact = sub.add_parser("artifact")
     artifact.add_argument("session_id")
     artifact.add_argument("artifact_id")

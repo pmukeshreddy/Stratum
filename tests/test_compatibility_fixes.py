@@ -1,7 +1,6 @@
 """Regression cases use test model doubles with production sessions/kernels/daemon APIs."""
 
 import asyncio
-import json
 
 import pytest
 
@@ -9,7 +8,6 @@ from threadweave.chat import Chat
 from threadweave.daemon import Daemon
 from threadweave.models import ModelResponse, Outcome, Usage, new_id
 from threadweave.runtime import Runtime
-from threadweave.terminal import EventRenderer
 from threadweave.tools import ToolContext
 
 from .conftest import eventually, response
@@ -18,12 +16,14 @@ from .test_chat import InputTerminal
 
 
 async def test_completed_child_followup_reuses_kernel_after_restart(tmp_path, python_config):
+    from .test_continual_harness import edit, proposal
+
     provider = ScriptedProvider(
         {
             "worker": [
                 response(
                     "ipython",
-                    code="x = 123\nnote = harness.create_memory('Retained value', 'x is 123')\nawait agent_message.send('first result', receiver_role='parent')",
+                    code="x = 123\nawait agent_message.send('first result', receiver_role='parent')",
                 ),
                 ModelResponse(text="Initial work done"),
                 response(
@@ -40,6 +40,7 @@ async def test_completed_child_followup_reuses_kernel_after_restart(tmp_path, py
     try:
         root = runtime.create("root", tmp_path, config=python_config, mode="interactive")
         child = runtime.spawn(root.id, "initial work", name="worker")
+        runtime.store.harness.apply(root.id, proposal(edit()), id="refine_fixture", global_=True)
         await runtime.start()
         await eventually(
             lambda: (
@@ -49,7 +50,7 @@ async def test_completed_child_followup_reuses_kernel_after_restart(tmp_path, py
         )
         assert child.id not in runtime.kernels
         before = runtime.store.usage(child.id)
-        states = runtime.store.states(child.id)
+        states = runtime.store.harness.entries(child.id)
         history_ids = {e["id"] for e in runtime.store.events(child.id, limit=1000)}
         await runtime.shutdown()
         runtime = Runtime(data, providers={"mock": provider})
@@ -62,7 +63,7 @@ async def test_completed_child_followup_reuses_kernel_after_restart(tmp_path, py
         restored = runtime.store.session(child.id)
         assert restored.outcome == "completed" and restored.kernel_id == child.kernel_id
         assert restored.workspace == child.workspace
-        assert runtime.store.states(child.id) == states and len(states) == 1
+        assert runtime.store.harness.entries(child.id) == states and len(states) == 1
         assert history_ids <= {e["id"] for e in runtime.store.events(child.id, limit=1000)}
         assert runtime.store.usage(root.id, tree=True).subagent_count == 1
         assert next(m for m in runtime.store.messages(child.id) if m["id"] == mid)["received_at"]
@@ -87,7 +88,7 @@ async def test_chat_refine_is_requested_instead_of_unknown(tmp_path, python_conf
         output = terminal.output.getvalue()
         assert "Unknown command" not in output
         assert "Refinement requested" in output
-        assert daemon.runtime.store.events(chat.session["id"], kind="refinement_trigger")
+        assert daemon.runtime.store.events(chat.session["id"], kind="refine_scheduled")
     finally:
         await daemon.runtime.shutdown()
         daemon.lock.close()
@@ -276,240 +277,6 @@ async def test_followup_cannot_revive_ineligible_or_reset_budget(tmp_path, pytho
         await runtime.shutdown()
 
 
-class EvidenceProvider:
-    """Unit-test double for auxiliary requests only; never a live model result."""
-
-    def __init__(self, *, invalid=False, gate=None):
-        self.requests, self.invalid, self.gate = [], invalid, gate
-        self.empty = False
-
-    async def invoke(self, request, emit):
-        assert request.metadata["purpose"] in {"refinement", "refinement_review"}
-        self.requests.append(request)
-        if self.gate:
-            self.gate[0].set()
-            await self.gate[1].wait()
-        if self.invalid:
-            return ModelResponse(text="not json")
-        if request.metadata["purpose"] == "refinement_review":
-            return ModelResponse(
-                text=json.dumps({"shouldRefine": True, "rationale": "Observed computation"}),
-                usage=Usage(input_tokens=40, output_tokens=20),
-            )
-        evidence = json.loads(request.messages[-1]["content"])["evidence"]
-        if self.empty or not evidence:
-            return ModelResponse(text='{"proposals": []}')
-        return ModelResponse(
-            text=json.dumps(
-                {
-                    "proposals": [
-                        {
-                            "kind": "memory",
-                            "title": "Observed procedure",
-                            "content": {"text": "Retain computed values"},
-                            "source_events": [evidence[-1]["id"]],
-                            "intended_effect": "Reuse demonstrated computation",
-                        }
-                    ]
-                }
-            ),
-            usage=Usage(input_tokens=40, output_tokens=20),
-        )
-
-
-def seed_evidence(runtime, sid):
-    return runtime.store.event(sid, "python_result", {"stdout": "Computed 123 successfully"})
-
-
-async def settled_request(runtime, sid, rid):
-    await eventually(
-        lambda: (
-            runtime.store.refinement_request(sid, rid)["status"] in {"applied", "skipped", "failed"}
-        )
-    )
-    await eventually(lambda: sid not in runtime.tasks)
-    return runtime.store.refinement_request(sid, rid)
-
-
-async def test_idle_chat_refine_applies_once_and_recovers_versioned_state(tmp_path, python_config):
-    python_config.refinement.automatic = False
-    python_config.features.automatic_refinement = False
-    daemon = Daemon(tmp_path / "data")
-    runtime, provider = daemon.runtime, EvidenceProvider()
-    runtime.providers["mock"] = provider
-    terminal = InputTerminal(tmp_path / "ui")
-
-    async def rpc(directory, method, **args):
-        return await daemon.dispatch(method, args)
-
-    chat = Chat(tmp_path / "data", tmp_path, terminal, rpc=rpc)
-    try:
-        await chat.open(config=python_config)
-        sid = chat.session["id"]
-        source = seed_evidence(runtime, sid)
-        await chat.submit("/help")
-        await chat.submit("/refine")
-        assert "Refinement requested; no changes applied yet" in terminal.output.getvalue()
-        rid = runtime.store.pending_refinement_requests(sid)[0]["id"]
-        assert (await daemon.dispatch("refine", {"session_id": sid, "request_id": rid}))[
-            "request_id"
-        ] == rid
-        await runtime.start()
-        result = await settled_request(runtime, sid, rid)
-        assert result["status"] == "applied" and result["applied_count"] == 1
-        assert len(provider.requests) == 1
-        assert runtime.store.session(sid).turns == 0
-        assert not runtime.store.events(sid, kind="environment_prepared")
-        entry = runtime.store.state(sid, result["entry_ids"][0])
-        assert entry["version"] == 1 and source in entry["provenance"]["source_events"]
-        renderer = EventRenderer(terminal, sid)
-        for event in runtime.store.events(sid, kind="refinement_status"):
-            await renderer.render(event)
-        assert "Refinement applied: 1 versioned changes committed" in terminal.output.getvalue()
-        assert (await daemon.dispatch("refinement_status", {"session_id": sid, "request_id": rid}))[
-            "status"
-        ] == "applied"
-        await runtime.shutdown()
-        runtime = Runtime(tmp_path / "data", providers={"mock": provider})
-        await runtime.start()
-        assert runtime.store.state(sid, entry["id"]) == entry
-        assert (
-            runtime.request_refinement(sid, source="human", request_id=rid)["status"] == "applied"
-        )
-        provider.empty = True  # The manual planner decides there is nothing more to apply.
-        rid2 = runtime.request_refinement(sid, source="human")["request_id"]
-        assert (await settled_request(runtime, sid, rid2))["status"] == "skipped"
-        assert len(provider.requests) == 2
-    finally:
-        await runtime.shutdown()
-        daemon.lock.close()
-
-
-@pytest.mark.parametrize(
-    "case", ["disabled", "empty", "invalid", "turn_limit", "model_limit", "stopped"]
-)
-async def test_refine_honest_terminal_outcomes_without_unwanted_turn(tmp_path, python_config, case):
-    python_config.refinement.enabled = case != "disabled"
-    python_config.features.automatic_refinement = False
-    provider = EvidenceProvider(invalid=case == "invalid")
-    runtime = Runtime(tmp_path / "data", providers={"mock": provider})
-    try:
-        session = runtime.create("root", tmp_path, config=python_config, mode="interactive")
-        sid = session.id
-        if case != "empty":
-            seed_evidence(runtime, sid)
-        if case == "turn_limit":
-            runtime.store.charge(sid, Usage(turns=python_config.limits.max_turns))
-        if case == "model_limit":
-            runtime.store.charge(sid, Usage(model_calls=python_config.limits.max_model_calls))
-        rid = runtime.interact(sid, "/refine")
-        if case == "stopped":
-            await runtime.stop(sid)
-        await runtime.start()
-        result = await settled_request(runtime, sid, rid)
-        assert result["status"] == ("skipped" if case in {"empty", "disabled"} else "failed")
-        assert result["reason"]
-        assert len(provider.requests) == (1 if case in {"invalid", "empty"} else 0)
-        assert not runtime.store.states(sid)
-        assert not runtime.store.messages(sid, pending=True)
-        assert runtime.store.session(sid).turns == 0
-    finally:
-        await runtime.shutdown()
-
-
-async def test_refine_during_model_turn_waits_for_boundary(tmp_path, python_config):
-    entered, release = asyncio.Event(), asyncio.Event()
-    refiner = EvidenceProvider()
-
-    class Provider:
-        async def invoke(self, request, emit):
-            if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
-                assert release.is_set()
-                return await refiner.invoke(request, emit)
-            entered.set()
-            await release.wait()
-            return ModelResponse(text="Ready")
-
-    runtime = Runtime(tmp_path / "data", providers={"mock": Provider()})
-    try:
-        session = runtime.create("root", tmp_path, config=python_config, mode="interactive")
-        seed_evidence(runtime, session.id)
-        runtime.interact(session.id, "work")
-        await runtime.start()
-        await asyncio.wait_for(entered.wait(), 5)
-        result = runtime.request_refinement(session.id, source="human")
-        assert result["status"] == "requested" and not refiner.requests
-        release.set()
-        assert (await settled_request(runtime, session.id, result["request_id"]))[
-            "status"
-        ] == "applied"
-        assert runtime.store.session(session.id).turns == 1
-    finally:
-        release.set()
-        await runtime.shutdown()
-
-
-async def test_python_refine_paused_request_survives_restart(tmp_path, python_config):
-    provider = EvidenceProvider()
-
-    class ResumableProvider:
-        async def invoke(self, request, emit):
-            if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
-                return await provider.invoke(request, emit)
-            return ModelResponse(text="Resumed")
-
-    data = tmp_path / "data"
-    runtime = Runtime(data, providers={"mock": ResumableProvider()})
-    try:
-        root = runtime.create("root", tmp_path, config=python_config, mode="interactive")
-        seed_evidence(runtime, root.id)
-        await python(
-            runtime, root.id, "request = await refine()\nassert request['status'] == 'requested'"
-        )
-        await runtime.pause(root.id)
-        rid = runtime.store.pending_refinement_requests(root.id)[0]["id"]
-        await runtime.shutdown()
-        runtime = Runtime(data, providers={"mock": ResumableProvider()})
-        await runtime.start()
-        assert runtime.store.session(root.id).paused
-        assert runtime.store.refinement_request(root.id, rid)["status"] == "requested"
-        runtime.resume(root.id)
-        assert (await settled_request(runtime, root.id, rid))["status"] == "applied"
-        assert len(provider.requests) == 1
-    finally:
-        await runtime.shutdown()
-
-
-@pytest.mark.parametrize("interruption", ["cancel", "crash"])
-async def test_interrupted_refinement_is_not_replayed(tmp_path, python_config, interruption):
-    entered, release = asyncio.Event(), asyncio.Event()
-    provider = EvidenceProvider(gate=(entered, release))
-    data = tmp_path / "data"
-    runtime = Runtime(data, providers={"mock": provider})
-    try:
-        root = runtime.create("root", tmp_path, config=python_config, mode="interactive")
-        seed_evidence(runtime, root.id)
-        rid = runtime.request_refinement(root.id, source="human")["request_id"]
-        if interruption == "crash":
-            runtime.store.db.execute(
-                "UPDATE refinement_requests SET status='running' WHERE id=?", (rid,)
-            )
-        else:
-            await runtime.start()
-            await asyncio.wait_for(entered.wait(), 5)
-            await runtime.pause(root.id)
-        await runtime.shutdown()
-        runtime = Runtime(data, providers={"mock": provider})
-        await runtime.start()
-        result = runtime.store.refinement_request(root.id, rid)
-        assert result["status"] == "failed" and result["uncertain"]
-        assert not runtime.store.states(root.id)
-        assert len(provider.requests) == (1 if interruption == "cancel" else 0)
-    finally:
-        release.set()
-        await runtime.shutdown()
-
-
 async def test_child_result_does_not_reactivate_completed_parent(tmp_path, python_config):
     runtime = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     try:
@@ -522,81 +289,4 @@ async def test_child_result_does_not_reactivate_completed_parent(tmp_path, pytho
         assert not runtime.store.session(child.id).runnable
         assert runtime.store.messages(child.id, pending=True)
     finally:
-        await runtime.shutdown()
-
-
-@pytest.mark.parametrize("json_mode", [False, True])
-async def test_chat_disabled_refinement_and_direct_state_edit_are_distinct(
-    tmp_path, python_config, json_mode
-):
-    python_config.refinement.enabled = False
-    daemon = Daemon(tmp_path / "data")
-    daemon.runtime.providers["mock"] = EvidenceProvider()
-    terminal = InputTerminal(tmp_path / "ui", json_mode=json_mode)
-
-    async def rpc(directory, method, **args):
-        return await daemon.dispatch(method, args)
-
-    chat = Chat(tmp_path / "data", tmp_path, terminal, rpc=rpc)
-    try:
-        await chat.open(config=python_config)
-        await chat.submit("/refine")
-        output = terminal.output.getvalue()
-        assert "disabled" in output and "skipped" in output
-        assert "Unknown command" not in output
-        if json_mode:
-            assert '"command": "refine"' in output
-        assert not daemon.runtime.store.pending_refinement_requests(chat.session["id"])
-        assert not daemon.runtime.providers["mock"].requests
-        enabled = python_config.model_copy(deep=True)
-        enabled.refinement.enabled = True
-        root = daemon.runtime.create("editable", tmp_path, config=enabled, mode="interactive")
-        source = seed_evidence(daemon.runtime, root.id)
-        result = await daemon.dispatch(
-            "refine",
-            {
-                "session_id": root.id,
-                "edit": {
-                    "kind": "memory",
-                    "title": "Operator authored",
-                    "content": {"text": "Observed value"},
-                    "source_events": [source],
-                    "intended_effect": "Retain the observation",
-                },
-            },
-        )
-        assert "refinement_id" in result and "request_id" not in result
-        assert not daemon.runtime.store.pending_refinement_requests(root.id)
-        assert not daemon.runtime.store.states(root.id)  # StateEdit is queued, not applied yet.
-        daemon.runtime.store.apply_refinements(root.id)
-        assert daemon.runtime.store.states(root.id)[0]["version"] == 1
-        assert not daemon.runtime.providers["mock"].requests
-    finally:
-        await daemon.runtime.shutdown()
-        daemon.lock.close()
-
-
-async def test_new_refinement_request_during_pass_is_not_lost(tmp_path, python_config):
-    entered, release = asyncio.Event(), asyncio.Event()
-    provider = EvidenceProvider(gate=(entered, release))
-    runtime = Runtime(tmp_path / "data", providers={"mock": provider})
-    try:
-        root = runtime.create("root", tmp_path, config=python_config, mode="interactive")
-        seed_evidence(runtime, root.id)
-        rid1 = runtime.request_refinement(root.id, source="human")["request_id"]
-        await runtime.start()
-        await asyncio.wait_for(entered.wait(), 5)
-        seed_evidence(runtime, root.id)
-        rid2 = runtime.request_refinement(root.id, source="human")["request_id"]
-        assert (
-            runtime.request_refinement(root.id, source="human", request_id=rid2)["status"]
-            == "requested"
-        )
-        release.set()
-        assert (await settled_request(runtime, root.id, rid1))["status"] == "applied"
-        assert (await settled_request(runtime, root.id, rid2))["status"] == "applied"
-        assert len(provider.requests) == 2
-        assert len(runtime.store.states(root.id)) == 2
-    finally:
-        release.set()
         await runtime.shutdown()

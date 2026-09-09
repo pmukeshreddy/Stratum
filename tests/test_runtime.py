@@ -267,45 +267,6 @@ async def test_verifier_failure_is_not_a_task_failure_and_completion_gate(
     assert "x" * 100000 not in str(provider.requests[-1].messages)
 
 
-async def test_refinement_applied_at_next_turn_then_skill_executes(runtime, tmp_path, config):
-    def refine(request):
-        event = runtime.store.events(request.session_id, kind="python_result", limit=1)[0]["id"]
-        return response(
-            "refine",
-            edit={
-                "kind": "skill",
-                "title": "Compute",
-                "content": {
-                    "name": "compute",
-                    "description": "Reuse calculation",
-                    "code": "answer = x * 2\nanswer",
-                },
-                "source_events": [event],
-                "intended_effect": "Reuse calculation",
-                "select": True,
-            },
-        )
-
-    def skill(request):
-        entry = runtime.store.states(request.session_id)[0]
-        supplemental = next(
-            m["content"]
-            for m in request.messages
-            if (m.get("content") or "").startswith("Selected supplemental state:")
-        )
-        assert "answer = x * 2" in supplemental
-        return response("skill_run", entry_id=entry["id"])
-
-    runtime.providers["mock"] = ScriptedProvider(
-        {"root": [response("python", code="x=21"), refine, skill, response("finish", result="42")]}
-    )
-    root = runtime.create("Refine", tmp_path, config=config)
-    await runtime.start()
-    assert (await runtime.wait(root.id)).outcome == Outcome.COMPLETED
-    assert len(runtime.store.events(root.id, kind="refinement")) == 1
-    assert runtime.store.usage(root.id).python_executions == 2
-
-
 async def test_heartbeat_persistence_and_missed_ticks_coalesce(tmp_path, config):
     config.provider.name = "mock"
     directory = tmp_path / "data"

@@ -20,6 +20,6 @@
   "permissions": ["workspace.read", "workspace.write", "python", "process", "agents", "state"],
   "execution": {"backend": "local", "environment_allowlist": ["PATH", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"]},
   "context": {"max_tokens": 96000, "summary_chars": 6000, "result_chars": 131072},
-  "refinement": {"automatic": true, "every_turns": 10, "on_completion": true},
+  "refinement": {"enabled": true, "turn_interval": 25, "compact": true, "cooldown_seconds": 1200},
   "limits": {"max_turns": 100, "token_budget": 3000000, "wall_seconds": 7200, "concurrency": 4, "max_subagents": 10, "max_depth": 3, "tool_timeout_seconds": 600}
 }

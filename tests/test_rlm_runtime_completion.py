@@ -322,7 +322,7 @@ async def test_failed_child_followup_recovers_own_repl_and_stable_id_messaging(t
         }
     )
     config = RunConfig(
-        provider={"name": "mock", "model": "deterministic"}, refinement={"automatic": False}
+        provider={"name": "mock", "model": "deterministic"}, refinement={"enabled": False}
     )
     runtime = Runtime(tmp_path / "state", providers={"mock": provider})
     try:
@@ -351,7 +351,7 @@ async def test_failed_child_followup_recovers_own_repl_and_stable_id_messaging(t
 
 async def test_parent_cancellation_cleans_completed_child_background_process(tmp_path):
     config = RunConfig(
-        provider={"name": "mock", "model": "deterministic"}, refinement={"automatic": False}
+        provider={"name": "mock", "model": "deterministic"}, refinement={"enabled": False}
     )
     config.permissions.append("process")
     runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
@@ -375,7 +375,7 @@ async def test_parent_cancellation_cleans_completed_child_background_process(tmp
 
 async def test_restart_does_not_admit_orphan_after_interrupted_parent_stop(tmp_path):
     config = RunConfig(
-        provider={"name": "mock", "model": "deterministic"}, refinement={"automatic": False}
+        provider={"name": "mock", "model": "deterministic"}, refinement={"enabled": False}
     )
     runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
     root = runtime.create("Interrupted cancellation", tmp_path, config=config)

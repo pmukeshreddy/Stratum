@@ -17,7 +17,6 @@ from .models import (
     Outcome,
     RunConfig,
     Session,
-    StateEdit,
     Usage,
     Workspace,
     new_id,
@@ -83,22 +82,6 @@ CREATE TABLE IF NOT EXISTS provider_continuations(
  event_id TEXT PRIMARY KEY REFERENCES events(id), provider TEXT NOT NULL, model TEXT NOT NULL,
  items TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS state_entries(
- id TEXT PRIMARY KEY, owner_id TEXT REFERENCES sessions(id), kind TEXT NOT NULL,
- current_version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS state_versions(
- entry_id TEXT NOT NULL REFERENCES state_entries(id), version INTEGER NOT NULL,
- body TEXT NOT NULL, PRIMARY KEY(entry_id, version)
-);
-CREATE TRIGGER IF NOT EXISTS versions_immutable_update BEFORE UPDATE ON state_versions
-BEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;
-CREATE TRIGGER IF NOT EXISTS versions_immutable_delete BEFORE DELETE ON state_versions
-BEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;
-CREATE TABLE IF NOT EXISTS refinements(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- edit TEXT NOT NULL, status TEXT NOT NULL, source_event TEXT NOT NULL, error TEXT
-);
 CREATE TABLE IF NOT EXISTS goals(
  session_id TEXT PRIMARY KEY REFERENCES sessions(id), objective TEXT NOT NULL,
  status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL
@@ -109,12 +92,6 @@ CREATE TABLE IF NOT EXISTS schedules(
  instruction TEXT NOT NULL
 );
 """
-
-
-class StateConflict(ValueError):
-    def __init__(self, entry_id, baseline, current):
-        super().__init__(f"State entry changed during refinement planning: {entry_id}")
-        self.details = {"entry_id": entry_id, "baseline": baseline, "current": current}
 
 
 class Store(RequestHistory, TrajectoryHistory):
@@ -134,9 +111,18 @@ class Store(RequestHistory, TrajectoryHistory):
                 f"Database schema {version} is newer than supported schema {VERSION}"
             )
         self.db.executescript(SCHEMA)
+        if version < 11:
+            from .migrations import LEGACY_HARNESS_SCHEMA
+
+            self.db.executescript(LEGACY_HARNESS_SCHEMA)
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1, ?)", (now(),))
         migrate(self.db, version, now())
         self._depth = 0
+        from .harness import HarnessStore
+        from .harness_migration import migrate_sqlite_harness
+
+        self.harness = HarnessStore(self.directory)
+        migrate_sqlite_harness(self.db, self.harness)
 
     @contextmanager
     def transaction(self):
@@ -252,7 +238,6 @@ class Store(RequestHistory, TrajectoryHistory):
             updated_at=now(),
             branch_from=branch_from,
             branch_event=branch_event,
-            selected_state=config.refinement.selected_entries,
         )
         with self.transaction():
             self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (config_id, body))
@@ -530,282 +515,6 @@ class Store(RequestHistory, TrajectoryHistory):
                 )
             return messages
 
-    def state(self, sid: str, entry_id: str, version: int | None = None) -> dict:
-        entry = self.db.execute("SELECT * FROM state_entries WHERE id=?", (entry_id,)).fetchone()
-        if (
-            not entry
-            or entry["owner_id"] not in (None, sid)
-            or (entry["owner_id"] is None and self.config(sid).refinement.evaluation_isolation)
-        ):
-            raise KeyError(f"State entry not accessible: {entry_id}")
-        version = version or entry["current_version"]
-        row = self.db.execute(
-            "SELECT body FROM state_versions WHERE entry_id=? AND version=?", (entry_id, version)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Unknown version: {version}")
-        return {**dict(entry), **json.loads(row[0])}
-
-    def states(self, sid: str, *, include_deleted=False) -> list[dict]:
-        clause = "" if include_deleted else " AND deleted=0"
-        if self.config(sid).refinement.evaluation_isolation:
-            clause += " AND owner_id IS NOT NULL"
-        rows = self.db.execute(
-            "SELECT id FROM state_entries WHERE (owner_id IS NULL OR owner_id=?)" + clause, (sid,)
-        ).fetchall()
-        return [self.state(sid, r[0]) for r in rows]
-
-    def queue_refinement(self, sid: str, edit: StateEdit, *, baseline=None) -> str:
-        config = self.config(sid)
-        if not config.refinement.enabled:
-            raise PermissionError("Refinement is disabled")
-        if edit.scope == "global" and not config.refinement.allow_global_writes:
-            raise PermissionError("Global state writes are disabled")
-        for eid in edit.source_events:
-            source = self.event_by_id(eid)
-            if source["root_id"] != self.session(sid).root_id:
-                raise PermissionError("Refinement evidence must belong to this session tree")
-        if edit.entry_id:
-            existing = self.state(sid, edit.entry_id)
-            if existing["owner_id"] is None and not config.refinement.allow_global_writes:
-                raise PermissionError("Global state writes are disabled")
-        elif edit.operation != "upsert":
-            raise ValueError("Delete and rollback require entry_id")
-        with self.transaction():
-            rid = new_id()
-            eid = self.event(
-                sid,
-                "refinement_requested",
-                {"refinement_id": rid, "edit": edit.model_dump()},
-                parent=edit.source_events[-1],
-            )
-            self.db.execute(
-                "INSERT INTO refinements(id,session_id,edit,status,source_event,error) VALUES(?,?,?,?,?,NULL)",
-                (rid, sid, edit.model_dump_json(), "pending", eid),
-            )
-            snapshot = (
-                baseline
-                if baseline is not None
-                else {e["id"]: e for e in self.states(sid, include_deleted=True)}
-            )
-            self.db.execute(
-                "UPDATE refinements SET baseline=? WHERE id=?",
-                (encode(snapshot.get(edit.entry_id)), rid),
-            )
-        return rid
-
-    def apply_refinements(self, sid: str, *, request_ids=None) -> list[str]:
-        rows = self.db.execute(
-            "SELECT * FROM refinements WHERE session_id=? AND status='pending'", (sid,)
-        ).fetchall()
-        if request_ids is not None:
-            rows = [r for r in rows if r["id"] in request_ids]
-        if not rows or (hasattr(self, "refinement_guard") and not self.refinement_guard(sid)):
-            return []
-        applied = []
-        try:
-            with self.transaction():
-                # Obtain SQLite's writer lock BEFORE checking any baseline. Other
-                # connections cannot change state between comparison and commit.
-                self.db.execute("UPDATE refinements SET status=status WHERE id=?", (rows[0]["id"],))
-                for row in rows:
-                    edit = StateEdit.model_validate_json(row["edit"])
-                    if edit.entry_id:
-                        current = self.state(sid, edit.entry_id)
-                        baseline = json.loads(row["baseline"]) if row["baseline"] else None
-                        if baseline is None or current != baseline:
-                            raise StateConflict(edit.entry_id, baseline, current)
-                for row in rows:
-                    edit = StateEdit.model_validate_json(row["edit"])
-                    applied.append(self._apply_edit(sid, edit, row["source_event"]))
-                    self.db.execute(
-                        "UPDATE refinements SET status='applied' WHERE id=?", (row["id"],)
-                    )
-        except (ValueError, KeyError, PermissionError) as exc:
-            applied = []
-            with self.transaction():
-                for row in rows:
-                    self.db.execute(
-                        "UPDATE refinements SET status=?,error=? WHERE id=?",
-                        (
-                            "conflicted" if isinstance(exc, StateConflict) else "rejected",
-                            str(exc),
-                            row["id"],
-                        ),
-                    )
-                    self.event(
-                        sid,
-                        "refinement_conflict"
-                        if isinstance(exc, StateConflict)
-                        else "refinement_rejected",
-                        {"id": row["id"], "error": str(exc), **getattr(exc, "details", {})},
-                        parent=row["source_event"],
-                    )
-        return applied
-
-    def enqueue_refinement_request(
-        self, sid, *, source, request_id=None, source_event=None, trigger="manual"
-    ):
-        """Request a model-generated evidence pass, NOT a pre-authored StateEdit.
-
-        Durable IDs make retries idempotent. Admission never changes an agent's
-        outcome, pause state, budgets or ordinary-turn runnable flag.
-        """
-        session, config = self.session(sid), self.config(sid)
-        request_id = request_id or new_id()
-        if self.db.execute(
-            "SELECT 1 FROM refinement_requests WHERE id=?", (request_id,)
-        ).fetchone():
-            return self.refinement_request(sid, request_id)
-        with self.transaction():
-            event = self.event(
-                sid,
-                "refinement_trigger",
-                {
-                    "source": source,
-                    "trigger": trigger,
-                    "request_id": request_id,
-                },
-                parent=source_event,
-            )
-            self.db.execute(
-                "INSERT INTO refinement_requests VALUES(?,?,?,?,?,?)",
-                (
-                    request_id,
-                    sid,
-                    event,
-                    "pending",
-                    encode({"waiting_for_resume": session.paused}),
-                    trigger,
-                ),
-            )
-            if not config.refinement.enabled:
-                return self.refinement_request_result(
-                    sid,
-                    request_id,
-                    "skipped",
-                    reason="Refinement is disabled in this session configuration",
-                )
-            if session.outcome not in {Outcome.ACTIVE, Outcome.COMPLETED}:
-                return self.refinement_request_result(
-                    sid,
-                    request_id,
-                    "failed",
-                    reason="Session is cancelled, failed or resource-limited; not reactivated",
-                )
-            self.event(
-                sid,
-                "refinement_status",
-                {"request_id": request_id, "status": "requested"},
-                parent=event,
-            )
-        return self.refinement_request(sid, request_id)
-
-    def pending_refinement_requests(self, sid):
-        return [
-            dict(row)
-            for row in self.db.execute(
-                "SELECT * FROM refinement_requests WHERE session_id=? AND status IN ('pending','waiting_to_apply') ORDER BY rowid",
-                (sid,),
-            )
-        ]
-
-    def refinement_request(self, sid, request_id):
-        row = self.db.execute(
-            "SELECT * FROM refinement_requests WHERE id=? AND session_id=?", (request_id, sid)
-        ).fetchone()
-        if row is None:
-            raise KeyError("Unknown refinement request for this session")
-        return {
-            "request_id": row["id"],
-            "event_id": row["trigger_event"],
-            "trigger": row["trigger"],
-            "status": "requested" if row["status"] == "pending" else row["status"],
-            **json.loads(row["result"]),
-        }
-
-    def refinement_request_result(self, sid, request_id, status, **result):
-        with self.transaction():
-            self.db.execute(
-                "UPDATE refinement_requests SET status=?,result=? WHERE id=? AND session_id=?",
-                (status, encode(result), request_id, sid),
-            )
-            self.event(
-                sid, "refinement_status", {"request_id": request_id, "status": status, **result}
-            )
-        return self.refinement_request(sid, request_id)
-
-    def _apply_edit(self, sid: str, edit: StateEdit, source: str) -> str:
-        eid = edit.entry_id or new_id()
-        current = self.state(sid, eid) if edit.entry_id else None
-        owner = current["owner_id"] if current else (sid if edit.scope == "session" else None)
-        config = self.config(sid)
-        if owner is None and (
-            not config.refinement.allow_global_writes or config.refinement.evaluation_isolation
-        ):
-            raise PermissionError("Global state writes are disabled")
-        if current and edit.expected_version and edit.expected_version != current["version"]:
-            raise ValueError("State changed since the expected version; retrieve and retry")
-        version = current["version"] + 1 if current else 1
-        kind = current["kind"] if current else edit.kind
-        title, content, deleted = edit.title, edit.content, edit.operation == "delete"
-        if edit.operation == "rollback":
-            if not edit.rollback_version:
-                raise ValueError("rollback_version is required")
-            previous = self.state(sid, eid, edit.rollback_version)
-            title, content, deleted = previous["title"], previous["content"], previous["deleted"]
-        if edit.operation == "delete" and current:
-            title, content = current["title"], current["content"]
-        if not deleted:
-            if kind == "skill":
-                from .refinement import validate_skill
-
-                content = validate_skill(content, config.permissions)
-            required = {
-                "memory": "text",
-                "prompt_note": "text",
-                "skill": "code",
-                "subagent_spec": "instruction",
-            }[kind]
-            if not isinstance(content.get(required), str) or not content[required].strip():
-                raise ValueError(f"{kind} content requires a nonempty {required} string")
-        body = {
-            "version": version,
-            "title": title,
-            "content": content,
-            "deleted": bool(deleted),
-            "provenance": {
-                "author_session": sid,
-                "source_events": edit.source_events,
-                "trigger": source,
-                "operation": edit.operation,
-                "rollback_version": edit.rollback_version,
-            },
-            "intended_effect": edit.intended_effect,
-            "created_at": now(),
-        }
-        if not current:
-            self.db.execute(
-                "INSERT INTO state_entries VALUES(?,?,?,?,?)", (eid, owner, kind, version, deleted)
-            )
-        else:
-            self.db.execute(
-                "UPDATE state_entries SET current_version=?,deleted=? WHERE id=?",
-                (version, deleted, eid),
-            )
-        self.db.execute("INSERT INTO state_versions VALUES(?,?,?)", (eid, version, encode(body)))
-        self.event(sid, "refinement", {"entry_id": eid, "kind": kind, **body}, parent=source)
-        self.event(
-            sid,
-            "refinement_activated",
-            {"entry_id": eid, "version": version, "kind": kind, "deleted": deleted},
-            parent=source,
-        )
-        if edit.select:
-            selected = list(dict.fromkeys([*self.session(sid).selected_state, eid]))
-            self.update(sid, selected_state=selected)
-        return eid
-
     def goal(self, sid: str) -> dict | None:
         row = self.db.execute("SELECT * FROM goals WHERE session_id=?", (sid,)).fetchone()
         if not row:
@@ -849,14 +558,6 @@ class Store(RequestHistory, TrajectoryHistory):
                 (outcome.value, now(), sid),
             )
             self.db.execute("UPDATE schedules SET enabled=0 WHERE session_id=?", (sid,))
-            if outcome in {Outcome.CANCELLED, Outcome.FAILED, Outcome.LIMITED}:
-                for request in self.pending_refinement_requests(sid):
-                    self.refinement_request_result(
-                        sid,
-                        request["id"],
-                        "failed",
-                        reason=f"Session {outcome.value} before refinement could run",
-                    )
             self.event(
                 sid,
                 "completion" if outcome == Outcome.COMPLETED else "termination",

@@ -186,9 +186,7 @@ async def test_programmable_multiturn_children_context_and_recovery(
         )
         await say(
             "retain procedure",
-            "memory = harness.create_memory('Observation', 'x is a retained scalar', id='scalar')\nassert harness.get('memory', 'scalar').version == 1\n"
-            + "memory = harness.update_memory('scalar', 'Observation', 'x equals 123')\nassert memory.version == 2\n"
-            + "skill = harness.create_skill('Read x', {'name':'read_x','description':'Read retained x','code':'skill_result = x','required_permissions':['python']})\nassert await skills.run('read_x') == 123",
+            "assert not hasattr(harness, 'create_memory')\nassert x == 123",
         )
         runtime.context.compact(root.id)
         await say(
@@ -196,7 +194,9 @@ async def test_programmable_multiturn_children_context_and_recovery(
             "assert x == 123 and files\nassert left.session_id != right.session_id\nassert history.messages()",
         )
         assert all(
-            {t["function"]["name"] for t in r.tools} == {"ipython"} for r in provider.requests
+            {t["function"]["name"] for t in r.tools} == {"ipython"}
+            for r in provider.requests
+            if r.metadata.get("purpose", "agent") == "agent"
         )
         assert all("Current coding evidence" not in str(r.messages) for r in provider.requests)
         assert not runtime.store.events(root.id, kind="coding_baseline")

@@ -302,8 +302,7 @@ async def run_buffalo(
             directory / "initial-harness-state.json",
             {
                 "session_id": session.id,
-                "states": runtime.store.states(session.id),
-                "selected_state": session.selected_state,
+                "states": runtime.store.harness.merged(session.id),
                 "state_directory": str(runtime.store.directory.resolve()),
             },
         )
@@ -356,12 +355,6 @@ async def run_buffalo(
         active = list(runtime.tasks.values())
         if active:
             await asyncio.gather(*active, return_exceptions=True)
-        # Background reviews share the same ledger. Settle cancellation before
-        # reporting usage, including uncertain provider usage on interruption.
-        refinements = list(runtime._active_refinements)
-        for task in refinements:
-            task.cancel()
-        await asyncio.gather(*refinements, return_exceptions=True)
         session = runtime.store.session(session.id)
         usage = runtime.store.usage(session.id, tree=True)
         result = {

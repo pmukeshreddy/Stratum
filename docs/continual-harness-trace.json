@@ -1,0 +1,221 @@
+{
+  "session_id": "8e6cc39d5eb04fd390470df97cf43d88",
+  "canonical_state": {
+    "schema": 1,
+    "entries": {
+      "prompt": {},
+      "memory": {
+        "lesson": {
+          "id": "lesson",
+          "kind": "memory",
+          "title": "Lesson",
+          "content": "Run checks in the project environment",
+          "path": "general",
+          "scope": "local",
+          "reference": {},
+          "arguments": {},
+          "metadata": {},
+          "source": "refine",
+          "version": 1,
+          "created_at": "2026-09-09T22:11:56.273Z",
+          "updated_at": "2026-09-09T22:11:56.273Z"
+        }
+      },
+      "skill": {},
+      "subagent": {}
+    },
+    "refinements": [
+      {
+        "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+        "trigger": "Retain project lesson",
+        "changes": [
+          "create memory:lesson"
+        ],
+        "evidence": "Observed repeated error",
+        "outcome": "Use the correct environment",
+        "created_at": "2026-09-09T22:11:56.273Z"
+      }
+    ]
+  },
+  "refinements": [
+    {
+      "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+      "scope": "local",
+      "summary": "Retain project lesson",
+      "rationale": "Observed repeated error",
+      "expectedOutcome": "Use the correct environment",
+      "appliedEdits": [
+        {
+          "kind": "memory",
+          "action": "create",
+          "id": "lesson",
+          "title": "Lesson",
+          "content": "Run checks in the project environment",
+          "applied": true,
+          "after": {
+            "id": "lesson",
+            "kind": "memory",
+            "title": "Lesson",
+            "content": "Run checks in the project environment",
+            "path": "general",
+            "scope": "local",
+            "reference": {},
+            "arguments": {},
+            "metadata": {},
+            "source": "refine",
+            "version": 1,
+            "created_at": "2026-09-09T22:11:56.273Z",
+            "updated_at": "2026-09-09T22:11:56.273Z"
+          }
+        }
+      ],
+      "rollbackOf": null,
+      "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-595/test_root_schedules_learns_con0/data/sessions/8e6cc39d5eb04fd390470df97cf43d88/harness/harness_state.json",
+      "timestamp": "2026-09-09T22:11:56.273Z"
+    }
+  ],
+  "events": [
+    {
+      "type": "harness_digest",
+      "payload": {
+        "digest": "# Continual Harness State\n\nYou have persistent learned harness state. Local entries belong to this session; global entries survive sessions.\nThese compact summaries are routing hints. Inspect full entries with harness.get(kind, id, global_=True/False) when detail matters.\nLocal entries may override global guidance for this session. Prompt entries supplement the immutable base system prompt.\n\nprompt: 0\n\nmemory: 0\n\nskill: 0\n\nsubagent: 0\n\nNo saved harness entries yet.\n\nrecent refinements: 0"
+      }
+    },
+    {
+      "type": "refine_scheduled",
+      "payload": {
+        "instructions": "Remember the project validation environment",
+        "global_": false,
+        "rollback_id": null,
+        "source": "self"
+      }
+    },
+    {
+      "type": "refine_complete",
+      "payload": {
+        "id": "refine_cfc80679f5084f6980c49cb65d1df2e1",
+        "scope": "local",
+        "summary": "Retain project lesson",
+        "rationale": "Observed repeated error",
+        "expectedOutcome": "Use the correct environment",
+        "appliedEdits": [
+          {
+            "kind": "memory",
+            "action": "create",
+            "id": "lesson",
+            "title": "Lesson",
+            "content": "Run checks in the project environment",
+            "applied": true,
+            "after": {
+              "id": "lesson",
+              "kind": "memory",
+              "title": "Lesson",
+              "content": "Run checks in the project environment",
+              "path": "general",
+              "scope": "local",
+              "reference": {},
+              "arguments": {},
+              "metadata": {},
+              "source": "refine",
+              "version": 1,
+              "created_at": "2026-09-09T22:11:56.273Z",
+              "updated_at": "2026-09-09T22:11:56.273Z"
+            }
+          }
+        ],
+        "rollbackOf": null,
+        "harnessStatePath": "/private/var/folders/9z/37tfwz3j0v9dlsykj19f5c600000gn/T/pytest-of-mukeshreddypochamreddy/pytest-595/test_root_schedules_learns_con0/data/sessions/8e6cc39d5eb04fd390470df97cf43d88/harness/harness_state.json",
+        "timestamp": "2026-09-09T22:11:56.273Z"
+      }
+    },
+    {
+      "type": "refinement_notice",
+      "payload": {
+        "content": "[self-refinement]\nRetain project lesson\n- create memory [local:lesson] Lesson: Run checks in the project environment",
+        "refinement_id": "refine_cfc80679f5084f6980c49cb65d1df2e1"
+      }
+    },
+    {
+      "type": "refinement_continuation",
+      "payload": {
+        "reason": "Applied edits visible to next root turn"
+      }
+    },
+    {
+      "type": "harness_digest",
+      "payload": {
+        "digest": "# Continual Harness State\n\nYou have persistent learned harness state. Local entries belong to this session; global entries survive sessions.\nThese compact summaries are routing hints. Inspect full entries with harness.get(kind, id, global_=True/False) when detail matters.\nLocal entries may override global guidance for this session. Prompt entries supplement the immutable base system prompt.\n\nprompt: 0\n\nmemory: 1\n- [local:lesson] Lesson (general, v1): Run checks in the project environment\n\nskill: 0\n\nsubagent: 0\n\nrecent refinements: 1\n- [refine_cfc80679f5084f6980c49cb65d1df2e1] Retain project lesson: create memory:lesson; outcome: Use the correct environment"
+      }
+    },
+    {
+      "type": "completion",
+      "payload": {
+        "outcome": "completed",
+        "result": "I retained the project validation lesson and will use the project environment."
+      }
+    },
+    {
+      "type": "resumed",
+      "payload": {}
+    },
+    {
+      "type": "context_compaction",
+      "payload": {
+        "source_events": [
+          "3b55906b8ee040d2a8e66c045b5d81c1"
+        ],
+        "archive_artifact": "c476517d39ec4a159a76409f7b04189a",
+        "semantic_tree_artifact": "0f0d9c434f28487f8bb4fa614b4bdd21",
+        "pending_children": [],
+        "summary": "{\"established_facts\":[\"c2968bffb64243aa9c301cb53dcca3c3\"],\"important_references\":[\"Complete compacted history and prior digest: artifacts.load('c476517d39ec4a159a76409f7b04189a')\",{\"id\":\"0f0d9c434f28487f8bb4fa614b4bdd21\",\"purpose\":\"Live trajectory tree: unresolved work, child conclusions, verification, REPL manifest/recipes and harness versions\",\"reference\":\"artifacts.load('0f0d9c434f28487f8bb4fa614b4bdd21'); children=[]\"}]}",
+        "method": "bounded_extractive",
+        "model_response_event": null,
+        "removed_tokens_estimate": 490,
+        "summary_tokens_estimate": 514,
+        "savings_estimate": -24
+      }
+    },
+    {
+      "type": "refinement_review",
+      "payload": {
+        "reason": "compact",
+        "shouldRefine": false,
+        "rationale": "The project lesson is already retained.",
+        "instructions": ""
+      }
+    },
+    {
+      "type": "completion",
+      "payload": {
+        "outcome": "completed",
+        "result": "I retained the project validation lesson and will use the project environment."
+      }
+    }
+  ],
+  "provider_calls": [
+    {
+      "turn": 0,
+      "purpose": "agent"
+    },
+    {
+      "turn": 0,
+      "purpose": "refinement"
+    },
+    {
+      "turn": 1,
+      "purpose": "agent"
+    },
+    {
+      "turn": 2,
+      "purpose": "agent"
+    },
+    {
+      "turn": 2,
+      "purpose": "refinement_review"
+    },
+    {
+      "turn": 3,
+      "purpose": "agent"
+    }
+  ]
+}

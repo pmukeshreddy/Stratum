@@ -87,29 +87,37 @@ remains recorded.
 Schedules accept intervals or five-field UTC cron, coalescing missed ticks.
 Reboot requires daemon startup, manually or through a service manager.
 
-`refine SESSION_ID edit.json` queues a pre-authored evidence-backed StateEdit; it
-does not request model generation. `/refine` in chat, `refine SESSION_ID`,
-`input SESSION_ID /refine` and Python `await refine()` instead request a
-model-generated pass over selected trajectory evidence. The request runs at a
-safe boundary. An idle or completed session can run a refinement-only pass without
-starting an ordinary agent turn or coding preparation. Paused sessions still need
-`/resume`. The mechanism requires `refinement.enabled`; periodic refinement and
-the `features.automatic_refinement` ablation flag do not disable explicit requests.
-Periodic scheduling remains separately controlled by `refinement.automatic` and
-its interval/completion settings. No defaults or resource allowances are changed.
+`buffalo refine SESSION_ID [instructions]` schedules refinement. Use `--global`
+for cross-session state or `--rollback REFINEMENT_ID` to apply the inverse of a
+recorded refinement. `/refine` in chat schedules the same planner. Paused sessions
+wait for resume. Pending/in-flight work is in-memory and is cancelled on branch
+invalidation; applied state, history, and notices survive restart. No SQL request
+queue or version table participates in refinement. Existing model accounting and
+resource limits still apply.
 
-Requests have durable IDs and requested/running/applied/skipped/failed statuses.
-The chat reports admission before work and renders the eventual outcome from the
-event stream. Daemon clients can query `refinement_status(session_id, request_id)`;
-repeating the same request ID does not enqueue another pass. Validated state
-versions and the applied status commit atomically with source-event provenance.
-No new usable evidence or no proposals is an explicit no-op; invalid proposals
-and failed model calls are reported, not treated as learning. Interrupted in-flight
-passes are marked failed/uncertain and are **not** automatically replayed after
-restart; queued, unstarted requests survive. Request a new pass explicitly after
-reviewing interruption evidence. Model calls still use existing cumulative budgets.
-Only explicitly selected durable contents enter context; default Python mode also
-provides bounded state/skill discovery menus.
+The continual harness uses `harness_state.json` as its only active learned state,
+with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
+`DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
+Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
+learned state is imported once; old tables have no runtime readers or writers.
+
+`await refine.run()` schedules local refinement; optional instructions focus the
+planner, and `global_=True` explicitly requests global changes. `await refine.status()`
+returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
+before it continues. Zero-edit proposals produce no update notice. Automatic review
+is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
+findings are ordinary trajectory evidence, not separate refinement triggers.
+
+A compact merged digest enters context at session start, resume, compaction, and
+stale-state detection. Unchanged digests are deduplicated. The base system prompt
+stays unchanged after learning. Colliding global/local IDs remain visible with
+scope labels; local guidance can override global guidance within the session.
+Skills reference existing Python callables and their argument contracts; reusable
+subagent specifications execute through native `rlm` delegation.
+
+See [the source/test parity matrix](continual-harness-parity.md) and
+[the deterministic session trace](continual-harness-trace.json).
 
 ## Security boundaries
 

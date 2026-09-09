@@ -254,28 +254,3 @@ def prefix_end(text, fits):
         return low
     boundary = max(text.rfind("\n", 0, low), text.rfind(" ", 0, low))
     return boundary + 1 if boundary >= low // 2 else low
-
-
-def state_excerpt(entry, budget, model, *, explicit):
-    content = entry["content"]
-    body = content.get("text") or content.get("code") or encode(content)
-    if not isinstance(body, str):
-        body = encode(body)
-    record = {
-        "id": entry["id"],
-        "kind": entry["kind"],
-        "version": entry["version"],
-        "title": entry["title"],
-        "selected_because": "explicitly selected for this invocation"
-        if explicit
-        else "task/context relevance",
-        "excerpt": "",
-        "additional_content": True,
-        "reference": f"{entry['kind']}://{entry['id']}",
-        "retrieve": f"harness.get({entry['kind']!r}, {entry['id']!r}, global_={entry.get('owner_id') is None})",
-    }
-    end = prefix_end(body, lambda part: estimate({**record, "excerpt": part}, model) <= budget)
-    if not end and body:
-        return None
-    record.update(excerpt=body[:end], additional_content=end < len(body))
-    return record

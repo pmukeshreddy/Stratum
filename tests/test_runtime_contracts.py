@@ -7,12 +7,12 @@ import pytest
 
 from threadweave.coding_config import coding_options
 from threadweave.host_api import Request, dispatch
-from threadweave.models import Action, HarnessError, ModelResponse, StateEdit, Usage, new_id
+from threadweave.models import Action, HarnessError, ModelResponse, Usage, new_id
 from threadweave.runtime import Runtime
 from threadweave.storage import Store, encode
 from threadweave.tools import ToolContext
 
-from .conftest import eventually, response
+from .conftest import response
 from .fakes import ScriptedProvider
 
 
@@ -303,104 +303,6 @@ def seed(runtime, sid):
     return event
 
 
-@pytest.mark.parametrize(
-    "decision,expected", [(False, "skipped"), (True, "applied"), ("error", "failed")]
-)
-async def test_reviewer_gates_planner_with_broad_trajectory_and_audit(
-    tmp_path, config, decision, expected
-):
-    config.refinement.automatic = True
-    provider = ReviewingProvider(decision=decision)
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    try:
-        root = runtime.create("learn", tmp_path, config=config)
-        seed(runtime, root.id)
-        rid = runtime.request_refinement(root.id, source="test", trigger="completion")["request_id"]
-        await runtime.auto_refine(root.id)
-        result = runtime.store.refinement_request(root.id, rid)
-        assert result["status"] == expected
-        assert len(provider.requests) == (2 if decision is True else 1)
-        review = json.loads(provider.requests[0].messages[-1]["content"])
-        assert len(encode(review["trajectory"])) > 35000
-        assert "REASONING about discovery" in encode(review["trajectory"])
-        assert {
-            "existing_state",
-            "previous_refinements",
-            "state_overview",
-            "trigger",
-        } <= review.keys()
-        if decision is True:
-            planner = json.loads(provider.requests[1].messages[-1]["content"])
-            assert len(encode(planner["trajectory"])) > len(encode(review["trajectory"]))
-            assert planner["review"]["instructions"] == "retain the discovered constraint"
-            assert runtime.store.states(root.id)
-        else:
-            assert not runtime.store.states(root.id)
-        if decision != "error":
-            assert (
-                runtime.store.events(root.id, kind="refinement_review")[0]["payload"]["rationale"]
-                == "review rationale"
-            )
-    finally:
-        await runtime.shutdown()
-
-
-@pytest.mark.parametrize("same_entry", [True, False])
-async def test_host_baseline_conflicts_without_model_expected_version(tmp_path, config, same_entry):
-    entered, release = asyncio.Event(), asyncio.Event()
-    provider = ReviewingProvider(planner_gate=(entered, release))
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    try:
-        root = runtime.create("learn", tmp_path, config=config)
-        event = seed(runtime, root.id)
-        edit = StateEdit(
-            title="existing",
-            content={"text": "old"},
-            source_events=[event],
-            intended_effect="retain",
-        )
-        runtime.store.queue_refinement(root.id, edit)
-        entry = runtime.store.apply_refinements(root.id)[0]
-        provider.planner = lambda evidence: [
-            {
-                **edit.model_dump(),
-                "entry_id": entry,
-                "content": {"text": "planned"},
-                "expected_version": None,
-            }
-        ]
-        rid = runtime.request_refinement(root.id, source="test")["request_id"]
-        task = asyncio.create_task(runtime.auto_refine(root.id))
-        await asyncio.wait_for(entered.wait(), 5)
-        other = Store(tmp_path / "state")
-        try:
-            other.queue_refinement(
-                root.id,
-                edit.model_copy(
-                    update={
-                        "entry_id": entry if same_entry else None,
-                        "content": {"text": "concurrent"},
-                    }
-                ),
-            )
-            other.apply_refinements(root.id)
-        finally:
-            other.close()
-        release.set()
-        await task
-        assert runtime.store.state(root.id, entry)["content"]["text"] == (
-            "concurrent" if same_entry else "planned"
-        )
-        assert runtime.store.refinement_request(root.id, rid)["status"] == (
-            "conflicted" if same_entry else "applied"
-        )
-        if same_entry:
-            assert runtime.store.events(root.id, kind="refinement_conflict")
-    finally:
-        release.set()
-        await runtime.shutdown()
-
-
 async def test_child_completion_steers_active_parent_at_committed_boundary(tmp_path, config):
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -538,142 +440,15 @@ async def test_compaction_request_edges_and_committed_summaries(tmp_path, config
         edges = runtime.store.request_graph(root.id)["edges"]
         assert {
             "source": summary.request_id,
-            "target": provider.requests[-1].request_id,
+            "target": next(
+                r.request_id
+                for r in reversed(provider.requests)
+                if r.metadata.get("purpose", "agent") == "agent"
+            ),
             "kind": "compaction",
         } in edges
         assert any(r["role"] == "summary" for r in runtime.store.trajectory(root.id))
     finally:
-        await runtime.shutdown()
-
-
-async def test_planned_refinement_waits_for_owner_and_recovers_without_duplicate_apply(
-    tmp_path, config
-):
-    provider = ReviewingProvider()
-    data = tmp_path / "state"
-    runtime = Runtime(data, providers={"mock": provider})
-    blocker = asyncio.create_task(asyncio.Event().wait())
-    try:
-        root = runtime.create("learn", tmp_path, config=config, mode="interactive")
-        seed(runtime, root.id)
-        runtime.tasks[root.id] = blocker
-        rid = runtime.request_refinement(root.id, source="test")["request_id"]
-        await runtime.auto_refine(root.id)
-        assert runtime.store.refinement_request(root.id, rid)["status"] == "waiting_to_apply"
-        assert not runtime.store.states(root.id)
-        assert runtime.store.apply_refinements(root.id) == []
-        await runtime.shutdown()
-        runtime = Runtime(data, providers={"mock": provider})
-        await runtime.start()
-        await eventually(
-            lambda: runtime.store.refinement_request(root.id, rid)["status"] == "applied"
-        )
-        await eventually(lambda: root.id not in runtime.tasks)
-        entries = runtime.store.states(root.id)
-        assert len(entries) == 1 and entries[0]["version"] == 1
-        assert len(provider.requests) == 1
-        runtime.apply_pending_refinements(root.id)
-        assert runtime.store.states(root.id) == entries
-    finally:
-        blocker.cancel()
-        await runtime.shutdown()
-
-
-@pytest.mark.parametrize("phase", ["reviewing", "planning"])
-async def test_restart_interrupted_refinement_retains_baseline_without_mutation(
-    tmp_path, config, phase
-):
-    runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
-    try:
-        root = runtime.create("learn", tmp_path, config=config, mode="interactive")
-        rid = runtime.request_refinement(root.id, source="test")["request_id"]
-        runtime.store.db.execute(
-            "INSERT INTO refinement_runs VALUES(?,?,?,?)",
-            (rid, root.id, phase, encode({"baseline": {}, "trigger": "test"})),
-        )
-        runtime.store.refinement_request_result(root.id, rid, phase)
-        await runtime.shutdown()
-        runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
-        await runtime.start()
-        assert runtime.store.refinement_request(root.id, rid)["status"] == "failed"
-        assert runtime.store.refinement_request(root.id, rid)["uncertain"]
-        assert not runtime.store.states(root.id)
-        assert (
-            json.loads(
-                runtime.store.db.execute(
-                    "SELECT body FROM refinement_runs WHERE id=?", (rid,)
-                ).fetchone()[0]
-            )["baseline"]
-            == {}
-        )
-    finally:
-        await runtime.shutdown()
-
-
-async def test_atomic_batch_rolls_back_all_state_when_one_edit_fails(tmp_path, config):
-    runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
-    try:
-        root = runtime.create("learn", tmp_path, config=config)
-        event = seed(runtime, root.id)
-        for content in [{"text": "valid"}, {"text": ""}]:
-            runtime.store.queue_refinement(
-                root.id,
-                StateEdit(
-                    title="test",
-                    content=content,
-                    source_events=[event],
-                    intended_effect="test atomicity",
-                ),
-            )
-        assert runtime.store.apply_refinements(root.id) == []
-        assert runtime.store.states(root.id) == []
-        assert runtime.store.events(root.id, kind="refinement") == []
-    finally:
-        await runtime.shutdown()
-
-
-async def test_crash_during_atomic_apply_rolls_back_then_recovers_plan(tmp_path, config):
-    import sys
-
-    provider = ReviewingProvider()
-    data = tmp_path / "state"
-    runtime = Runtime(data, providers={"mock": provider})
-    blocker = asyncio.create_task(asyncio.Event().wait())
-    try:
-        root = runtime.create("learn", tmp_path, config=config, mode="interactive")
-        seed(runtime, root.id)
-        runtime.tasks[root.id] = blocker
-        rid = runtime.request_refinement(root.id, source="test")["request_id"]
-        await runtime.auto_refine(root.id)
-        assert runtime.store.refinement_request(root.id, rid)["status"] == "waiting_to_apply"
-        await runtime.shutdown()
-        script = """
-import os, sys
-from threadweave.runtime import Runtime
-runtime = Runtime(sys.argv[1])
-apply = runtime.store._apply_edit
-def crash(*args, **kwargs):
-    apply(*args, **kwargs)
-    os._exit(19)
-runtime.store._apply_edit = crash
-runtime.apply_pending_refinements(sys.argv[2])
-"""
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-c", script, str(data), root.id
-        )
-        assert await proc.wait() == 19
-        runtime = Runtime(data, providers={"mock": provider})
-        assert runtime.store.states(root.id) == []
-        assert runtime.store.refinement_request(root.id, rid)["status"] == "waiting_to_apply"
-        await runtime.start()
-        await eventually(
-            lambda: runtime.store.refinement_request(root.id, rid)["status"] == "applied"
-        )
-        assert runtime.store.states(root.id)[0]["version"] == 1
-        assert len(runtime.store.events(root.id, kind="refinement")) == 1
-        assert len(provider.requests) == 1
-    finally:
-        blocker.cancel()
         await runtime.shutdown()
 
 
@@ -728,38 +503,6 @@ async def test_chat_wire_retry_identity_is_durable_before_transmission(tmp_path,
         await runtime.shutdown()
 
 
-@pytest.mark.parametrize("operation", ["delete", "rollback"])
-async def test_stale_deletes_and_rollbacks_conflict_without_expected_version(
-    tmp_path, config, operation
-):
-    runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
-    try:
-        root = runtime.create("learn", tmp_path, config=config)
-        event = seed(runtime, root.id)
-        edit = StateEdit(
-            title="lesson", content={"text": "old"}, source_events=[event], intended_effect="learn"
-        )
-        runtime.store.queue_refinement(root.id, edit)
-        entry = runtime.store.apply_refinements(root.id)[0]
-        baseline = {entry: runtime.store.state(root.id, entry)}
-        runtime.store.queue_refinement(
-            root.id, edit.model_copy(update={"entry_id": entry, "content": {"text": "new"}})
-        )
-        runtime.store.apply_refinements(root.id)
-        runtime.store.queue_refinement(
-            root.id,
-            edit.model_copy(
-                update={"entry_id": entry, "operation": operation, "rollback_version": 1}
-            ),
-            baseline=baseline,
-        )
-        assert runtime.store.apply_refinements(root.id) == []
-        assert runtime.store.state(root.id, entry)["content"] == {"text": "new"}
-        assert runtime.store.events(root.id, kind="refinement_conflict")
-    finally:
-        await runtime.shutdown()
-
-
 async def test_shared_coding_child_preserves_original_baseline_after_parent_edits(
     tmp_path, repository, coding_config
 ):
@@ -785,30 +528,6 @@ async def test_shared_coding_child_preserves_original_baseline_after_parent_edit
         event = runtime.store.event(child.id, "test_verify", {})
         verification, error = await runtime._verify(child.id, event)
         assert not error and verification.passed
-    finally:
-        await runtime.shutdown()
-
-
-async def test_failed_review_can_be_retried_on_same_evidence_with_fresh_request(tmp_path, config):
-    config.refinement.automatic = True
-    provider = ReviewingProvider(decision="error")
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    try:
-        root = runtime.create("learn", tmp_path, config=config)
-        seed(runtime, root.id)
-        failed = runtime.request_refinement(root.id, source="test", trigger="completion")[
-            "request_id"
-        ]
-        await runtime.auto_refine(root.id)
-        assert runtime.store.refinement_request(root.id, failed)["status"] == "failed"
-        provider.decision = True
-        retry = runtime.request_refinement(root.id, source="retry", trigger="completion")[
-            "request_id"
-        ]
-        await runtime.auto_refine(root.id)
-        assert retry != failed
-        assert runtime.store.refinement_request(root.id, retry)["status"] == "applied"
-        assert len(runtime.store.states(root.id)) == 1
     finally:
         await runtime.shutdown()
 

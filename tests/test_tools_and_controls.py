@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from threadweave.models import HarnessError, Outcome, StateEdit
+from threadweave.models import HarnessError, Outcome
 from threadweave.runtime import LimitReached, Runtime
 from threadweave.tools import Empty, Tool, ToolContext
 
@@ -179,38 +179,6 @@ async def test_limited_partial_turn_can_fork_without_replaying_source_actions(
     assert (await runtime.wait(branch.id)).outcome == Outcome.COMPLETED
     assert runtime.store.session(root.id).outcome == Outcome.LIMITED
     assert runtime.store.usage(branch.id).python_executions == 1
-
-
-async def test_global_refinement_read_update_and_delete(runtime, tmp_path):
-    from .fakes import TestConfig as RunConfig
-
-    config = RunConfig(refinement={"allow_global_writes": True})
-    root = runtime.create("Global", tmp_path, config=config)
-    other = runtime.create("Consumer", tmp_path)
-    evidence = runtime.store.event(root.id, "observation", {})
-    edit = StateEdit(
-        kind="memory",
-        scope="global",
-        content={"text": "Reusable fact"},
-        source_events=[evidence],
-        intended_effect="Share across tasks",
-    )
-    runtime.store.queue_refinement(root.id, edit)
-    entry = runtime.store.apply_refinements(root.id)[0]
-    assert runtime.store.state(other.id, entry)["owner_id"] is None
-    other_event = runtime.store.event(other.id, "observation", {})
-    with pytest.raises(PermissionError):
-        runtime.store.queue_refinement(
-            other.id,
-            edit.model_copy(
-                update={
-                    "entry_id": entry,
-                    "scope": "session",
-                    "source_events": [other_event],
-                    "operation": "delete",
-                }
-            ),
-        )
 
 
 async def test_extension_tools_are_typed_and_registered_once(runtime, tmp_path):

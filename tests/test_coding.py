@@ -16,7 +16,6 @@ from threadweave.experiments import Experiments
 from threadweave.gitops import GitWorkspace, candidate_result, git
 from threadweave.guardrails import observe
 from threadweave.models import new_id
-from threadweave.refinement import validate_skill
 from threadweave.repository import RepositoryIndex, confined, symbols
 from threadweave.retrieval import search
 from threadweave.runtime import Runtime
@@ -427,21 +426,6 @@ async def test_fts_scope_refinement_validation_and_loop_guard(tmp_path, reposito
         )
         other = runtime.create("Other", repository, config=coding_config)
         assert not search(runtime.store, other.id, "negative operands")
-        with pytest.raises(ValueError):
-            validate_skill(
-                {"name": "bad", "description": "bad", "code": "if broken"},
-                coding_config.permissions,
-            )
-        with pytest.raises(ValueError):
-            validate_skill(
-                {
-                    "name": "bad",
-                    "description": "bad",
-                    "code": "import subprocess",
-                    "required_permissions": ["python"],
-                },
-                coding_config.permissions,
-            )
         for _ in range(3):
             assert not observe(runtime, session.id, "run_tests", {})
         assert runtime.store.events(session.id, kind="no_progress")

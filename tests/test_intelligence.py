@@ -3,67 +3,10 @@ import json
 import pytest
 
 from threadweave.configuration import doctor, load_config
-from threadweave.models import ModelResponse, RunConfig, StateEdit, Usage, new_id
-from threadweave.refinement import run_skill
+from threadweave.models import ModelResponse, RunConfig, Usage, new_id
 from threadweave.runtime import Runtime
 
-from .fakes import ScriptedProvider
 from .test_coding import setup_runtime
-
-
-async def test_automatic_refinement_uses_evidence_routing_and_versioned_validation(
-    tmp_path, repository, coding_config
-):
-    coding_config.refinement.automatic = True
-    coding_config.models = {
-        "fast": coding_config.provider.model_copy(update={"model": "fast-test"})
-    }
-    coding_config.routing.policy = "role_based"
-    coding_config.routing.roles = {"refinement": "fast"}
-    runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
-
-    class Refiner:
-        async def invoke(self, request, emit):
-            if request.metadata["purpose"] == "refinement_review":
-                assert request.config.model == "fast-test"
-                return ModelResponse(
-                    text=json.dumps(
-                        {"shouldRefine": True, "rationale": "Observed operator failure"}
-                    ),
-                    usage=Usage(input_tokens=50, output_tokens=40),
-                )
-            assert request.metadata["purpose"] == "refinement"
-            assert request.config.model == "fast-test"
-            evidence = json.loads(request.messages[-1]["content"])["evidence"]
-            proposal = {
-                "kind": "memory",
-                "title": "Arithmetic failure",
-                "content": {"text": "Subtraction was used in addition."},
-                "source_events": [evidence[-1]["id"]],
-                "intended_effect": "Check operator semantics",
-            }
-            invalid = {**proposal, "source_events": ["fabricated-event"]}
-            return ModelResponse(
-                text=json.dumps({"proposals": [proposal, invalid]}),
-                usage=Usage(input_tokens=50, output_tokens=40),
-            )
-
-    runtime.providers["test"] = Refiner()
-    try:
-        await runtime.auto_refine(session.id, trigger="completion")
-        states = runtime.store.states(session.id)
-        assert len(states) == 1 and states[0]["version"] == 1
-        assert states[0]["provenance"]["source_events"]
-        assert runtime.store.events(session.id, kind="refinement_rejected")
-        assert runtime.store.usage(session.id).model_calls == 2
-        assert runtime.store.usage(session.id).input_tokens == 100
-        assert not runtime.store.session(session.id).pending_turn
-        decision = runtime.store.events(session.id, kind="model_routing")[-1]["payload"]
-        assert decision["role"] == "refinement" and decision["alias"] == "fast"
-        await runtime.auto_refine(session.id, trigger="completion")
-        assert runtime.store.usage(session.id).model_calls == 2
-    finally:
-        await runtime.shutdown()
 
 
 async def test_model_compaction_records_provenance_and_preserves_full_events(
@@ -105,56 +48,6 @@ async def test_model_compaction_records_provenance_and_preserves_full_events(
         assert all(runtime.store.event_by_id(i) for i in ids)
         assert runtime.store.usage(session.id).model_calls == 2
         assert runtime.store.session(session.id).pending_turn is None
-    finally:
-        await runtime.shutdown()
-
-
-async def test_skills_inputs_outcomes_quarantine_and_rollback(tmp_path, repository, coding_config):
-    runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
-    try:
-        edit = StateEdit(
-            kind="skill",
-            title="A real executable procedure",
-            content={
-                "name": "double",
-                "description": "Double the input",
-                "inputs": {
-                    "type": "object",
-                    "properties": {"value": {"type": "integer"}},
-                    "required": ["value"],
-                },
-                "required_permissions": ["python"],
-                "code": "skill_inputs['value'] * 2",
-            },
-            source_events=[context.source_event],
-            intended_effect="Reuse validated computation",
-        )
-        runtime.store.queue_refinement(session.id, edit)
-        entry = runtime.store.apply_refinements(session.id)[0]
-        result = await run_skill(context, entry, {"value": 4})
-        assert result["value"] == "8"
-        with pytest.raises(ValueError):
-            await run_skill(context, entry, {"value": "not a number"})
-        broken = edit.model_copy(deep=True)
-        broken.entry_id = entry
-        broken.content["code"] = "raise ValueError('unsuitable procedure')"
-        runtime.store.queue_refinement(session.id, broken)
-        runtime.store.apply_refinements(session.id)
-        for _ in range(3):
-            context.action_id = new_id()
-            assert (await run_skill(context, entry, {"value": 4}))["error"]
-        with pytest.raises(ValueError, match="quarantined"):
-            await run_skill(context, entry, {"value": 4})
-        runtime.store.queue_refinement(
-            session.id,
-            edit.model_copy(
-                update={"entry_id": entry, "operation": "rollback", "rollback_version": 1}
-            ),
-        )
-        runtime.store.apply_refinements(session.id)
-        context.action_id = new_id()
-        assert (await run_skill(context, entry, {"value": 5}))["value"] == "10"
-        assert runtime.store.state(session.id, entry)["version"] == 3
     finally:
         await runtime.shutdown()
 
@@ -221,23 +114,3 @@ def test_config_environment_resolution_doctor_and_no_secret_printing(tmp_path, m
     assert report["providers"][0]["credential_present"]
     assert "never-log-this-secret" not in json.dumps(report)
     assert report["capabilities"]["git"]
-
-
-async def test_explicit_refinement_request_runs_at_boundary_without_periodic_policy(
-    tmp_path, repository, coding_config
-):
-    runtime, session, context = await setup_runtime(tmp_path, repository, coding_config)
-    runtime.providers["test"] = ScriptedProvider(
-        {"root": [ModelResponse(text='{"proposals": []}')]}
-    )
-    try:
-        runtime.message(None, session.id, "/refine")
-        assert runtime.store.usage(session.id).model_calls == 0
-        await runtime.auto_refine(session.id)
-        assert runtime.store.usage(session.id).model_calls == 1
-        assert (
-            runtime.store.events(session.id, kind="manual_refinement")[-1]["payload"]["trigger"]
-            == "manual"
-        )
-    finally:
-        await runtime.shutdown()

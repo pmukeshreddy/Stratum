@@ -14,7 +14,6 @@ from threadweave.context import python_instructions
 from threadweave.evals.runtime_upgrade import evaluate
 from threadweave.kernel import Kernel
 from threadweave.models import Action, ModelResponse, Outcome, RunConfig, new_id
-from threadweave.refinement_evidence import prefilter
 from threadweave.runtime import Runtime
 from threadweave.tools import ToolContext
 
@@ -45,7 +44,7 @@ def test_repl_is_the_operating_doctrine():
         "execution is optional",
     ):
         assert forbidden not in text
-    assert config.refinement.automatic and not config.task.verify_each_turn
+    assert config.refinement.enabled and not config.task.verify_each_turn
     assert "tool_choice" not in config.provider.parameters
 
 
@@ -255,65 +254,6 @@ class RecursiveLearningProvider:
         )
 
 
-async def test_recursive_evidence_refinement_activation_and_later_turn(tmp_path):
-    provider = RecursiveLearningProvider()
-    config = RunConfig(
-        provider={"name": "mock", "model": "deterministic", "max_output_tokens": 128},
-        features={"model_compaction": False},
-        limits={"wall_seconds": 300},
-    )
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    try:
-        root = runtime.create(
-            "Investigate a reusable subtotal debugging strategy", tmp_path, config=config
-        )
-        await runtime._run_turn(root.id)
-        child = next(s for s in runtime.store.sessions() if s.parent_id == root.id)
-        await runtime._run_turn(child.id)
-        await runtime._run_turn(child.id)
-        runtime.receive(root.id)
-        await runtime.auto_refine(root.id, trigger="child_findings")
-        assert runtime.store.events(root.id, kind="refinement_activated")
-        await runtime._run_turn(root.id)
-        assert runtime.store.events(root.id, kind="refinement_later_consumed")
-        assert runtime.store.events(child.id, kind="python_result")
-        assert runtime.store.events(root.id, kind="execution_input_consumed")[-1]["payload"][
-            "child_evidence"
-        ]
-        assert not runtime.store.events(root.id, kind="python_error")
-    finally:
-        await runtime.shutdown()
-
-
-async def test_prefilter_rejects_duplicates_but_admits_successful_discovery(tmp_path):
-    runtime = Runtime(tmp_path / "state", providers={"mock": RecursiveLearningProvider()})
-    try:
-        root = runtime.create(
-            "Inspect",
-            tmp_path,
-            config=RunConfig(provider={"name": "mock", "model": "deterministic"}),
-        )
-        for _ in range(2):
-            source = runtime.store.event(
-                root.id,
-                "python_execution",
-                {"code": "data = {'answer':42}\nassert data['answer']==42"},
-            )
-            runtime.store.event(
-                root.id,
-                "python_result",
-                {"result": {"stdout": "Confirmed independent parse strategy", "error": None}},
-                parent=source,
-            )
-        source = runtime.store.event(root.id, "python_execution", {"code": "print(1)"})
-        runtime.store.event(root.id, "python_result", {"result": {"stdout": "1\n"}}, parent=source)
-        assert len(prefilter(runtime, root.id)) == 1
-        assert len(runtime.store.events(root.id, kind="refinement_prefilter_reject")) == 2
-        assert prefilter(runtime, root.id) == []
-    finally:
-        await runtime.shutdown()
-
-
 async def test_l1_tree_compaction_and_recovery(tmp_path):
     config = RunConfig(
         provider={"name": "mock", "model": "deterministic", "max_output_tokens": 128},
@@ -365,7 +305,7 @@ async def test_l1_tree_compaction_and_recovery(tmp_path):
 
 async def test_verification_levels_and_no_repeated_full_gate(tmp_path, repository, coding_config):
     coding_config.control_plane = "python"
-    coding_config.refinement.automatic = False
+    coding_config.refinement.enabled = False
     coding_config.verification.targeted_commands = [
         [sys.executable, "-m", "pytest", "-q", "tests/test_mathops.py"]
     ]
@@ -439,8 +379,7 @@ async def test_real_oversized_string_survives_old_16mib_boundary(tmp_path):
         await worker.close()
 
 
-async def test_child_inherits_selected_version_and_followup_preserves_kernel(tmp_path):
-    from threadweave.models import StateEdit
+async def test_child_reads_global_harness_and_followup_preserves_kernel(tmp_path):
 
     runtime = Runtime(tmp_path / "state", providers={"mock": RecursiveLearningProvider()})
     try:
@@ -449,24 +388,12 @@ async def test_child_inherits_selected_version_and_followup_preserves_kernel(tmp
             tmp_path,
             config=RunConfig(provider={"name": "mock", "model": "deterministic"}),
         )
+        from .test_continual_harness import edit, proposal
+
         source = runtime.store.events(root.id)[0]["id"]
-        entry = runtime.store._apply_edit(
-            root.id,
-            StateEdit(
-                kind="memory",
-                title="Repository workflow",
-                content={"text": "Run focused tests in the project interpreter."},
-                source_events=[source],
-                intended_effect="Reuse workflow",
-                select=True,
-            ),
-            source,
-        )
+        runtime.store.harness.apply(root.id, proposal(edit()), id="global", global_=True)
         child = runtime.spawn(root.id, "Check independent behavior", name="worker")
-        assert (
-            runtime.store.states(child.id)[0]["content"]
-            == runtime.store.state(root.id, entry)["content"]
-        )
+        assert runtime.store.harness.entries(child.id) == runtime.store.harness.entries(root.id)
         ctx = ToolContext(runtime, child.id, new_id(), source)
         await runtime.execute_python(ctx, "marker = 17")
         runtime.store.finish(child.id, Outcome.COMPLETED, "Checked")
@@ -514,44 +441,6 @@ async def test_targeted_pytest_preserves_option_operands(tmp_path, repository, c
         await runtime.shutdown()
 
 
-def test_refinement_budget_applies_per_event_not_per_nested_field(tmp_path):
-    from types import SimpleNamespace
-
-    from threadweave.context import token_bound
-    from threadweave.refinement_evidence import bounded_evidence
-
-    config = RunConfig(provider={"model": "gpt-6-astra"})
-    archives = []
-
-    class Archive:
-        def put(self, sid, value):
-            archives.append(value)
-            return "a" * 32
-
-    runtime = SimpleNamespace(
-        store=SimpleNamespace(config=lambda sid: config, event=lambda *a, **k: None),
-        artifacts=Archive(),
-    )
-    value = {
-        "original_task": {
-            "messages": [{"role": "user", "content": "Verify both independent components"}]
-        },
-        "trajectory": [
-            {
-                "id": str(i),
-                "type": "tool_result",
-                "payload": {str(j): {"logs": ["pending " * 300] * 10} for j in range(40)},
-            }
-            for i in range(12)
-        ],
-    }
-    result = bounded_evidence(runtime, "root", value, 3000)
-    assert token_bound(result, "gpt-6-astra") <= 3000
-    assert result["original_task"] == value["original_task"]
-    assert result["complete_evidence_artifact"] == "a" * 32 and archives == [value]
-    assert all("id" in r and "complete_record_artifact" in r for r in result["trajectory"])
-
-
 async def test_full_gate_waits_for_pending_child_evidence(tmp_path):
     class Finish:
         async def invoke(self, request, emit):
@@ -565,7 +454,7 @@ async def test_full_gate_waits_for_pending_child_evidence(tmp_path):
             "verifier_options": {"path": "answer.txt", "equals": "42"},
             "require_verifier": True,
         },
-        refinement={"automatic": False},
+        refinement={"enabled": False},
     )
     runtime = Runtime(tmp_path / "state", providers={"mock": Finish()})
     try:
@@ -591,7 +480,7 @@ async def test_durable_repl_tree_compacts_without_auxiliary_inference(tmp_path):
     config = RunConfig(
         provider={"name": "mock", "model": "gpt-6-astra", "max_output_tokens": 128},
         context={"max_tokens": 12000, "recent_blocks": 1},
-        refinement={"automatic": False},
+        refinement={"enabled": False},
     )
     runtime = Runtime(tmp_path / "state", providers={"mock": NoInference()})
     try:
@@ -631,7 +520,7 @@ async def test_compacted_work_resolution_is_authoritative(tmp_path):
             "Preserve unresolved work, retire completed branches",
             tmp_path,
             config=RunConfig(
-                provider={"name": "mock", "model": "deterministic"}, refinement={"automatic": False}
+                provider={"name": "mock", "model": "deterministic"}, refinement={"enabled": False}
             ),
         )
         child = runtime.spawn(root.id, "Inspect an independent requirement")

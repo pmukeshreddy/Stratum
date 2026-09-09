@@ -31,7 +31,7 @@ async def test_live_persistent_python_restore_and_recursive_child(tmp_path):
         },
         limits={"wall_seconds": 900, "token_budget": 500000, "max_subagents": 2},
     )
-    config.refinement.automatic = False
+    config.refinement.enabled = False
     runtime = Runtime(directory / "state")
     report = {
         "platform": platform.platform(),

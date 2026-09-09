@@ -142,51 +142,6 @@ def test_compaction_reference_cannot_embed_retained_conversation(tmp_path, confi
         assert "artifacts.load" in summary
 
 
-async def test_periodic_checkpoint_reviews_routine_work_before_deciding_to_refine(tmp_path, config):
-    config.refinement.automatic = True
-    config.refinement.every_turns = 20
-    provider = ScriptedProvider(
-        {
-            "root": [
-                ModelResponse(
-                    text='{"shouldRefine": false, "rationale": "Routine work has no reusable lesson"}'
-                )
-            ]
-        }
-    )
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    root = runtime.create("Inspect evidence", tmp_path, config=config)
-    try:
-        runtime.store.update(root.id, turns=20)
-        runtime.store.event(
-            root.id, "python_result", {"stdout": "Routine observation: 12", "error": None}
-        )
-        await runtime.auto_refine(root.id)
-        assert len(provider.requests) == 1
-        assert provider.requests[0].metadata["purpose"] == "refinement_review"
-        assert runtime.store.states(root.id) == []
-    finally:
-        await runtime.shutdown()
-
-
-async def test_automatic_refinement_preserves_time_for_next_agent_action(tmp_path, config):
-    config.refinement.automatic = True
-    provider = ScriptedProvider({"root": [ModelResponse(text='{"proposals":[]}')]})
-    runtime = Runtime(tmp_path / "state", providers={"mock": provider})
-    root = runtime.create("Inspect evidence", tmp_path, config=config)
-    try:
-        runtime.store.update(root.id, started_at=now() - 29, runnable=True)
-        runtime.store.event(
-            root.id, "experiment_conclusion", {"conclusion": "New reusable evidence."}
-        )
-        await runtime.auto_refine(root.id)
-        assert provider.requests == []
-        assert runtime.store.session(root.id).runnable
-        assert runtime.store.events(root.id, kind="auxiliary_deferred")
-    finally:
-        await runtime.shutdown()
-
-
 def test_reported_occupancy_anchor_restores_and_preserves_opaque_state(tmp_path, config):
     from threadweave.request_context import record_usage
     from threadweave.subscription import responses_input
@@ -335,7 +290,7 @@ async def test_late_compaction_keeps_fitting_evidence_but_enforces_capacity(
     config.context.max_tokens = 10000
     config.context.recent_blocks = 1
     config.limits.wall_seconds = 300
-    config.refinement.automatic = False
+    config.refinement.enabled = False
     responses = [ModelResponse(text="Verified conclusion.")]
     if needs_compaction:
         responses.insert(

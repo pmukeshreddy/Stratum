@@ -73,51 +73,14 @@ class Harness:
     def list(self, kind=None, *, global_=False):
         return [Record(e) for e in self.host.call("harness.list", kind=kind, global_=global_)]
 
-    def get(self, kind, id, *, global_=False, version=None):
-        value = self.host.call("harness.get", kind=kind, id=id, global_=global_, version=version)
+    def get(self, kind, id, *, global_=False):
+        value = self.host.call("harness.get", kind=kind, id=id, global_=global_)
         if value is None:
             raise KeyError(f"Harness entry not found: {kind}/{id}")
         return Record(value)
 
-    def create(self, kind, title, content, **options):
-        return Record(
-            self.host.call("harness.create", kind=kind, title=title, content=content, **options)
-        )
-
-    def update(self, kind, id, title, content, **options):
-        return Record(
-            self.host.call(
-                "harness.update", kind=kind, id=id, title=title, content=content, **options
-            )
-        )
-
-    def delete(self, kind, id, **options):
-        return Record(self.host.call("harness.delete", kind=kind, id=id, **options))
-
-    def rollback(self, kind, id, version, **options):
-        return Record(
-            self.host.call("harness.rollback", kind=kind, id=id, version=version, **options)
-        )
-
-    def select(self, ids):
-        return Record(self.host.bridge.call("state_select", entry_ids=ids))
-
-    def __getattr__(self, name):
-        # Explicit category CRUD shares validation/provenance, not arbitrary host dispatch.
-        operation, _, category = name.partition("_")
-        kinds = {
-            "memory": "memory",
-            "prompt_note": "prompt",
-            "skill": "skill",
-            "subagent": "subagent",
-        }
-        if operation in {"create", "update", "delete"} and category in kinds:
-
-            def method(*args, **kwargs):
-                return getattr(self, operation)(kinds[category], *args, **kwargs)
-
-            return method
-        raise AttributeError(name)
+    def overview(self):
+        return self.host.call("harness.overview")
 
 
 class Recursive:
@@ -134,7 +97,6 @@ class Recursive:
         purpose="shared",
         isolate=None,
         adapter=None,
-        spec_id=None,
         requirement=None,
     ):
         if not isinstance(prompt, str) or not prompt.strip() or args:
@@ -147,12 +109,14 @@ class Recursive:
             purpose=purpose,
             isolate=isolate,
             adapter=adapter,
-            spec_id=spec_id,
             requirement=requirement,
         )
 
+    def get_harness_state(self):
+        return self.harness.overview()
+
     def help(self):
-        return 'await rlm("assignment", name="child") returns a persistent handle at admission. Put prose in the prompt or requirement. Optional purpose selects a registered child workspace/capability profile (default shared), not a description. Optional spec_id applies a subagent specification. await agents.wait(seconds=30) returns a receipt immediately and defers the next model turn; end the cell afterward. agent_message sends/receives messages; agent_observe reads child trajectories.'
+        return 'await rlm("assignment", name="child") returns a persistent handle at admission. Put prose in the prompt or requirement. Optional purpose selects a registered child workspace/capability profile (default shared), not a description. await agents.wait(seconds=30) returns a receipt immediately and defers the next model turn; end the cell afterward. agent_message sends/receives messages; agent_observe reads child trajectories.'
 
     def __repr__(self):
         return self.help()
@@ -167,7 +131,6 @@ class Recursive:
         purpose="shared",
         isolate=None,
         adapter=None,
-        spec_id=None,
         requirement=None,
     ):
         result = await self.host.acall(
@@ -179,7 +142,6 @@ class Recursive:
             purpose=purpose,
             isolate=isolate,
             adapter=adapter,
-            spec_id=spec_id,
             requirement=requirement,
         )
         return AgentHandle(**result)
@@ -504,35 +466,6 @@ class Skills:
             return module
         return Record(entry)
 
-    async def run(self, name, **inputs):
-        # Preparation checks permissions/schema/quarantine and returns code, never
-        # recursively enters the worker while this cell already owns it.
-        ticket = await self.host.acall("skills.prepare", name=name, inputs=inputs)
-        passed = False
-        try:
-            if ticket.get("import_name"):
-                module = self.load(name)
-                result = module.run(**inputs)
-                if inspect.isawaitable(result):
-                    result = await result
-            else:
-                import ast
-
-                self.values["skill_inputs"] = inputs
-                result = eval(
-                    compile(
-                        ticket["code"], "<skill>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
-                    ),
-                    self.values,
-                )
-                if inspect.isawaitable(result):
-                    await result
-                result = self.values.get("skill_result")
-            passed = True
-            return result
-        finally:
-            await self.host.acall("skills.outcome", ticket=ticket["ticket"], passed=passed)
-
 
 def bootstrap(bridge, values, metadata):
     """Construct namespaces once per kernel; restore user values only afterwards."""
@@ -618,14 +551,27 @@ def bootstrap(bridge, values, metadata):
         values["repl_state"].force = "l1_compaction"
         return result
 
-    async def refine():
-        return await host.acall("harness.refine")
+    class Refine:
+        async def status(self):
+            return await host.acall("refine.status")
+
+        async def run(self, instructions=None, global_=False):
+            if instructions is not None and not isinstance(instructions, str):
+                raise TypeError("instructions must be str or None")
+            if not isinstance(global_, bool):
+                raise TypeError("global_ must be bool")
+            payload = {}
+            if instructions is not None:
+                payload["instructions"] = instructions
+            if global_:
+                payload["global_"] = True
+            return await host.acall("refine.run", **payload)
 
     async def heartbeat(**options):
         return await bridge.acall("schedule_turn", **options)
 
-    values.update(compact=compact, refine=refine, heartbeat=heartbeat)
-    compact.run, refine.run, heartbeat.run = compact, refine, heartbeat
+    values.update(compact=compact, refine=Refine(), heartbeat=heartbeat)
+    compact.run, heartbeat.run = compact, heartbeat
     # Python skill packages are imported and callable in every session. Failures
     # become inspectable placeholders, never silently disappear.
     from .skills import UnavailableSkill, load_module

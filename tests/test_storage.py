@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 from pydantic import ValidationError
 
-from threadweave.models import Lifecycle, StateEdit, Usage, Workspace
+from threadweave.models import Lifecycle, Usage, Workspace
 from threadweave.storage import Store
 
 from .fakes import TestConfig as RunConfig
@@ -85,84 +85,6 @@ def test_recursive_usage_includes_all_descendants(tmp_path):
     assert total.python_executions == 1 and total.tool_calls == 2
     assert total.cost == 0.1 and total.wall_seconds == 2
     assert total == store.usage(child.id, tree=True)
-    store.close()
-
-
-def test_refinement_versioning_delete_rollback_and_conflict(tmp_path):
-    store = Store(tmp_path / "db")
-    root = make(store, tmp_path)
-    evidence = store.event(root.id, "observation", {"temperature": 20})
-    edit = StateEdit(
-        title="Observation",
-        content={"text": "20 C"},
-        source_events=[evidence],
-        intended_effect="Retain measured temperature",
-        select=True,
-    )
-    store.queue_refinement(root.id, edit)
-    assert store.states(root.id) == []
-    entry_id = store.apply_refinements(root.id)[0]
-    assert store.state(root.id, entry_id)["version"] == 1
-    assert entry_id in store.session(root.id).selected_state
-    store.queue_refinement(
-        root.id,
-        edit.model_copy(
-            update={"entry_id": entry_id, "content": {"text": "22 C"}, "expected_version": 1}
-        ),
-    )
-    store.apply_refinements(root.id)
-    assert store.state(root.id, entry_id)["content"]["text"] == "22 C"
-    assert store.state(root.id, entry_id, 1)["content"]["text"] == "20 C"
-    store.queue_refinement(
-        root.id, edit.model_copy(update={"entry_id": entry_id, "expected_version": 1})
-    )
-    assert store.apply_refinements(root.id) == []
-    assert store.state(root.id, entry_id)["version"] == 2
-    store.queue_refinement(
-        root.id, edit.model_copy(update={"entry_id": entry_id, "operation": "delete"})
-    )
-    store.apply_refinements(root.id)
-    assert store.states(root.id) == []
-    store.queue_refinement(
-        root.id,
-        edit.model_copy(
-            update={"entry_id": entry_id, "operation": "rollback", "rollback_version": 1}
-        ),
-    )
-    store.apply_refinements(root.id)
-    recovered = store.state(root.id, entry_id)
-    assert recovered["version"] == 4 and not recovered["deleted"]
-    assert recovered["content"]["text"] == "20 C"
-    assert recovered["provenance"]["rollback_version"] == 1
-    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
-        store.db.execute("DELETE FROM state_versions")
-    store.close()
-
-
-@pytest.mark.parametrize(
-    "kind,content",
-    [
-        ("memory", {"text": "A fact"}),
-        ("prompt_note", {"text": "Check evidence"}),
-        ("skill", {"name": "answer", "description": "Compute answer", "code": "answer = 42"}),
-        ("subagent_spec", {"instruction": "Review artifacts"}),
-    ],
-)
-def test_typed_state_scope_provenance_and_global_permission(tmp_path, kind, content):
-    store = Store(tmp_path / "db")
-    root = make(store, tmp_path)
-    other = make(store, tmp_path)
-    event = store.event(root.id, "evidence", {})
-    edit = StateEdit(kind=kind, content=content, source_events=[event], intended_effect="Reuse")
-    store.queue_refinement(root.id, edit)
-    eid = store.apply_refinements(root.id)[0]
-    with pytest.raises(KeyError):
-        store.state(other.id, eid)
-    with pytest.raises(PermissionError):
-        store.queue_refinement(root.id, edit.model_copy(update={"scope": "global"}))
-    with pytest.raises(PermissionError):
-        store.queue_refinement(other.id, edit)
-    assert store.state(root.id, eid)["provenance"]["source_events"] == [event]
     store.close()
 
 

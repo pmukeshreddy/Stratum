@@ -83,11 +83,10 @@ def profile(directory):
         for e in events.values():
             if e["type"] in {
                 "completion_attempt",
-                "refinement_scheduled",
-                "automatic_refinement",
+                "refine_scheduled",
                 "refinement_review",
-                "refinement",
-                "refinement_budget_exhausted",
+                "refine_complete",
+                "refine_failed",
                 "refinement_continuation",
                 "completion_deferred",
                 "context_compaction",
@@ -136,7 +135,7 @@ def profile(directory):
                     "agent_message_received",
                     "child_evidence_used",
                     "refinement_budget_exhausted",
-                    "refinement_scheduled",
+                    "refine_scheduled",
                 )
             },
             "calls": calls,

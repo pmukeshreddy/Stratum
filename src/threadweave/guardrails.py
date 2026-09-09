@@ -15,7 +15,7 @@ def state_fingerprint(runtime, sid):
         # Receipts change every execution even when computation made no progress.
         state["repl"] = {k: data.get(k) for k in ("values", "recipes", "missing")}
     state["messages"] = [m["id"] for m in store.messages(sid, limit=20)]
-    state["entries"] = [(e["id"], e["version"]) for e in store.states(sid)]
+    state["entries"] = [(e["id"], e["version"]) for e in store.harness.entries(sid)]
     if store.config(sid).task.adapter == "coding":
         row = store.db.execute(
             "SELECT state_id FROM mutation_workspaces WHERE path=?", (session.workspace.path,)

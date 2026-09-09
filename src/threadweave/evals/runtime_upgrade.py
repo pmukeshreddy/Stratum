@@ -130,7 +130,7 @@ async def evaluate(directory, *, model="", names=None):
                 "parameters": {"reasoning_effort": "medium"},
             },
             context={"max_tokens": 24000, "summary_tokens": 2500},
-            refinement={"evaluation_isolation": True},
+            refinement={"enabled": True},
             task={
                 "adapter": "coding",
                 "capture_baseline": False,

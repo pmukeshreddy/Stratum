@@ -9,7 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .models import HarnessError, Record, StateEdit
+from .models import HarnessError, Record
 
 
 @dataclass
@@ -264,22 +264,15 @@ class HistoryArgs(Record):
     kind: str | None = None
 
 
-class StateReadArgs(Record):
-    entry_id: str
-    version: int | None = Field(default=None, ge=1)
-
-
-class StateSelectArgs(Record):
-    entry_ids: list[str] = Field(max_length=50)
+class HarnessGetArgs(Record):
+    kind: str
+    id: str
+    global_: bool = False
 
 
 class RefineArgs(Record):
-    edit: StateEdit
-
-
-class SkillArgs(Record):
-    entry_id: str
-    inputs: dict = Field(default_factory=dict)
+    instructions: str | None = None
+    global_: bool = False
 
 
 class ScheduleArgs(Record):
@@ -402,43 +395,13 @@ def builtins() -> ToolRegistry:
         return c.runtime.store.events(sid, after=a.after, limit=a.limit, kind=a.kind)
 
     async def states(c, a):
-        return [
-            {k: e[k] for k in ("id", "kind", "title", "version", "owner_id")}
-            for e in c.runtime.store.states(c.session_id)
-        ]
+        return c.runtime.store.harness.entries(c.session_id)
 
-    async def state_read(c, a):
-        entry = c.runtime.store.state(c.session_id, a.entry_id, a.version)
-        if entry["kind"] == "skill":
-            rows = c.runtime.store.db.execute(
-                "SELECT passed FROM skill_outcomes WHERE entry_id=? AND version=? ORDER BY rowid DESC",
-                (a.entry_id, entry["version"]),
-            ).fetchall()
-            cap = c.runtime.store.config(c.session_id).refinement.skill_failure_limit
-            entry["statistics"] = {
-                "successes": sum(row[0] for row in rows),
-                "failures": sum(not row[0] for row in rows),
-                "quarantined": len(rows) >= cap and not any(row[0] for row in rows[:cap]),
-            }
-        return entry
-
-    async def select(c, a):
-        for eid in a.entry_ids:
-            c.runtime.store.state(c.session_id, eid)
-        c.runtime.store.update(c.session_id, selected_state=a.entry_ids)
-        c.runtime.store.event(c.session_id, "state_selected", a.model_dump(), parent=c.source_event)
-        return {"selected": a.entry_ids}
+    async def harness_get(c, a):
+        return c.runtime.store.harness.get(c.session_id, **a.model_dump())
 
     async def refine(c, a):
-        return {
-            "refinement_id": c.runtime.store.queue_refinement(c.session_id, a.edit),
-            "applies": "next turn boundary",
-        }
-
-    async def skill(c, a):
-        from .refinement import run_skill
-
-        return await run_skill(c, a.entry_id, a.inputs)
+        return c.runtime.request_refinement(c.session_id, **a.model_dump())
 
     async def schedule(c, a):
         return {"schedule_id": c.runtime.schedule(c.session_id, **a.model_dump())}
@@ -555,41 +518,20 @@ def builtins() -> ToolRegistry:
         HistoryArgs,
         history,
     )
+    add("harness_list", "Inspect merged continual harness entries.", Empty, states, ("state",))
     add(
-        "state_list",
-        "List available persistent state metadata without injecting all content.",
-        Empty,
-        states,
-        ("state",),
-    )
-    add(
-        "state_read",
-        "Read a persistent entry or historical version.",
-        StateReadArgs,
-        state_read,
-        ("state",),
-    )
-    add(
-        "state_select",
-        "Select entries for bounded supplemental context at the next turn.",
-        StateSelectArgs,
-        select,
+        "harness_get",
+        "Inspect a full local or global harness entry.",
+        HarnessGetArgs,
+        harness_get,
         ("state",),
     )
     add(
         "refine",
-        "Queue a versioned state edit with trajectory evidence for the next turn boundary.",
+        "Schedule local refinement at the turn boundary; global scope is explicit.",
         RefineArgs,
         refine,
         ("state",),
-    )
-    add(
-        "skill_run",
-        "Execute a stored skill in the session's Python worker.",
-        SkillArgs,
-        skill,
-        ("state", "python"),
-        False,
     )
     add(
         "schedule_turn",
@@ -604,11 +546,4 @@ def builtins() -> ToolRegistry:
 
     register_programmatic(registry)
     add("history_get", "Retrieve a durable event by ID.", HistoryArgs, history)
-    add(
-        "skill_inspect",
-        "Read an executable skill and its version/provenance.",
-        StateReadArgs,
-        state_read,
-        ("state",),
-    )
     return registry

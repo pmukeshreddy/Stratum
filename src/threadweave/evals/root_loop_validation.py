@@ -28,8 +28,6 @@ def validation_config():
     config.provider.max_output_tokens = 32768
     config.provider.timeout_seconds = 300
     config.limits.wall_seconds = 300
-    config.refinement.reasoning = "inherit"
-    config.refinement.completion_followup = True
     # Read-only audits and data tasks do not require source edits or repository test suites.
     update_coding_options(
         config.task, capture_baseline=False, require_tests=False, require_change=False

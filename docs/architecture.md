@@ -94,25 +94,29 @@ work; a service manager or opening the CLI restarts the daemon after reboot.
 
 ## Daemon ↔ Continual Harness
 
-storage.Store and refinement.MemoryServices implement the existing Continual
-Harness: append-only history and typed, versioned memories, executable skills,
-prompt notes and reusable subagent specifications.
+The continual harness uses `harness_state.json` as its only active learned state,
+with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
+`DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
+Each scope appends refinement records to `refinements.jsonl`. Existing SQLite
+learned state is imported once; old tables have no runtime readers or writers.
 
-`harness.create_memory/create_prompt_note/create_skill/create_subagent`, get/list,
-update/delete/rollback provide immediate daemon-transactional CRUD within a Python
-cell. The cell is the provenance source; selected prompt changes apply at the next
-invocation. The optional `tools.call('refine', edit=...)` queues operations with
-source events, intended effect and optional expected_version. Runtime applies them
-at turn boundaries. Deletion and rollback append versions, never overwrite history.
-Entries have session-local or explicitly permitted global scope. `skills.list/load/run`
-and `harness.select` expose retrieval/execution/selection without another model tool surface.
+`await refine.run()` schedules local refinement; optional instructions focus the
+planner, and `global_=True` explicitly requests global changes. `await refine.status()`
+returns `pending` and `in_flight`. Application runs at a completed-turn boundary,
+then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
+before it continues. Zero-edit proposals produce no update notice. Automatic review
+is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
+findings are ordinary trajectory evidence, not separate refinement triggers.
 
-Compact state/skill menus enter supplemental L1; complete contents require selection
-or retrieval. Skills validate syntax/input schemas/
-declared permissions, record outcomes and quarantine repeatedly failing versions.
-This is not a sandbox. Automatic refinement optionally proposes evidence-backed
-state at configured boundaries. Auxiliary calls use the same provider retry,
-reservation and accounting path. Foundational policy/model weights are unchanged.
+A compact merged digest enters context at session start, resume, compaction, and
+stale-state detection. Unchanged digests are deduplicated. The base system prompt
+stays unchanged after learning. Colliding global/local IDs remain visible with
+scope labels; local guidance can override global guidance within the session.
+Skills reference existing Python callables and their argument contracts; reusable
+subagent specifications execute through native `rlm` delegation.
+
+See [the source/test parity matrix](continual-harness-parity.md) and
+[the deterministic session trace](continual-harness-trace.json).
 
 ## L1 / L2 / L3
 

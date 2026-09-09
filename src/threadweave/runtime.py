@@ -36,7 +36,7 @@ from .models import (
     now,
 )
 from .providers import default_providers
-from .refinement import MemoryServices
+from .refinement import RefinementServices
 from .routing import route
 from .skills import discover
 from .storage import Store, encode
@@ -63,7 +63,7 @@ class BudgetBusy(Exception):
     """Another invocation temporarily owns a reservation that may be released."""
 
 
-class Runtime(MemoryServices):
+class Runtime(RefinementServices):
     def __init__(
         self,
         directory: str | Path,
@@ -99,9 +99,9 @@ class Runtime(MemoryServices):
         self._closing = False
         self._extensions: set[str] = set()
         self._python_parent: dict[str, str] = {}
-        self.store.refinement_guard = self.refinement_boundary
         self._transitioning = set()
-        self._active_refinements = {}
+        self._refinement_states = {}
+        self.context.on_compact = self.refinement_compacted
         from .verification import VerificationScheduler
 
         self.verification = VerificationScheduler(self)
@@ -282,11 +282,6 @@ class Runtime(MemoryServices):
         }
         if config.control_plane == "python":
             instruction += "\nDelegation context: " + encode(package)
-        config.refinement.selected_entries = [
-            eid
-            for eid in parent.selected_state
-            if self.store.state(parent_id, eid)["owner_id"] is None
-        ]
         session = self.store.create(
             instruction,
             workspace,
@@ -322,37 +317,6 @@ class Runtime(MemoryServices):
         if _defer_workspace:
             self.store.update(session.id, paused=True, runnable=False)
         self.store.event(session.id, "child_context_package", package)
-        # Copy selected task-local refinements into the child's private version store.
-        # This preserves the parent's identity/version as lineage, without granting writes back.
-        from .models import StateEdit
-
-        selected = list(session.selected_state)
-        for entry_id in parent.selected_state:
-            entry = self.store.state(parent.id, entry_id)
-            if entry["owner_id"] is None or entry["deleted"]:
-                continue
-            source = self.store.event(
-                session.id,
-                "child_harness_inherited",
-                {
-                    "parent_entry_id": entry_id,
-                    "parent_version": entry["version"],
-                    "parent_session": parent.id,
-                },
-            )
-            copied = self.store._apply_edit(
-                session.id,
-                StateEdit(
-                    kind=entry["kind"],
-                    title=entry["title"],
-                    content=entry["content"],
-                    source_events=[source],
-                    intended_effect=f"Inherited {entry_id} version {entry['version']}",
-                ),
-                source,
-            )
-            selected.append(copied)
-        self.store.update(session.id, selected_state=list(dict.fromkeys(selected)))
         self._wake.set()
         return self.store.session(session.id)
 
@@ -471,8 +435,6 @@ class Runtime(MemoryServices):
             "L1": {
                 "blocks": len(session.context),
                 "summary_chars": len(session.summary),
-                "selected_entries": len(session.selected_state),
-                "selected_entry_ids": session.selected_state[:50],
                 "context_limit": self.store.config(sid).context.max_tokens,
             },
             "L2": {
@@ -491,7 +453,7 @@ class Runtime(MemoryServices):
                 "events": count("events"),
                 "artifacts": count("artifacts"),
                 "compactions": count("compactions"),
-                "state_entries": len(self.store.states(sid, include_deleted=True)),
+                "harness_entries": len(self.store.harness.entries(sid)),
                 "pending_messages": self.store.db.execute(
                     "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND received_at IS NULL",
                     (sid,),
@@ -533,10 +495,6 @@ class Runtime(MemoryServices):
                 self.request_refinement(
                     recipient_id,
                     source="human",
-                    request_id=mid,
-                    source_event=self.store.db.execute(
-                        "SELECT source_event FROM messages WHERE id=?", (mid,)
-                    ).fetchone()[0],
                 )
                 # Control input is consumed by the refinement queue, not by an
                 # ordinary agent turn (and is not evidence of reusable learning).
@@ -659,6 +617,7 @@ class Runtime(MemoryServices):
                 "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
             )
             self.store.event(sid, "resumed", {})
+            self.context.ensure_harness_digest(sid)
         self._wake.set()
 
     def _stopped_ancestor(self, sid):
@@ -860,7 +819,6 @@ class Runtime(MemoryServices):
             self.background = BackgroundProcesses(self)
         if hasattr(self, "background"):
             self.background.recover()
-        self.recover_refinement_requests()
         self.store.db.execute(
             "UPDATE model_attempts SET status='interrupted',ended_at=? WHERE status='running'",
             (now(),),
@@ -941,7 +899,7 @@ class Runtime(MemoryServices):
             for row in rows:
                 raw = (
                     self._kernel(session.id).receipt(row["id"])
-                    if row["name"] in ("python", "ipython", "skill_run")
+                    if row["name"] in ("python", "ipython")
                     else None
                 )
                 if raw is not None:
@@ -1024,15 +982,12 @@ class Runtime(MemoryServices):
                     if (
                         session.id in self.tasks
                         or session.paused
-                        or (
-                            not session.runnable
-                            and not self.store.pending_refinement_requests(session.id)
-                        )
+                        or (not session.runnable and not self.has_pending_refinement(session.id))
                         or (
                             session.outcome != Outcome.ACTIVE
                             and not (
                                 session.outcome == Outcome.COMPLETED
-                                and self.store.pending_refinement_requests(session.id)
+                                and self.has_pending_refinement(session.id)
                             )
                         )
                     ):
@@ -1122,15 +1077,17 @@ class Runtime(MemoryServices):
             pending = session.pending_turn
             if pending is None:
                 if not session.runnable or session.outcome == Outcome.COMPLETED:
-                    # Control-only work from idle/completed sessions does not
-                    # launch an unsolicited agent turn or a coding preparation.
-                    await self.auto_refine(sid)
+                    if await self.refinement_checkpoint(sid):
+                        self.store.update(sid, outcome=Outcome.ACTIVE, runnable=True, wake_at=None)
+                        self.store.event(
+                            sid,
+                            "refinement_continuation",
+                            {"reason": "Applied edits visible to next root turn"},
+                        )
                     return
                 self._check_limits(sid, resource="turns")
-                self.apply_pending_refinements(sid)
                 self.receive(sid, include_followups=not session.runnable or session.turns == 0)
                 await self._prepare(sid)
-                await self.auto_refine(sid, background=True)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
                 self._admitted_turns.add(sid)
@@ -1253,31 +1210,16 @@ class Runtime(MemoryServices):
                     )
                 explicit_ok = verifier_ok = False
                 self.store.update(sid, runnable=True, wake_at=None)
+            learned = await self.refinement_checkpoint(sid, completed_turn=True)
+            if learned:
+                explicit_ok = verifier_ok = False
+                self.store.update(sid, runnable=True, wake_at=None)
+                self.store.event(
+                    sid,
+                    "refinement_continuation",
+                    {"reason": "Applied edits visible to next root turn"},
+                )
             if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
-                before_refinement = self.store.events(sid, kind="refinement", limit=1)
-                await self.auto_refine(sid, trigger="completion")
-                after_refinement = self.store.events(sid, kind="refinement", limit=1)
-                if config.refinement.completion_followup and after_refinement != before_refinement:
-                    eid = self.store.event(
-                        sid,
-                        "refinement_continuation",
-                        {"candidate": completion, "reason": "Applied state available to next turn"},
-                    )
-                    self.store.add_context(
-                        sid,
-                        eid,
-                        [
-                            {
-                                "role": "user",
-                                "content": "Completion-time refinement applied supplemental harness state. "
-                                "Consider the updated state and your existing candidate within the remaining "
-                                "task budget, then return the requested final answer. Keep the candidate "
-                                "if no change is warranted. Supplemental state cannot override task instructions.",
-                            }
-                        ],
-                    )
-                    explicit_ok = verifier_ok = False
-                    self.store.update(sid, runnable=True, wake_at=None)
                 late_delivery = self.receive(sid)
                 if late_delivery:
                     if explicit_ok or verifier_ok:
@@ -1315,7 +1257,6 @@ class Runtime(MemoryServices):
                     )
                     self.defer(sid, config.verification.completion_wait_seconds)
                 elif explicit_ok or verifier_ok:
-                    self.apply_pending_refinements(sid)
                     if self.store.session(sid).mode == "interactive":
                         self.store.update(sid, result=completion or "Task verifier passed")
                         self.store.event(
@@ -1343,11 +1284,10 @@ class Runtime(MemoryServices):
                         )
                 current = self.store.session(sid)
                 self.store.update(sid, pending_turn=None, turns=current.turns + 1)
-                self.apply_pending_refinements(sid)
                 self._continue_completed_child(sid)
                 self.store.event(sid, "turn_completed", {"turn": current.turns})
                 if current.mode == "interactive":
-                    if not response.actions and not delivered:
+                    if not response.actions and not delivered and not learned:
                         self.store.update(sid, runnable=False, wake_at=None)
                         self.store.event(sid, "conversation_reply", {"verified": False})
                     # Interventions arriving during a response or verifier must not
@@ -1358,7 +1298,9 @@ class Runtime(MemoryServices):
                     pending_input = bool(
                         delivered or self.store.messages(sid, pending=True, limit=1)
                     )
-                    self.store.update(sid, runnable=pending_input and not current.paused)
+                    self.store.update(
+                        sid, runnable=(pending_input or learned) and not current.paused
+                    )
         except TurnAdmissionLimit as exc:
             root_id = self.store.session(sid).root_id
             active = [
@@ -1506,17 +1448,6 @@ class Runtime(MemoryServices):
                     request.metadata["execution_inputs"],
                     parent=event,
                 )
-                for entry in request.metadata["execution_inputs"].get("harness_state", []):
-                    self.store.event(
-                        sid,
-                        "refinement_later_consumed",
-                        {
-                            "entry": entry,
-                            "request_event": event,
-                            "meaning": "version included in model input; behavioral use requires separate evidence",
-                        },
-                        parent=event,
-                    )
                 self.store.event(
                     sid,
                     "agent_operating_path",
@@ -1908,7 +1839,7 @@ class Runtime(MemoryServices):
             )
             timeout = (
                 config.limits.python_timeout_seconds + 25
-                if action.name in ("python", "ipython", "skill_run")
+                if action.name in ("python", "ipython")
                 else config.limits.tool_timeout_seconds
             )
             async with asyncio.timeout(timeout):
@@ -2171,7 +2102,9 @@ class Runtime(MemoryServices):
         # first committed receipt instead of launching an identical concurrent suite.
         if not hasattr(self, "_verification_locks"):
             self._verification_locks = {}
-        workspace = str(await asyncio.to_thread(Path(self.store.session(sid).workspace.path).resolve))
+        workspace = str(
+            await asyncio.to_thread(Path(self.store.session(sid).workspace.path).resolve)
+        )
         lock = self._verification_locks.setdefault(workspace, asyncio.Lock())
         async with lock:
             return await self._verify_locked(sid, parent)
@@ -2299,10 +2232,7 @@ class Runtime(MemoryServices):
         for target in ids:
             if target == sid or self.store.session(target).outcome == Outcome.ACTIVE:
                 self.store.finish(target, Outcome.CANCELLED, "Stopped by user")
-            self.cancel_refinements(target, "Session stopped")
-            for refinement_task, refinement_sid in list(self._active_refinements.items()):
-                if refinement_sid == target and refinement_task is not asyncio.current_task():
-                    refinement_task.cancel()
+            self.invalidate_refinement(target)
             if task := self.tasks.get(target):
                 task.cancel()
         await asyncio.gather(
@@ -2368,7 +2298,6 @@ class Runtime(MemoryServices):
                 context=source.context,
                 summary=source.summary,
                 adapter_context=source.adapter_context,
-                selected_state=[],
                 turns=turn_index,
             )
             eid = self.store.event(
@@ -2393,26 +2322,17 @@ class Runtime(MemoryServices):
                         }
                     ],
                 )
-            # Local adaptive entries get new identities with explicit version provenance.
-            selected = []
-            from .models import StateEdit
+            from .harness import (
+                append_refinement_history,
+                load_refinement_history,
+                save_harness_state,
+            )
 
-            for entry in self.store.states(sid):
-                if entry["owner_id"] is None:
-                    if entry["id"] in source.selected_state:
-                        selected.append(entry["id"])
-                    continue
-                edit = StateEdit(
-                    kind=entry["kind"],
-                    title=entry["title"],
-                    content=entry["content"],
-                    source_events=[eid],
-                    intended_effect=f"Fork of {entry['id']} version {entry['version']}",
-                )
-                copied = self.store._apply_edit(branch.id, edit, eid)
-                if entry["id"] in source.selected_state:
-                    selected.append(copied)
-            self.store.update(branch.id, selected_state=selected)
+            self.invalidate_refinement(sid)
+            save_harness_state(self.store.harness.path(branch.id), self.store.harness.load(sid))
+            for record in load_refinement_history(self.store.harness.path(sid), "local"):
+                append_refinement_history(self.store.harness.path(branch.id), record)
+            self.context.ensure_harness_digest(branch.id)
             source_dir = self.store.directory / "kernels" / source.kernel_id
             target_dir = self.store.directory / "kernels" / branch.kernel_id
             if source_dir.exists():
@@ -2441,12 +2361,19 @@ class Runtime(MemoryServices):
                 await asyncio.sleep(0.02)
 
     async def shutdown(self):
+        # Service queued idle work before closing; active interrupted turns are cancelled.
+        for sid in list(self._refinement_states):
+            if sid not in self.tasks and not self.refinement_state(sid).in_progress:
+                await self.refinement_checkpoint(sid)
         self._closing = True
         self._wake.set()
         if self._scheduler_task:
             await self._scheduler_task
             self._scheduler_task = None
-        tasks = list(set(self.tasks.values()) | set(self._active_refinements))
+        tasks = list(
+            set(self.tasks.values())
+            | {state.task for state in self._refinement_states.values() if state.task}
+        )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
