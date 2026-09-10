@@ -4,6 +4,8 @@ import asyncio
 
 from threadweave.models import Action, ModelResponse, Usage
 
+from .test_continual_harness import learning_assessment
+
 
 def action(tool_name, **arguments):
     return Action(name=tool_name, arguments=arguments)
@@ -29,6 +31,7 @@ class RecoveryScenario:
                                 "id": "values",
                                 "title": "Values",
                                 "content": "The working values contain integers 0 through 999.",
+                                "metadata": {"learningAssessment": learning_assessment()},
                             }
                         ],
                     }

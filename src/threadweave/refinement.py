@@ -65,12 +65,54 @@ def refine_command_options(args):
     return {"global_": global_, **({"instructions": rest} if rest else {})}
 
 
-# Behavioral prompts ported from Prime's core/refinement/refinement.ts.
-PLANNER_PROMPT = """You are Buffalo's /refine continual harness subsystem.
+# Prime's lifecycle, with a stricter learning-quality criterion in its existing
+# reviewer/planner path. Assessment is completed during planning, never at apply.
+LEARNING_CRITERION = """Learning quality (apply before approving or proposing any edit):
+- Compare the candidate with the PRE-EDIT trajectory, retained history, active plan,
+  current harness, and earlier refinements. Cite the prior actions or statements.
+  Was it already known, explicitly stated, executed, or planned? Recording recent
+  successful work is not itself learning. Normally reject such redundant entries.
+- Name a concrete future situation and the decision/action that should change
+  BECAUSE this entry exists. Ask what the root would probably do without it. If
+  the same action is already likely from history or the active plan, reject it.
+  Later repetition of a pre-existing behavior cannot establish value or novelty.
+- Prefer a newly derived failure-prevention rule, corrected decision policy,
+  reusable troubleshooting/verification procedure, tool, or delegation role.
+  Explain what generalizes beyond the incident and what is new relative to the
+  earlier trajectory. A past fix can support a NEW preventive procedure; merely
+  recording the fix or an already established procedure is redundant.
+- A stable fact at risk of being lost after compaction can qualify only with a
+  specific later need and a credible different decision without the fact. Do not
+  use hypothetical forgetting to justify preserving everything in the context.
+- Reject ephemeral progress/checkpoint summaries: features finished, tests passed,
+  current implementation status, temporary blockers, and current child/file
+  assignments. Memory is for durable decision-relevant facts, not handoff logs.
+- Prefer declining or edits=[] over weak edits. Approval is permission to plan,
+  not an obligation to persist. Assess updates and deletes too: explain the future
+  decision improved by replacing/removing existing guidance. Keep useful content
+  concrete and actionable; a rationale alone does not turn a summary into a lesson.
+
+For each candidate, use learningAssessment with these fields:
+  priorEvidence: specific pre-edit actions/statements/plans and existing entries;
+  redundancyCheck: what overlaps and why any remaining behavioral value is new;
+  futureTrigger: concrete later situation where the entry matters;
+  behaviorChange: future decision/action attributable to the entry;
+  counterfactual: likely decision without the entry, considering retained history;
+  noveltyRationale: the new reusable inference, rather than the incident summary;
+  expectedBenefit: observable result that could validate the changed behavior;
+  redundant: boolean, true when no incremental reusable value remains;
+  progressOnly: boolean, true for ephemeral task/checkpoint information;
+  wouldActSame: boolean, true when the entry is unlikely to change a future decision.
+Do not invent novelty or evidence to fill these fields. Reject if any of the last
+three fields is true or no concrete future behavioral change is supported.
+"""
+
+PLANNER_PROMPT = (
+    """You are Buffalo's /refine continual harness subsystem.
 
 Your job is to improve the editable continual harness state from the current trajectory.
-This is similar in spirit to context compaction, but instead of summarizing the
-conversation you emit precise Create, Update, or Delete edits to reusable state.
+Emit precise Create, Update, or Delete edits to reusable state only when they
+can change a future decision. Refinement is not a progress-summary checkpoint.
 The continual harness is the persistent, editable set of prompt notes, memories,
 skills, and subagent specs that lets Buffalo improve reusable behavior
 outside the token history.
@@ -79,12 +121,12 @@ runtime, Python REPL kernel, and native call interface that executes those artif
 
 Continual harness components:
 - prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten.
-- memory: durable facts, decisions, failures, preferences, and outcomes.
+- memory: durable facts and preferences with a specific future decision use.
 - skill: installed Python REPL skill. Skill create/update edits MUST include a `reference` object with `{"type":"python"}`, a Python import, and a callable or call pattern; they also MUST include an `arguments` object describing accepted inputs, required fields, defaults, and constraints. Use `{}` for `arguments` only when the Python callable truly needs no external inputs. Include the RLM-native call form `await <skill_import>(...)`.
 - subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: compose a concise task prompt and spawn with `handle = await rlm("sub-task")`; admission returns immediately with `rlm_child_id`, `name`, `session_dir`, and `model`, never the child's answer. Results arrive only through explicit `agent_message` replies or files; children reply with `await agent_message.send(message, receiver_role="parent")`. Use `await rlm.list_subagents()` to recover direct child handles and `await agent_message.send(..., receiver_role="child", receiver_name=handle.name)` for follow-ups. Do not invent wrappers like `run_subagent(...)`.
 
 Scope and persistence policy:
-- The default editable continual harness store is local to the current Buffalo session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
+- The default editable continual harness store is local to the current Buffalo session. Use it for reusable lessons and decision-relevant project facts that should not affect other sessions. Local scope does not relax the learning-quality criterion.
 - A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future sessions.
 - Entry ids in the harness overview may carry a display-only `local:` or `global:` prefix. Always use the bare id (no prefix) in edits.
 - All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
@@ -93,8 +135,13 @@ Scope and persistence policy:
 - Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
 - When an edit is persisted, include metadata such as `{"scope":"local"}` or `{"scope":"global"}` when that helps future review understand the intended blast radius.
 
+"""
+    + LEARNING_CRITERION
+    + """
 Use the trajectory, current continual harness state, and prior refinement history. Prefer
-small evidence-backed edits. If prior refinements caused issues, rollback or
+small evidence-backed edits. Every edit MUST include its learningAssessment in
+metadata. The planner may return edits=[] even after an approved review or an
+explicit refinement request. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output
 JSON only with this exact shape:
 
@@ -112,23 +159,41 @@ JSON only with this exact shape:
       "path": "optional grouping path",
       "reference": {"type": "python", "import": "package.module", "callable": "function_name", "call_pattern": "await function_name(...)"},
       "arguments": {"name": {"type": "string", "required": true, "description": "accepted input"}},
-      "metadata": {},
+      "metadata": {"learningAssessment": {
+        "priorEvidence": "specific earlier actions/statements/plans",
+        "redundancyCheck": "comparison with those actions and existing entries",
+        "futureTrigger": "concrete later situation",
+        "behaviorChange": "decision/action the entry should change",
+        "counterfactual": "likely action without the entry and why",
+        "noveltyRationale": "new reusable value beyond the earlier trajectory",
+        "expectedBenefit": "observable result to check later",
+        "redundant": false, "progressOnly": false, "wouldActSame": false
+      }},
       "reason": "why this edit is useful"
     }
   ]
 }"""
+)
 
-REVIEW_PROMPT = """You are Buffalo's automatic /refine review gate.
+REVIEW_PROMPT = (
+    """You are Buffalo's automatic /refine review gate.
 
-Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns.
+Decide whether this checkpoint warrants planning a reusable behavioral improvement.
+Auto /refine writes local continual harness state by default. Approve only when
+there is a credible candidate satisfying the learning-quality criterion below.
 Reject one-off noise, unsupported hypotheses, and transient tool outputs. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
 
+"""
+    + LEARNING_CRITERION
+    + """
 Return JSON only:
 {
   "shouldRefine": true|false,
-  "rationale": "short reason",
+  "rationale": "evidence for approval or rejection, including redundancy",
+  "learningAssessment": {"priorEvidence": "...", "redundancyCheck": "...", "futureTrigger": "...", "behaviorChange": "...", "counterfactual": "...", "noveltyRationale": "...", "expectedBenefit": "...", "redundant": true|false, "progressOnly": true|false, "wouldActSame": true|false},
   "instructions": "optional concise instructions for /refine if shouldRefine is true"
 }"""
+)
 
 
 def auto_refine_instructions(reason, review):
@@ -137,10 +202,62 @@ def auto_refine_instructions(reason, review):
     )
     return (
         f"Automatic refine review triggered by {reason}. Only create/update/delete local "
-        "harness entries if there is clear evidence that should help this session continue. "
-        "Prefer an empty edits array over speculative or one-off memories. Do not promote "
+        "harness entries with nonredundant reusable value and a concrete future decision "
+        "that should change. Compare with pre-edit actions, retained history, and active plans. "
+        "Prefer an empty edits array over progress summaries or already established tactics. "
+        "Do not promote "
         f"anything global unless explicitly requested. Reviewer rationale: {review['rationale']}{detail}"
     )
+
+
+def assess_learning_edits(proposal):
+    """Fail closed on an unsupported model assessment, without replanning the edit.
+
+    The reviewer/planner performs the semantic comparison against the trajectory.
+    This guard enforces that contract, rather than guessing novelty from keywords.
+    It does not change the typed store or explicit extension/rollback proposals.
+    """
+    accepted, assessments = [], []
+    evidence_fields = (
+        "priorEvidence",
+        "redundancyCheck",
+        "futureTrigger",
+        "behaviorChange",
+        "counterfactual",
+        "noveltyRationale",
+        "expectedBenefit",
+    )
+    flags = ("redundant", "progressOnly", "wouldActSame")
+    for index, edit in enumerate(proposal["edits"]):
+        assessment = edit.get("metadata", {}).get("learningAssessment")
+        assessment = assessment if isinstance(assessment, dict) else {}
+        rejected = [name for name in flags if assessment.get(name) is True]
+        missing = [
+            name
+            for name in evidence_fields
+            if not isinstance(assessment.get(name), str) or not assessment[name].strip()
+        ] + [name for name in flags if not isinstance(assessment.get(name), bool)]
+        status = (
+            "REJECTED_REDUNDANT" if rejected else "REJECTED_UNSUPPORTED" if missing else "ACCEPTED"
+        )
+        assessments.append(
+            {
+                "index": index,
+                "action": edit["action"],
+                "kind": edit["kind"],
+                "id": edit.get("id"),
+                "title": edit.get("title"),
+                "content": edit.get("content"),
+                "reason": edit.get("reason"),
+                "status": status,
+                "rejectedChecks": rejected,
+                "missingEvidence": missing,
+                "learningAssessment": assessment,
+            }
+        )
+        if status == "ACCEPTED":
+            accepted.append(edit)
+    return {**proposal, "edits": accepted}, assessments
 
 
 TRUNCATED_JSON_ERROR = (
@@ -498,9 +615,10 @@ class RefinementServices(AuxiliaryServices):
                 "project-qualified facts that should affect future Buffalo sessions. Do not persist "
                 "session-only progress, temporary blockers, or current-run coordination globally."
                 if global_
-                else "Requested refinement scope: local. Prefer local continual harness edits for current "
-                "task progress, temporary blockers, current-run coordination, and project facts "
-                "that are not clearly reusable across Buffalo sessions. Global entries in the overview "
+                else "Requested refinement scope: local. Only propose nonredundant reusable lessons "
+                "or decision-relevant project facts with a concrete future behavioral effect in "
+                "this session. Do not save ephemeral progress or coordination checkpoints. "
+                "Global entries in the overview "
                 "are read-only context: do not propose update or delete edits for them; create "
                 "a local entry instead if an override is needed."
             )
@@ -527,6 +645,8 @@ class RefinementServices(AuxiliaryServices):
         }
         if isinstance(value.get("instructions"), str):
             review["instructions"] = value["instructions"]
+        if isinstance(value.get("learningAssessment"), dict):
+            review["learningAssessment"] = value["learningAssessment"]
         self.store.event(sid, "refinement_review", {"reason": reason, **review})
         return review
 
@@ -583,6 +703,18 @@ class RefinementServices(AuxiliaryServices):
                 )
                 self.check_refinement_response(response, "Refinement")
                 proposal = normalize_proposal(parse_object(response.text))
+                proposal, assessments = assess_learning_edits(proposal)
+                self.store.event(
+                    sid,
+                    "refinement_plan",
+                    {
+                        "id": identifier,
+                        "source": options.get("source", "user"),
+                        "status": "PLANNED" if proposal["edits"] else "APPROVED_EMPTY_PLAN",
+                        "proposal": proposal,
+                        "assessments": assessments,
+                    },
+                )
         if asyncio.current_task().cancelling():
             raise asyncio.CancelledError()
         return {

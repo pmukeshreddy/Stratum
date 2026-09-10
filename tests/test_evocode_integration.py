@@ -17,6 +17,8 @@ from threadweave.autonomous import (
 from threadweave.evals.evocode_worker import PersistentWorker
 from threadweave.models import Action, ModelResponse, RunConfig, Usage
 
+from .test_continual_harness import learning_assessment
+
 
 def cell(code):
     return ModelResponse(actions=[Action(name="ipython", arguments={"code": code})])
@@ -165,6 +167,7 @@ class FixturePeer:
                                 "id": "fixture-procedure",
                                 "title": "Fixture procedure",
                                 "content": "Read both persistent values before completion.",
+                                "metadata": {"learningAssessment": learning_assessment()},
                             }
                         ],
                     }

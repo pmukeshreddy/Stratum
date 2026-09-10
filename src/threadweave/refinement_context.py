@@ -135,7 +135,7 @@ def refinement_user_prompt(inputs, *, review=False):
             value = f"{value['reason']}; {value['turnsSinceLastReview']} assistant turns since last auto-refine review"
         parts.append(f"<{field}>\n{value}\n</{field}>")
     parts.append(
-        "Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions."
+        "Return shouldRefine=true only for a nonredundant reusable candidate with a concrete future decision that should change because of the entry. Compare against pre-edit actions, retained history, active plans, and existing entries. Reject progress/checkpoint summaries and merely preserving already established tactics. Default to local scope; global refinement requires durable cross-session value."
         if review
         else "Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale."
     )

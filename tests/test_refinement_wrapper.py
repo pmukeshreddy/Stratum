@@ -8,6 +8,8 @@ from threadweave.evals.harness import MatchedProvider, discard
 from threadweave.models import Action, HarnessError, ModelRequest, ModelResponse, RunConfig
 from threadweave.runtime import Runtime
 
+from .test_continual_harness import learning_assessment
+
 
 async def test_refinement_reservations_and_next_notice_context(tmp_path):
     class Provider:
@@ -38,6 +40,7 @@ async def test_refinement_reservations_and_next_notice_context(tmp_path):
                                     "id": "validated",
                                     "title": "Validated procedure",
                                     "content": "Compare results against an independent subtotal.",
+                                    "metadata": {"learningAssessment": learning_assessment()},
                                 }
                             ],
                         }

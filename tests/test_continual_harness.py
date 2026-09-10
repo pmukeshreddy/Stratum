@@ -34,6 +34,23 @@ def input_sections(request):
     return dict(re.findall(r"<([a-z_]+)>\n([\s\S]*?)\n</\1>", request.messages[-1]["content"]))
 
 
+def learning_assessment(**changes):
+    """An assessed model response fixture, not a claim about model judgment."""
+    return {
+        "priorEvidence": "Earlier validation failed in an unrelated environment.",
+        "redundancyCheck": "No environment preflight exists in the active plan or harness.",
+        "futureTrigger": "The next validation invocation in a different workspace.",
+        "behaviorChange": "Resolve the workspace interpreter before starting validation.",
+        "counterfactual": "The root would reuse its default interpreter and fail again.",
+        "noveltyRationale": "A preflight rule generalizes the observed environment failure.",
+        "expectedBenefit": "Avoid the previously observed import failure.",
+        "redundant": False,
+        "progressOnly": False,
+        "wouldActSame": False,
+        **changes,
+    }
+
+
 def edit(kind="memory", action="create", id="lesson", **kwargs):
     return {
         "kind": kind,
@@ -41,6 +58,7 @@ def edit(kind="memory", action="create", id="lesson", **kwargs):
         "id": id,
         "title": "Lesson",
         "content": "Run checks in the project environment",
+        "metadata": {"learningAssessment": learning_assessment()},
         **(
             {"reference": REF, "arguments": {"text": {"type": "string", "required": True}}}
             if kind == "skill"

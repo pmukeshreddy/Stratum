@@ -1,5 +1,9 @@
 # Prime refinement specification and port audit
 
+Subsequent change: [learning-quality admission](refinement-learning-quality.md)
+intentionally tightens reviewer/planner criteria while retaining this lifecycle.
+The source-parity audit below describes the preceding implementation.
+
 This supersedes the earlier system-only delivery requirement and the previous
 parity report. The supplied Prime checkout is authoritative. Evaluation processes
 were stopped on 2026-09-10; their results directories were preserved. No new
