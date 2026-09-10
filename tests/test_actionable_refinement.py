@@ -1,4 +1,4 @@
-"""Evidence-triggered refinement must change unfinished work, without a final-answer ritual."""
+"""Root-chosen refinement can change unfinished work; evidence does not schedule it."""
 
 import json
 
@@ -15,7 +15,7 @@ LESSON = (
 )
 
 
-@pytest.mark.parametrize("boundary", ["failed_execution", "pre_completion"])
+@pytest.mark.parametrize("boundary", ["failed_execution", "unresolved_decision"])
 async def test_refinement_changes_work_before_completion(tmp_path, boundary):
     purposes = []
 
@@ -23,19 +23,9 @@ async def test_refinement_changes_work_before_completion(tmp_path, boundary):
         async def invoke(self, request, emit):
             purpose = request.metadata.get("purpose", "agent")
             purposes.append(purpose)
-            if purpose == "refinement_review":
+            if purpose == "refinement":
                 evidence = json.loads(request.messages[-1]["content"])
                 assert any(evidence["in_task_opportunity"].values())
-                return ModelResponse(
-                    text=json.dumps(
-                        {
-                            "shouldRefine": True,
-                            "rationale": "Negative inputs remain incorrect",
-                            "instructions": "Correct the magnitude procedure before completion",
-                        }
-                    )
-                )
-            if purpose == "refinement":
                 return ModelResponse(
                     text=json.dumps(
                         {
@@ -59,8 +49,15 @@ async def test_refinement_changes_work_before_completion(tmp_path, boundary):
                     )
                 )
             if request.turn == 0:
-                if boundary == "pre_completion":
-                    return ModelResponse(text="def magnitude(n): return n")
+                if boundary == "unresolved_decision":
+                    return ModelResponse(
+                        actions=[
+                            Action(
+                                name="ipython",
+                                arguments={"code": "candidate = 'def magnitude(n): return n'"},
+                            )
+                        ]
+                    )
                 return ModelResponse(
                     actions=[
                         Action(
@@ -72,6 +69,17 @@ async def test_refinement_changes_work_before_completion(tmp_path, boundary):
                     ]
                 )
             if request.turn == 1:
+                return ModelResponse(
+                    actions=[
+                        Action(
+                            name="ipython",
+                            arguments={
+                                "code": "print(await refine.run('Retain the reusable lesson about validating negative inputs while this correction remains open'))"
+                            },
+                        )
+                    ]
+                )
+            if request.turn == 2:
                 assert LESSON in "\n".join(str(m.get("content", "")) for m in request.messages)
                 return ModelResponse(
                     actions=[
@@ -86,14 +94,15 @@ async def test_refinement_changes_work_before_completion(tmp_path, boundary):
             return ModelResponse(text="def magnitude(n): return abs(n)")
 
     config = RunConfig(
-        provider={"name": "mock", "model": "deterministic"}, limits={"wall_seconds": 30}
+        provider={"name": "mock", "model": "deterministic"},
+        limits={"wall_seconds": 30},
     )
     runtime = Runtime(tmp_path / "state", providers={"mock": Provider()})
     try:
         root = runtime.create(
             "Implement magnitude and check negative inputs.", tmp_path, config=config
         )
-        if boundary == "pre_completion":
+        if boundary == "unresolved_decision":
             runtime.store.event(
                 root.id,
                 "semantic_state_updated",
@@ -114,11 +123,9 @@ async def test_refinement_changes_work_before_completion(tmp_path, boundary):
         assert later and later[-1]["payload"]["result"]["error"] is None
         assert complete["payload"]["application"]["issue"] == "negative input"
         assert notice["payload"]["expanded"] and LESSON in notice["payload"]["content"]
-        assert purposes.count("refinement") == purposes.count("refinement_review") == 1
+        assert purposes.count("refinement") == 1
+        assert purposes.count("refinement_review") == 0
         assert not any(e["type"] == "refine_failed" for e in events)
-        if boundary == "pre_completion":
-            attempt = next(e for e in events if e["type"] == "completion_attempt")
-            assert attempt["seq"] < complete["seq"]
     finally:
         await runtime.shutdown()
 
@@ -144,24 +151,13 @@ async def test_clean_completion_has_no_refinement_ritual(tmp_path):
         await runtime.shutdown()
 
 
-async def test_competing_requirements_review_can_decline_without_extra_work(tmp_path):
+async def test_competing_requirements_do_not_schedule_learning(tmp_path):
     purposes = []
 
     class Provider:
         async def invoke(self, request, emit):
             purpose = request.metadata.get("purpose", "agent")
             purposes.append(purpose)
-            if purpose == "refinement_review":
-                evidence = json.loads(request.messages[-1]["content"])
-                assert evidence["in_task_opportunity"]["instruction_decision"]
-                return ModelResponse(
-                    text=json.dumps(
-                        {
-                            "shouldRefine": False,
-                            "rationale": "The interpretation is consistent and checked.",
-                        }
-                    )
-                )
             assert purpose == "agent"
             if request.turn == 0:
                 return ModelResponse(
@@ -179,33 +175,7 @@ async def test_competing_requirements_review_can_decline_without_extra_work(tmp_
         await runtime.start()
         await runtime.wait(root.id, timeout=10)
         assert runtime.store.session(root.id).outcome == "completed"
-        assert purposes == ["agent", "refinement_review", "agent"]
+        assert purposes == ["agent", "agent"]
         assert not runtime.store.events(root.id, kind="refine_complete")
     finally:
         await runtime.shutdown()
-
-
-def test_new_candidate_is_fresh_evidence_but_repeated_candidate_is_not():
-    from threadweave.refinement_evidence import opportunity, opportunity_key
-
-    class Store:
-        def __init__(self):
-            self.rows = []
-
-        def iter_events(self, sid, kind=None):
-            return iter([r for r in self.rows if not kind or r["type"] == kind])
-
-    store = Store()
-    messages = [{"role": "user", "content": "Resolve the conflicting width requirements."}]
-
-    def record(code):
-        store.rows.append(
-            {"id": str(len(store.rows)), "type": "python_execution", "payload": {"code": code}}
-        )
-        return opportunity_key(opportunity(store, "root", messages))
-
-    first = record("print('Inspecting the requirements')")
-    candidate = record("draft = 'def width(): return 1'")
-    assert candidate != first
-    assert record("draft = 'def width(): return 1'") == candidate
-    assert record("draft = 'def width(): return 2'") != candidate

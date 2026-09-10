@@ -146,10 +146,9 @@ Updates preserve omitted path, reference, arguments and metadata; get returns No
 Direct writes are immediate; record_refinement(trigger, changes, evidence=..., outcome=...) records
 their explicit audit summary. Use global_=True or a global:id prefix to target the global store.
 Supplemental state never overrides the task or the immutable base system prompt.
-Use refinement when observed evidence exposes a reusable correction that can change unfinished
-work: a failed check, a mistaken assumption, an unresolved instruction conflict, or a workflow
-that needs revision. Ask while the decision or correction is still open, before implementing and
-testing everything. State the observed evidence, what remains uncertain, and the next action the
+Choose refinement when you recognize a reusable correction or lesson from observed work.
+Learning is optional. If learning will help unfinished work, ask while the decision is still
+open. State the observed evidence, what remains uncertain, and the next action the
 lesson should improve in await refine.run('evidence; unresolved issue; next action'). Track a real
 unresolved decision with context.track(..., kind='decision') when it needs to survive turns.
 Do not request a retrospective checklist just because a task is finished or tests passed. If the
@@ -172,11 +171,8 @@ normal module artifacts first if code is needed. Read each installed skill's SKI
 its documented function; do not assume a .run entry point. skills.list()/skills.load(name) inspect
 installed skills. A subagent entry is a reusable delegation specification: compose its instructions
 into a task for native delegation when enabled. Results arrive through native messaging or files.
-Fresh failed validation, tracked unresolved decisions, or the first interpretation of explicitly
-conflicting requirements can trigger an evidence review at a safe boundary. The reviewer must
-find a concrete remaining correction; a conflict alone does not require an edit. This can occur
-before completion. Routine automatic review is also enabled at 25 assistant
-turns and compaction, with a 20 minute cooldown;
+Learning runs only when you choose refine.run(), or through normal automatic review at
+25 assistant turns and compaction, with a 20 minute cooldown;
 review may decline and refinement may return no edits. await compact() retains recoverable Python
 state, artifacts and history. Retrieve omitted details explicitly.
 """
