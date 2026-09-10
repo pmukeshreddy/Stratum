@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections import Counter
 from pathlib import Path
 
 
@@ -21,7 +20,6 @@ def activity(directory, record=None):
         actions = [
             dict(r) for r in db.execute("SELECT name,arguments,session_id,status FROM actions")
         ]
-        paths = dict(db.execute("SELECT id,path FROM artifacts"))
     root = next(s for s in sessions if s["parent_id"] is None)
     sid = root["id"]
 
@@ -32,11 +30,6 @@ def activity(directory, record=None):
 
     completed = [r for r in requests if r["status"] == "completed"]
     agent = [r for r in completed if r["purpose"] == "agent"]
-    stages = Counter()
-    for r in completed:
-        if r["purpose"] == "refinement":
-            data = json.loads((directory / "state" / paths[r["body_artifact"]]).read_text())
-            stages[data.get("metadata", {}).get("refinement_stage", "unspecified")] += 1
     reviews = of("refinement_review", True)
     applied = of("refine_complete", True)
     inputs = of("execution_input_consumed", True)
@@ -47,7 +40,6 @@ def activity(directory, record=None):
         if edit["applied"]
     ]
     shown = {(v["id"], v["version"]) for e in inputs for v in e["payload"]["harness_state"]}
-    retrievals = [e["payload"] for e in of("harness_state_retrieved")]
     child_ids = {s["id"] for s in sessions if s["parent_id"]}
     active, peak = set(), 0
     for event in events:
@@ -105,17 +97,15 @@ def activity(directory, record=None):
         "verification_failures": len(failed_verifiers),
         "refinement_reviews": len(reviews),
         "refinement_declines": sum(not e["payload"]["shouldRefine"] for e in reviews),
-        "refinement_planner_calls": stages["planner"],
+        "refinement_planner_calls": sum(r["purpose"] == "refinement" for r in completed),
+        "refinement_approvals": sum(e["payload"]["shouldRefine"] for e in reviews),
+        "refinements_applied": sum(
+            any(edit["applied"] for edit in e["payload"]["appliedEdits"]) for e in applied
+        ),
         "refinement_applied_edits": sum(
             sum(edit["applied"] for edit in e["payload"]["appliedEdits"]) for e in applied
         ),
-        "refinement_continuations": sum(
-            any(i["seq"] > e["seq"] for i in inputs)
-            for e in applied
-            if any(edit["applied"] for edit in e["payload"]["appliedEdits"])
-        ),
         "harness_entries_in_root_invocations": len(shown),
-        "harness_state_retrievals": len(of("harness_state_retrieved")) + len(of("state_retrieved")),
         "skills_loaded": len(of("skill_loaded")),
         "compactions": len(of("context_compaction")),
         "wall_seconds": record.get("wall_time_seconds"),
@@ -142,8 +132,8 @@ def activity(directory, record=None):
         edits = [e for e in changes if e["kind"] == kind]
         row[prefix + "_created"] = sum(e["action"] == "create" for e in edits)
         row[prefix + "_updated"] = sum(e["action"] == "update" for e in edits)
-        row[prefix + "_retrieved"] = sum(e["kind"] == kind for e in retrievals)
-        row[prefix + "_injected"] = sum(
+        row[prefix + "_deleted"] = sum(e["action"] == "delete" for e in edits)
+        row[prefix + "_in_system_prompt"] = sum(
             v["kind"] == kind for e in inputs for v in e["payload"]["harness_state"]
         )
     return row

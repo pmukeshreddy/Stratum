@@ -66,6 +66,24 @@ class Host:
         return await self.bridge.acall("host_request", operation=operation, payload=payload)
 
 
+def _python_skill_reference(reference):
+    if not isinstance(reference, dict):
+        raise ValueError("skill entries require a Python reference")
+    if reference.get("type") != "python":
+        raise ValueError("skill reference.type must be 'python'")
+    if not any(
+        isinstance(reference.get(key), str) and reference[key]
+        for key in ("import", "python_import")
+    ):
+        raise ValueError("skill reference requires a Python import")
+    if not any(
+        isinstance(reference.get(key), str) and reference[key]
+        for key in ("callable", "call_pattern")
+    ):
+        raise ValueError("skill reference requires a callable or call_pattern")
+    return dict(reference)
+
+
 class Harness:
     """Prime's writable kernel view of the canonical host-owned JSON store."""
 
@@ -75,9 +93,11 @@ class Harness:
     def _call(self, operation, *, global_=False, **payload):
         if "global" in payload:
             global_ = payload.pop("global")
-        if not isinstance(global_, bool):
-            raise TypeError("global must be a bool")
-        return self.host.call("harness." + operation, global_=global_ or self.global_, **payload)
+            if not isinstance(global_, bool):
+                raise TypeError(f"global must be a bool, got {type(global_).__name__}")
+        return self.host.call(
+            "harness." + operation, global_=bool(global_) or self.global_, **payload
+        )
 
     def list(self, kind=None, *, global_=False, **kwargs):
         return [Record(e) for e in self._call("list", kind=kind, global_=global_, **kwargs)]
@@ -294,7 +314,7 @@ class Harness:
             content,
             id=id,
             path=path,
-            reference=reference,
+            reference=_python_skill_reference(reference),
             arguments=arguments,
             metadata=metadata,
             global_=global_,
@@ -320,7 +340,7 @@ class Harness:
             title,
             content,
             path=path,
-            reference=reference,
+            reference=_python_skill_reference(reference) if reference is not None else None,
             arguments=arguments,
             metadata=metadata,
             global_=global_,
@@ -370,9 +390,16 @@ class Harness:
     def delete_subagent(self, id: str, *, global_: bool = False, **kwargs: object) -> bool:
         return self.delete("subagent", id, global_=global_, **kwargs)
 
-    create_prompt = create_prompt_note
-    update_prompt = update_prompt_note
-    delete_prompt = delete_prompt_note
+    def plan_refinement(self, observation, *, failing_component="", next_step=""):
+        target = f" for {failing_component}" if failing_component else ""
+        plan = [
+            f"Diagnose the repeated failure or opportunity{target}: {observation}",
+            "Update the smallest useful prompt note, memory item, skill, or subagent spec.",
+            "Run the next action with the changed harness state, then record the outcome.",
+        ]
+        if next_step:
+            plan.append(f"Immediate validation step: {next_step}")
+        return plan
 
 
 class Recursive:
@@ -843,26 +870,50 @@ def bootstrap(bridge, values, metadata):
         values["repl_state"].force = "l1_compaction"
         return result
 
-    class Refine:
-        async def status(self):
-            return await host.acall("refine.status")
+    async def refine_status() -> dict:
+        """Read current refine state.
 
-        async def run(self, instructions=None, global_=False):
-            if instructions is not None and not isinstance(instructions, str):
-                raise TypeError("instructions must be str or None")
-            if not isinstance(global_, bool):
-                raise TypeError("global_ must be bool")
-            payload = {}
-            if instructions is not None:
-                payload["instructions"] = instructions
-            if global_:
-                payload["global_"] = True
-            return await host.acall("refine.run", **payload)
+        Returns a dict with `pending` (whether a requested refine is already
+        queued for this turn) and `in_flight` (whether a refine is currently
+        planning or applying).
+        """
+        return await host.acall("refine.status")
+
+    async def refine_run(instructions: str | None = None, global_: bool = False) -> dict:
+        """Schedule continual harness refinement.
+
+        Refinement never runs mid-cell: it runs when the current turn ends and
+        the harness applies changes and rebuilds the system prompt, then resumes
+        you automatically. Returns `{"scheduled": True}`, or
+        `{"scheduled": False, "reason": ...}` when refinement cannot start.
+        Optional `instructions` focus the refinement on a specific observation.
+        Set `global_=True` to target the global (cross-session) harness store;
+        omit for local (session-scoped) refinement.
+        """
+        if instructions is not None and not isinstance(instructions, str):
+            raise TypeError(f"instructions must be str or None, got {type(instructions).__name__}")
+        if not isinstance(global_, bool):
+            raise TypeError(f"global_ must be bool, got {type(global_).__name__}")
+        payload = {}
+        if instructions is not None:
+            payload["instructions"] = instructions
+        if global_:
+            payload["global_"] = True
+        return await host.acall("refine.run", **payload)
 
     async def heartbeat(**options):
         return await bridge.acall("schedule_turn", **options)
 
-    values.update(compact=compact, refine=Refine(), heartbeat=heartbeat)
+    values.update(compact=compact, heartbeat=heartbeat)
+    if metadata.get("depth", 0) == 0:
+        import sys
+        import types
+
+        module = types.ModuleType("refine", "Continual harness refinement from the kernel.")
+        module.run, module.status = refine_run, refine_status
+        refine_run.__name__, refine_status.__name__ = "run", "status"
+        refine_run.__module__ = refine_status.__module__ = "refine"
+        values["refine"] = sys.modules["refine"] = module
     compact.run, heartbeat.run = compact, heartbeat
     # Python skill packages are imported and callable in every session. Failures
     # become inspectable placeholders, never silently disappear.

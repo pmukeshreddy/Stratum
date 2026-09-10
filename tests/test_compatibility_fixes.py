@@ -73,22 +73,27 @@ async def test_completed_child_followup_reuses_kernel_after_restart(tmp_path, py
         await runtime.shutdown()
 
 
-async def test_chat_refine_is_requested_instead_of_unknown(tmp_path, python_config):
+async def test_chat_refine_uses_the_session_command_queue(tmp_path, python_config):
     daemon = Daemon(tmp_path / "state")
     terminal = InputTerminal(tmp_path / "ui")
 
     async def rpc(directory, method, **args):
         return await daemon.dispatch(method, args)
 
-    daemon.runtime.providers["mock"] = ScriptedProvider({})
+    daemon.runtime.providers["mock"] = ScriptedProvider(
+        {"*": [ModelResponse(text='{"edits": []}')]}
+    )
     chat = Chat(tmp_path / "state", tmp_path, terminal, rpc=rpc)
     try:
         await chat.open(config=python_config)
         assert await chat.submit("/refine")
+        await daemon.runtime.refinement_state(chat.session["id"]).command_task
+        await chat.poll()
         output = terminal.output.getvalue()
         assert "Unknown command" not in output
-        assert "Refinement requested" in output
-        assert daemon.runtime.store.events(chat.session["id"], kind="refine_scheduled")
+        assert "Refinement complete: 0 harness changes" in output
+        assert daemon.runtime.store.events(chat.session["id"], kind="refine_complete")
+        assert not daemon.runtime.store.events(chat.session["id"], kind="refine_scheduled")
     finally:
         await daemon.runtime.shutdown()
         daemon.lock.close()

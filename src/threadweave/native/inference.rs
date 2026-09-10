@@ -19,7 +19,16 @@ fn emit(value: Value) {
     let _ = io::stdout().flush();
 }
 
-fn error(error: &ApiError) -> Value {
+fn error(error: &ApiError, refinement: bool) -> Value {
+    if refinement {
+        if let ApiError::Stream(message) = error {
+            // The pinned Codex client represents response.incomplete as this
+            // typed Stream error. Prime maps that event to stopReason=length.
+            if message.starts_with("Incomplete response returned, reason: ") {
+                return json!({"type":"completed", "stop_reason":"length"});
+            }
+        }
+    }
     // Never stringify transport errors: their Display implementation includes HTTP bodies.
     let (code, retryable) = match error {
         ApiError::Transport(TransportError::Http { status, .. }) | ApiError::Api { status, .. } => {
@@ -40,7 +49,31 @@ fn error(error: &ApiError) -> Value {
         }
         _ => ("transport_failure".into(), true),
     };
-    json!({"type":"error", "code":code, "retryable":retryable})
+    let mut output = json!({"type":"error", "code":code, "retryable":retryable});
+    if refinement {
+        let mut headers = serde_json::Map::new();
+        if let ApiError::Transport(TransportError::Http { status, headers: source, .. }) = error {
+            output["status"] = json!(status.as_u16());
+            if let Some(source) = source {
+                for name in ["retry-after", "retry-after-ms"] {
+                    if let Some(value) = source.get(name).and_then(|v| v.to_str().ok()) {
+                        headers.insert(name.into(), json!(value));
+                    }
+                }
+            }
+        } else if let ApiError::Api { status, .. } = error {
+            output["status"] = json!(status.as_u16());
+        }
+        output["retry_headers"] = json!(headers);
+        match error {
+            ApiError::Retryable { delay: Some(delay), .. }
+            | ApiError::RateLimitExceeded { delay: Some(delay), .. } => {
+                output["retryAfterMs"] = json!(delay.as_secs_f64() * 1000.0);
+            }
+            _ => (),
+        }
+    }
+    output
 }
 
 #[tokio::main]
@@ -58,6 +91,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("missing request")??;
     let request: Value = serde_json::from_str(&line)?;
+    let refinement = request["refinement"] == true;
     let settings = &request["auth_settings"];
     let policy = if settings["respect_system_proxy"] == true {
         OutboundProxyPolicy::RespectSystemProxy
@@ -145,7 +179,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(err) => {
-                emit(error(&err));
+                emit(error(&err, refinement));
                 return Ok(());
             }
         }
@@ -180,7 +214,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(_) => (),
             Err(err) => {
-                emit(error(&err));
+                emit(error(&err, refinement));
                 return Ok(());
             }
         }

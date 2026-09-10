@@ -9,14 +9,14 @@ from threadweave.models import Action, HarnessError, ModelRequest, ModelResponse
 from threadweave.runtime import Runtime
 
 
-async def test_refinement_reservations_notice_and_root_continuation(tmp_path):
+async def test_refinement_reservations_and_next_notice_context(tmp_path):
     class Provider:
         def __init__(self):
             self.requests = []
 
         async def resolve(self, config, *, reasoning_off=False):
             if reasoning_off:
-                config = config.model_copy(update={"parameters": {"reasoning_effort": "low"}})
+                config = config.model_copy(update={"parameters": {}})
             return config, {}
 
         async def invoke(self, request, emit):
@@ -26,7 +26,7 @@ async def test_refinement_reservations_notice_and_root_continuation(tmp_path):
                 return ModelResponse(text='{"shouldRefine": false, "rationale": "no new evidence"}')
             if purpose == "refinement":
                 assert request.config.max_output_tokens == 32000
-                assert request.config.parameters["reasoning_effort"] == "low"
+                assert "reasoning_effort" not in request.config.parameters
                 return ModelResponse(
                     text=json.dumps(
                         {
@@ -55,7 +55,10 @@ async def test_refinement_reservations_notice_and_root_continuation(tmp_path):
                     ]
                 )
             assert "[self-refinement]" in str(request.messages)
-            assert "Compare results against an independent subtotal." in str(request.messages)
+            assert (
+                "Compare results against an independent subtotal."
+                not in request.messages[0]["content"]
+            )
             assert request.config.max_output_tokens == 32768
             assert request.config.parameters["reasoning_effort"] == "xhigh"
             return ModelResponse(text="24, checked")
@@ -65,6 +68,7 @@ async def test_refinement_reservations_notice_and_root_continuation(tmp_path):
             "name": "codex_subscription",
             "model": "test-model",
             "max_output_tokens": 32768,
+            "model_metadata": {"maxTokens": 128000},
             "parameters": {"reasoning_effort": "xhigh"},
         },
         limits={"wall_seconds": 30},
@@ -99,8 +103,8 @@ async def test_refinement_reservations_notice_and_root_continuation(tmp_path):
         events = list(runtime.store.iter_events(root.id))
         scheduled = next(e for e in events if e["type"] == "refine_scheduled")
         complete = next(e for e in events if e["type"] == "refine_complete")
-        notice = next(e for e in events if e["type"] == "refinement_notice")
-        assert scheduled["seq"] < complete["seq"] < notice["seq"]
+        assert sum(e["type"] == "refinement_notice" for e in events) == 1
+        assert scheduled["seq"] < complete["seq"]
         assert complete["payload"]["appliedEdits"][0]["applied"]
         assert runtime.store.harness.get(root.id, "memory", "validated")
         assert not any(e["type"] == "refine_failed" for e in events)

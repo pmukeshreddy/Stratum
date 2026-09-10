@@ -9,22 +9,12 @@ from .storage import encode
 
 
 def refinement_provider_config(provider):
-    """Structured reviewer/planner inference never inherits interactive thinking knobs."""
-    parameters = dict(provider.parameters)
-    parameters["reasoning_effort"] = "none"
-    parameters.pop("reasoning_summary", None)
-    if "reasoning" in parameters:
-        parameters["reasoning"] = {"enabled": False}
-    if "thinking" in parameters:
-        parameters["thinking"] = {"type": "disabled"}
-    if "enable_thinking" in parameters:
-        parameters["enable_thinking"] = False
-    if "chat_template_kwargs" in parameters:
-        parameters["chat_template_kwargs"] = {
-            **parameters["chat_template_kwargs"],
-            "enable_thinking": False,
-        }
-    return provider.model_copy(update={"parameters": parameters})
+    """Prime passes model/auth/output budget, not the primary turn's sampling options.
+
+    Omitting reasoning is not the same as forcing a lowest supported effort.
+    Provider-specific compatibility belongs to the provider, not the refiner.
+    """
+    return provider.model_copy(update={"parameters": {}})
 
 
 class AuxiliaryServices:
@@ -32,29 +22,33 @@ class AuxiliaryServices:
         if role == "compaction":
             evidence = {**evidence, "original_task": self.context.original_task(sid)}
         session, config = self.store.session(sid), self.store.config(sid)
-        routing_role = (
-            "refinement"
-            if role == "refinement_review" and "refinement_review" not in config.routing.roles
-            else role
-        )
+        routing_role = session.role if role in {"refinement", "refinement_review"} else role
         provider = route(self.store, sid, routing_role, expected_tools=False)
         structured_refinement = role in {"refinement", "refinement_review"}
         reasoning_off = structured_refinement
         if reasoning_off:
+            from .refinement_model import refinement_output_limit
+
             provider = refinement_provider_config(provider)
             provider = provider.model_copy(
                 update={
-                    "max_output_tokens": min(
-                        provider.max_output_tokens, 4096 if role == "refinement_review" else 32000
-                    )
+                    "max_output_tokens": refinement_output_limit(
+                        provider, review=role == "refinement_review"
+                    ),
+                    "streaming": True,
                 }
             )
+        if structured_refinement:
+            from .refinement_context import refinement_user_prompt
+
+            evidence = refinement_user_prompt(evidence, review=role == "refinement_review")
         messages = [
             {"role": "system", "content": instruction},
-            {"role": "user", "content": encode(evidence)},
+            {"role": "user", "content": evidence if structured_refinement else encode(evidence)},
         ]
         if (
-            token_bound(messages, provider.model)
+            not structured_refinement
+            and token_bound(messages, provider.model)
             > config.context.max_tokens - provider.max_output_tokens
         ):
             raise ValueError(
@@ -74,9 +68,12 @@ class AuxiliaryServices:
             input_token_bound=token_bound(messages, provider.model),
             metadata={
                 "purpose": role,
-                **({"refinement_stage": "planner"} if role == "refinement" else {}),
             },
         )
+        if structured_refinement:
+            from .refinement_retry import complete_refinement
+
+            return await complete_refinement(self, sid, request)
         return await self._model_call(sid, request, persist_turn=False)
 
     async def semantic_compact(self, sid, *, force=False):
@@ -93,9 +90,7 @@ class AuxiliaryServices:
         if not config.features.model_compaction or not session.context:
             return
         schemas = self.tools.schemas(config)
-        size = self.context.request_estimate(
-            sid, self.context.messages(sid, refresh_harness=False), schemas
-        )[0]
+        size = self.context.request_estimate(sid, self.context.messages(sid), schemas)[0]
         available = config.context.max_tokens - max(
             p.max_output_tokens for p in [config.provider, *config.models.values()]
         )
@@ -194,14 +189,15 @@ class AuxiliaryServices:
 
             support = {
                 "live_trajectory_tree": capture(self.context, sid),
-                "durable_state": self.store.harness.merged(sid),
-                "retained_recent_context": session.context[count:],
+                "retained_recent_context": self._compaction_blocks(session.context[count:]),
             }
             archive = self.artifacts.put(
                 sid,
                 {"previous_summary": session.summary, "blocks": session.context[:count], **support},
             )
-            text = encode({"retiring_history": session.context[:count], **support})
+            text = encode(
+                {"retiring_history": self._compaction_blocks(session.context[:count]), **support}
+            )
             previous, offset, event = session.summary, 0, None
             resolutions, updates = [], []
             source_events = [b["event_id"] for b in session.context]
@@ -286,3 +282,17 @@ class AuxiliaryServices:
 
     def retain_failure(self, sid, event, verification):
         self.environment.call(sid, "retain_failure", sid, event, verification)
+
+    @staticmethod
+    def _compaction_blocks(blocks):
+        from .refinement_context import convert_to_llm
+
+        return [
+            {
+                **block,
+                "messages": convert_to_llm(
+                    [m for m in block["messages"] if m.get("customType") != "harness_digest"]
+                ),
+            }
+            for block in blocks
+        ]

@@ -117,29 +117,26 @@ The continual harness uses `harness_state.json` as its only active learned state
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
 Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is part of the persisted session trajectory; no local JSONL
-sidecar is used. Existing SQLite learned state is imported once; old learned-state
-tables have no runtime readers or writers.
+refinement history is stored as session audit events, separate from model conversation.
+Retired SQLite reinforcement tables and import adapters have been removed.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
-returns `pending` and `in_flight`. Planning overlaps tools after the model response
-finishes; the exact plan is applied only at a completed-turn boundary,
-then a durable `[self-refinement]` or `[auto-refinement]` notice informs the root
-before it continues. Zero-edit proposals produce no update notice. Automatic review
-is enabled at 25 turns and compaction, with a 20 minute cooldown. Failures and child
-findings are ordinary trajectory evidence, not separate refinement triggers.
+returns `pending` and `in_flight`. Planning can overlap tools after the model response
+finishes; the exact plan is applied only at a safe turn boundary.
+Automatic review runs at 25 assistant turns and compaction, with a 20 minute cooldown,
+only in root sessions. The reviewer alone decides whether to run the planner.
+Explicit refinement bypasses review. An empty edits array is valid.
 
-An untouched session defers its compact merged digest until its first input commit.
-The digest refreshes on resume, compaction, and
-stale-state detection. Unchanged digests are deduplicated. The base system prompt
-stays unchanged after learning. Colliding global/local IDs remain visible with
+Each legitimate model request rebuilds its SYSTEM prompt from the merged local/global
+harness JSON. Refinement results stay in audit history; no synthetic refinement messages
+enter conversation, and applied edits do not resume completed or idle tasks.
+Colliding global/local IDs remain visible with
 scope labels; local guidance can override global guidance within the session.
 Skills reference existing Python callables and their argument contracts; reusable
 subagent specifications execute through native `rlm` delegation.
 
-See [the source/test parity matrix](continual-harness-parity.md) and
-[the deterministic session trace](continual-harness-trace.json).
+See [the source, deletion, and test mapping](continual-harness-parity.md).
 
 Installed skills remain ordinary Python modules. Read SKILL.md and invoke the
 documented callable directly; `skills.list()` and `skills.load(name)` provide

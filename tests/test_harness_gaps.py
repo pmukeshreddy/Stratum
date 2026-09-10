@@ -93,8 +93,9 @@ async def test_compaction_covers_material_beyond_24000_and_keeps_recent(tmp_path
         archive = runtime.artifacts.load(root.id, compaction["archive_artifact"])
         assert "ZEBRA-937" in encode(archive)
         assert compaction["archive_artifact"] in runtime.store.session(root.id).summary
-        assert runtime.store.session(root.id).context[-2]["messages"] == recent
-        assert "harness_digest" in runtime.store.session(root.id).context[-1]["messages"][0]
+        assert runtime.store.session(root.id).context[-1]["messages"] == recent
+        assert "# Continual Harness State" not in runtime.context.messages(root.id)[0]["content"]
+        assert "# Continual Harness State" in runtime.store.session(root.id).summary_harness_digest
     finally:
         await runtime.shutdown()
 

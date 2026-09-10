@@ -102,7 +102,7 @@ class RecoveryScenario:
             actions = [
                 action("agent_spawn", instruction="Compute left", name="left"),
                 action("agent_spawn", instruction="Compute right", name="right"),
-                action("refine", instructions="Remember the retained computation"),
+                action("python", code="await refine.run('Remember the retained computation')"),
             ]
         elif turn == 2:
             actions = [action("agent_wait", seconds=300)]

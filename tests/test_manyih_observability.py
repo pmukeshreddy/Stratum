@@ -109,7 +109,7 @@ def test_operations_are_syntax_only():
     assert operations("%time x") == ["unparsed Python/IPython; see code excerpt"]
 
 
-async def test_refinement_counts_and_notice_visibility(tmp_path):
+async def test_refinement_counts_are_independent_of_next_turn(tmp_path):
     from .test_continual_harness import edit, proposal
 
     class RefineProvider:
@@ -151,8 +151,10 @@ async def test_refinement_counts_and_notice_visibility(tmp_path):
         assert row["continual_harness"]["explicit_refine_calls"] == 1
         assert row["continual_harness"]["refinements_applied"] == 1
         assert row["continual_harness"]["memory_edits"] == 1
-        assert row["continual_harness"]["later_root_inputs_receiving_refinement_notice"] == 1
-        assert any(e["later_root_invocations_receiving_notice"] for e in events)
+        assert row["continual_harness"]["automatic_refine_reviews"] == 0
+        assert row["continual_harness"]["reviews_approved"] == 0
+        assert row["continual_harness"]["reviews_declined"] == 0
+        assert {e["type"] for e in events} == {"refine_scheduled", "refine_complete"}
         # A second task's complete local AND global stores remain empty.
         other = Runtime(tmp_path / "other-state", providers={"mock": RefineProvider()})
         try:

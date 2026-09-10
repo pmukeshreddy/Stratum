@@ -53,6 +53,15 @@ def mechanisms(directory):
         operations = Counter(a.get("operation") for n, a in actions if n == "host_request")
         sessions = [json.loads(r[0]) for r in db.execute("SELECT body FROM sessions")]
         statuses = {"completed": events["refine_complete"], "failed": events["refine_failed"]}
+        reviews = [
+            json.loads(r[0])
+            for r in db.execute("SELECT payload FROM events WHERE type='refinement_review'")
+        ]
+        refinements = [
+            json.loads(r[0])
+            for r in db.execute("SELECT payload FROM events WHERE type='refine_complete'")
+        ]
+        edits = [e for r in refinements for e in r["appliedEdits"] if e["applied"]]
         requests = [
             json.loads(r[0])
             for r in db.execute("SELECT payload FROM events WHERE type='model_request'")
@@ -63,20 +72,25 @@ def mechanisms(directory):
         ]
     return {
         "repl_calls": sum(n == "ipython" for n, _ in actions),
-        "python_executions": events["python_result"],
+        "python_executions": events["python_execution"],
         "rlm_calls": operations["rlm.run"],
         "subagents": sum(s["parent_id"] is not None for s in sessions),
         "max_depth": max((s["depth"] for s in sessions), default=0),
         "agent_requests": purposes["agent"],
         "root_turns": sum(s["turns"] for s in sessions if s["parent_id"] is None),
         "all_agent_turns": sum(s["turns"] for s in sessions),
-        "refinement_reviews": purposes["refinement_review"],
-        "refinement_planner_and_reducer_requests": purposes["refinement"],
-        "refinement_applied_edits": events["refinement"],
-        "refinement_continuations": events["refinement_continuation"],
-        "refinement_budget_exhausted": events["refinement_budget_exhausted"],
-        "auxiliary_deferred": events["auxiliary_deferred"],
-        "state_retrievals": events["state_retrieved"],
+        "automatic_review_triggers": purposes["refinement_review"],
+        "reviews_approved": sum(r["shouldRefine"] for r in reviews),
+        "reviews_declined": sum(not r["shouldRefine"] for r in reviews),
+        "refinements_applied": sum(
+            any(e["applied"] for e in r["appliedEdits"]) for r in refinements
+        ),
+        "typed_edits": len(edits),
+        **{
+            kind + "_edits": sum(e["kind"] == kind for e in edits)
+            for kind in ("prompt", "memory", "skill", "subagent")
+        },
+        "refinement_planner_requests": purposes["refinement"],
         "compaction_requests": purposes["compaction"],
         "refinement_statuses": statuses,
         "host_operations": dict(operations),
@@ -204,7 +218,6 @@ def audit(output, previous):
         ("activity.jsonl", activities),
         ("rlm-calls.jsonl", calls),
         ("refinement-events.jsonl", refinements),
-        ("refinement-use.jsonl", [u for r in details for u in r["refinement_use"]]),
     ):
         (output / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return summary
@@ -233,10 +246,7 @@ async def execute(args):
         r["task_id"]: r
         for r in map(json.loads, (previous / "buffalo-results.jsonl").read_text().splitlines())
     }
-    assert [
-        sum(r[k] for r in previous_inputs.values())
-        for k in ("functional_pass", "style_pass", "overall_pass")
-    ] == [91, 70, 65]
+    assert set(previous_inputs) == set(IDS)
     assert old_manifest["task_ids"] == IDS
     assert git(source, "rev-parse", "HEAD") == old_manifest["official"]["starting_state"]["commit"]
     assert not git(source, "status", "--porcelain", "--untracked-files=no")
@@ -369,7 +379,6 @@ async def execute(args):
                     ("activity.jsonl", [trace]),
                     ("rlm-calls.jsonl", child_calls),
                     ("refinement-events.jsonl", refinement_events),
-                    ("refinement-use.jsonl", detail["refinement_use"]),
                 ):
                     with (output / name).open("a") as stream:
                         stream.writelines(json.dumps(row) + "\n" for row in rows)

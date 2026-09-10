@@ -34,6 +34,12 @@ class TrajectoryHistory:
             "subscription_model_selected",
             "agent_message_sent",
             "user_intervention",
+            "refine_scheduled",
+            "refinement_review",
+            "refine_complete",
+            "refine_failed",
+            "harness_refinement",
+            "harness_digest",
         }
         if not include_bookkeeping:
             # These receipts duplicate the committed work below. Keep them in the ledger,
@@ -68,7 +74,9 @@ class TrajectoryHistory:
             base = {k: event[k] for k in ("id", "seq", "timestamp", "session_id", "type")}
             block = []
             if row["committed_messages"] is not None:
-                for message in json.loads(row["committed_messages"]):
+                from .refinement_context import convert_to_llm
+
+                for message in convert_to_llm(json.loads(row["committed_messages"])):
                     role = message["role"]
                     if message.get("content"):
                         block.append(

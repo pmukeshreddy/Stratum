@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 from .activity import activity
+from .reinforcement_metrics import lifecycle
 
 
 def operations(code):
@@ -267,22 +268,9 @@ def task_observability(directory, record):
             "refinement_review",
             "refine_complete",
             "refine_failed",
-            "refinement_notice",
-            "refinement",
         }:
             continue
         payload = event["payload"]
-        visible = (
-            [
-                invocation_ref(r)
-                for r in root_inputs
-                if r["started_at"] > event["timestamp"]
-                and payload.get("content")
-                and any(payload["content"] in str(m.get("content", "")) for m in r["messages"])
-            ]
-            if event["type"] == "refinement_notice"
-            else []
-        )
         refinement_events.append(
             {
                 "task_id": task_id,
@@ -292,7 +280,6 @@ def task_observability(directory, record):
                 "type": event["type"],
                 "timestamp": event["timestamp"],
                 "payload": payload,
-                "later_root_invocations_receiving_notice": visible,
             }
         )
 
@@ -333,12 +320,8 @@ def task_observability(directory, record):
             for term in ("timeout", "timed out", "wall_seconds", "wall time")
         )
     ]
-    notice_inputs = {
-        r["request_id"]
-        for e in refinement_events
-        for r in e["later_root_invocations_receiving_notice"]
-    }
     detail = {
+        "reinforcement_lifecycle": lifecycle(directory),
         "task_id": task_id,
         "score": {k: bool(record[k + "_pass"]) for k in ("functional", "style", "overall")},
         "root": {
@@ -405,7 +388,6 @@ def task_observability(directory, record):
             ),
             "applied_edits": len(edits),
             **{k + "_edits": edit_kinds[k] for k in ("prompt", "memory", "skill", "subagent")},
-            "later_root_inputs_receiving_refinement_notice": len(notice_inputs),
         },
         "compaction": {
             "L1_compactions": counts["context_compaction"],
@@ -441,15 +423,6 @@ def task_observability(directory, record):
         },
         "raw_trace_directory": str(directory),
     }
-    from .refinement_use import refinement_use
-
-    detail["refinement_use"] = refinement_use(
-        events,
-        root_inputs,
-        sid,
-        task_id,
-        (directory / "answer.txt").read_text() if (directory / "answer.txt").exists() else "",
-    )
     return (
         detail,
         {
@@ -469,7 +442,6 @@ def task_observability(directory, record):
 
 
 def summarize(rows, previous, elapsed):
-    from .refinement_use import use_summary
 
     totals = {}
     for section in (
@@ -520,7 +492,28 @@ def summarize(rows, previous, elapsed):
             }
     return {
         "totals": totals,
-        "refinement_use": use_summary(rows),
+        "root_turn_distribution": dict(
+            sorted(Counter(r["root"]["root_turns"] for r in rows).items())
+        ),
+        "average_root_turns": statistics.mean(r["root"]["root_turns"] for r in rows),
+        "reinforcement_outcomes": dict(
+            Counter(outcome for r in rows for outcome in r["reinforcement_lifecycle"]["outcomes"])
+        ),
+        "reinforcement_lifecycle_totals": {
+            key: sum(r["reinforcement_lifecycle"][key] for r in rows)
+            for key in (
+                "explicit_refine_calls",
+                "compactions",
+                "interval_threshold_reached",
+                "compaction_trigger_reached",
+                "automatic_review_requests",
+                "review_approvals",
+                "review_declines",
+                "planner_calls",
+                "refinements_applied",
+                "typed_edits",
+            )
+        },
         "tasks_spawning_children": sum(r["RLM"]["children_spawned"] > 0 for r in rows),
         "runtime": {
             "median_task_seconds": statistics.median(seconds),

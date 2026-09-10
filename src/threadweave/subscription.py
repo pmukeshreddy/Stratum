@@ -104,21 +104,16 @@ class SubscriptionProvider:
             )
         supported = {item["reasoningEffort"] for item in catalog["supportedReasoningEfforts"]}
         if reasoning_off:
-            # Catalogs for reasoning-only models may have no off setting. Use the
-            # least supported effort, never the interactive session's default.
-            parameters["reasoning_effort"] = next(
-                (
-                    level
-                    for level in ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-                    if level in supported
-                ),
-                "none",
-            )
+            # Prime's completeSimple refinement calls omit reasoning entirely.
+            # Do not convert omission into a model-specific effort selection.
+            parameters.pop("reasoning_effort", None)
             parameters.pop("reasoning_summary", None)
-        effort = parameters.setdefault(
-            "reasoning_effort", settings["reasoning_effort"] or catalog["defaultReasoningEffort"]
-        )
-        if effort not in supported:
+        else:
+            parameters.setdefault(
+                "reasoning_effort",
+                settings["reasoning_effort"] or catalog["defaultReasoningEffort"],
+            )
+        if not reasoning_off and parameters["reasoning_effort"] not in supported:
             raise HarnessError(
                 "provider",
                 "UNSUPPORTED_REASONING",
@@ -128,7 +123,11 @@ class SubscriptionProvider:
         return resolved, settings
 
     async def invoke(self, request, emit):
-        config, settings = await self.resolve(request.config)
+        config, settings = (
+            await self.resolve(request.config, reasoning_off=True)
+            if request.reasoning_mode == "off"
+            else await self.resolve(request.config)
+        )
         executable = self.executable
         if not executable.is_file():
             raise HarnessError(
@@ -145,11 +144,18 @@ class SubscriptionProvider:
             "store": False,
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": request.session_id,
-            "reasoning": {
+        }
+        if request.reasoning_mode != "off":
+            body["reasoning"] = {
                 "effort": config.parameters["reasoning_effort"],
                 "summary": config.parameters.get("reasoning_summary", "auto"),
-            },
-        }
+            }
+        else:
+            # Prime's one-shot Codex request has no sessionId/reasoning option.
+            body.pop("prompt_cache_key", None)
+            if not body.get("tools"):
+                body.pop("tools", None)
+            body["text"] = {"verbosity": "low"}
         if config.parameters.get("verbosity"):
             body["text"] = {"verbosity": config.parameters["verbosity"]}
         environment = dict(os.environ)
@@ -177,6 +183,7 @@ class SubscriptionProvider:
             "refresh_lock": str(executable.parent / "refresh.lock"),
             "body": body,
             "request_id": request.request_id,
+            "refinement": request.metadata.get("purpose") in {"refinement", "refinement_review"},
         }
         try:
             async with asyncio.timeout(config.timeout_seconds):
@@ -270,13 +277,26 @@ class SubscriptionProvider:
                         if code == "AUTH_REQUIRED"
                         else f"Subscription inference failed: {code}"
                     )
-                    raise HarnessError(
+                    error = HarnessError(
                         "provider",
                         code,
                         message,
                         retryable=bool(event.get("retryable")),
                         uncertain=True,
                     )
+                    if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
+                        from .refinement_retry import classify_failure, retry_after_ms
+
+                        error.provider_failure = {
+                            "kind": classify_failure(
+                                "unauthorized" if code == "AUTH_REQUIRED" else code,
+                                event.get("status"),
+                            ),
+                            "retryAfterMs": event.get("retryAfterMs")
+                            if event.get("retryAfterMs") is not None
+                            else retry_after_ms(event.get("retry_headers", {})),
+                        }
+                    raise error
                 elif kind == "completed":
                     raw = event.get("usage") or {}
                     usage = Usage(
@@ -290,6 +310,7 @@ class SubscriptionProvider:
                         rate_limits=limits,
                         reasoning_summary="".join(summaries),
                         end_turn=event.get("end_turn"),
+                        stop_reason=event.get("stop_reason", "toolUse" if actions else "stop"),
                     )
                     return ModelResponse(
                         text="".join(text),

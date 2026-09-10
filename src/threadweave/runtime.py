@@ -36,7 +36,7 @@ from .models import (
     now,
 )
 from .providers import default_providers
-from .refinement import RefinementServices
+from .refinement import RefinementServices, refine_command
 from .routing import route
 from .skills import discover
 from .storage import Store, encode
@@ -491,11 +491,8 @@ class Runtime(RefinementServices):
                 delivery=delivery,
                 causal_request_id=causal_request_id,
             )
-            if sender_id is None and body.strip() == "/refine":
-                self.request_refinement(
-                    recipient_id,
-                    source="human",
-                )
+            if sender_id is None and (command := refine_command(body)):
+                self.queue_refine_command(recipient_id, command)
                 # Control input is consumed by the refinement queue, not by an
                 # ordinary agent turn (and is not evidence of reusable learning).
                 self.store.db.execute("UPDATE messages SET received_at=? WHERE id=?", (now(), mid))
@@ -577,7 +574,7 @@ class Runtime(RefinementServices):
         """Atomic human input + continuation; no client-side input/resume race."""
         if not body.strip():
             raise ValueError("Message cannot be empty")
-        if body.strip() == "/refine":
+        if refine_command(body):
             return self.message(None, sid, body)
         session = self.store.session(sid)
         if session.outcome == Outcome.LIMITED:
@@ -596,6 +593,7 @@ class Runtime(RefinementServices):
             self.store.update(sid, runnable=False, wake_at=now() + seconds)
 
     def resume(self, sid: str):
+        self.context._harness_context_ready.discard(sid)
         session = self.store.session(sid)
         self.validate_config(self.store.config(sid))
         if self._stopped_ancestor(sid):
@@ -617,7 +615,6 @@ class Runtime(RefinementServices):
                 "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
             )
             self.store.event(sid, "resumed", {})
-            self.context.ensure_harness_digest(sid)
         self._wake.set()
 
     def _stopped_ancestor(self, sid):
@@ -1067,6 +1064,7 @@ class Runtime(RefinementServices):
     async def _run_turn(self, sid):
         started = now()
         try:
+            await self.wait_refinement_barrier(sid)
             session = self.store.session(sid)
             if session.lifecycle == Lifecycle.INACTIVE:
                 self.store.transition(sid, Lifecycle.IDLE)
@@ -1077,20 +1075,13 @@ class Runtime(RefinementServices):
             pending = session.pending_turn
             if pending is None:
                 if not session.runnable or session.outcome == Outcome.COMPLETED:
-                    if await self.refinement_checkpoint(sid):
-                        self.store.update(sid, outcome=Outcome.ACTIVE, runnable=True, wake_at=None)
-                        self.store.event(
-                            sid,
-                            "refinement_continuation",
-                            {"reason": "Applied edits visible to next root turn"},
-                        )
+                    await self.refinement_checkpoint(sid)
                     return
                 self._check_limits(sid, resource="turns")
                 self.receive(sid, include_followups=not session.runnable or session.turns == 0)
                 await self._prepare(sid)
                 self._check_limits(sid, resource="turns")
                 self.store.charge(sid, Usage(turns=1))
-                self.context.ensure_harness_digest(sid, committed=True)
                 self._admitted_turns.add(sid)
                 response, response_event = await self._invoke(sid)
                 if (
@@ -1212,15 +1203,7 @@ class Runtime(RefinementServices):
                     )
                 explicit_ok = verifier_ok = False
                 self.store.update(sid, runnable=True, wake_at=None)
-            learned = await self.refinement_checkpoint(sid, completed_turn=True)
-            if learned:
-                explicit_ok = verifier_ok = False
-                self.store.update(sid, runnable=True, wake_at=None)
-                self.store.event(
-                    sid,
-                    "refinement_continuation",
-                    {"reason": "Applied edits visible to next root turn"},
-                )
+            await self.refinement_checkpoint(sid, completed_turn=True)
             if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
                 late_delivery = self.receive(sid)
                 if late_delivery:
@@ -1289,7 +1272,7 @@ class Runtime(RefinementServices):
                 self._continue_completed_child(sid)
                 self.store.event(sid, "turn_completed", {"turn": current.turns})
                 if current.mode == "interactive":
-                    if not response.actions and not delivered and not learned:
+                    if not response.actions and not delivered:
                         self.store.update(sid, runnable=False, wake_at=None)
                         self.store.event(sid, "conversation_reply", {"verified": False})
                     # Interventions arriving during a response or verifier must not
@@ -1300,9 +1283,7 @@ class Runtime(RefinementServices):
                     pending_input = bool(
                         delivered or self.store.messages(sid, pending=True, limit=1)
                     )
-                    self.store.update(
-                        sid, runnable=(pending_input or learned) and not current.paused
-                    )
+                    self.store.update(sid, runnable=pending_input and not current.paused)
         except TurnAdmissionLimit as exc:
             root_id = self.store.session(sid).root_id
             active = [
@@ -1377,6 +1358,9 @@ class Runtime(RefinementServices):
         self.environment.call(sid, "admitted", sid)
 
     async def _invoke(self, sid):
+        if sid not in self._admitted_turns:
+            await self.wait_refinement_barrier(sid)
+        self.context.ensure_harness_digest(sid)
         config = self.store.config(sid)
         if config.control_plane == "python" and config.features.persistent_repl:
             kernel = self._kernel(sid)
@@ -1511,10 +1495,12 @@ class Runtime(RefinementServices):
                 )
         raise AssertionError("Unreachable context recovery loop")
 
-    async def _model_call(self, sid, request, *, persist_turn=True):
+    async def _model_call(self, sid, request, *, persist_turn=True, max_attempts=None):
         request = request.model_copy(deep=True, update={"request_id": new_id()})
         try:
-            return await self._model_call_with_retries(sid, request, persist_turn=persist_turn)
+            return await self._model_call_with_retries(
+                sid, request, persist_turn=persist_turn, max_attempts=max_attempts
+            )
         except BaseException:
             # Admission failure or cancellation during retry backoff also closes
             # the logical request, even though no new transport attempt started.
@@ -1524,8 +1510,9 @@ class Runtime(RefinementServices):
             )
             raise
 
-    async def _model_call_with_retries(self, sid, request, *, persist_turn=True):
+    async def _model_call_with_retries(self, sid, request, *, persist_turn=True, max_attempts=None):
         config = self.store.config(sid)
+        attempts = max_attempts if max_attempts is not None else config.retry.attempts
         session = self.store.session(sid)
         size, provider = request.input_token_bound, request.config
         if provider.name == "codex_subscription":
@@ -1536,6 +1523,16 @@ class Runtime(RefinementServices):
                 if request.reasoning_mode == "off"
                 else await resolver.resolve(provider)
             )
+            if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
+                from .refinement_model import refinement_output_limit
+
+                provider = provider.model_copy(
+                    update={
+                        "max_output_tokens": refinement_output_limit(
+                            provider, review=request.metadata["purpose"] == "refinement_review"
+                        )
+                    }
+                )
             if request.request_kind == "trajectory":
                 self.store.pin_provider(sid, previous, provider)
             request = request.model_copy(update={"config": provider})
@@ -1552,7 +1549,7 @@ class Runtime(RefinementServices):
         # One logical identity per body; transport retries below reuse it.
         request_artifact = self.artifacts.put(sid, request.public_dump())
         registered = False
-        for attempt in range(config.retry.attempts):
+        for attempt in range(attempts):
             while True:
                 try:
                     with self.store.transaction():
@@ -1754,15 +1751,17 @@ class Runtime(RefinementServices):
                             retries=int(attempt > 0),
                         ),
                         failure=failure.model_dump(),
-                        retry=failure.retryable and attempt + 1 < config.retry.attempts,
+                        retry=failure.retryable and attempt + 1 < attempts,
                     )
 
                 if (
                     failure.code
                     in {"context_overflow", "context_length_exceeded", "context_capacity"}
                     or not failure.retryable
-                    or attempt + 1 >= config.retry.attempts
+                    or attempt + 1 >= attempts
                 ):
+                    if isinstance(exc, HarnessError):
+                        raise
                     raise HarnessError(
                         failure.category,
                         failure.code,
@@ -1961,6 +1960,7 @@ class Runtime(RefinementServices):
                     "kernel_state": self.store.config(sid).kernel_state.model_dump(),
                     "root_id": session.root_id,
                     "parent_id": session.parent_id,
+                    "depth": session.depth,
                     "name": session.name,
                     "task": session.instruction,
                     "original_task": self.context.original_task(sid),
@@ -2272,6 +2272,7 @@ class Runtime(RefinementServices):
 
     async def pause(self, sid):
         self.store.update(sid, runnable=False, paused=True, wake_at=None)
+        self.invalidate_refinement(sid)
         kernel = self.kernels.get(sid)
         if kernel and kernel.active_execution:
             await kernel.interrupt(kernel.active_execution)
@@ -2287,6 +2288,9 @@ class Runtime(RefinementServices):
         source = self.store.session(sid)
         if sid in self.tasks:
             raise ValueError("Pause the source session before forking it")
+        if command := self.refinement_state(sid).command_task:
+            await asyncio.shield(command)
+        await self.refinement_branch_changed(sid)
         last = self.store.events(sid, limit=1)
         config = self.store.config(sid).model_copy(deep=True)
         workspace, _ = self.environment.continuation_workspace(source, config)
@@ -2305,6 +2309,8 @@ class Runtime(RefinementServices):
                 branch.id,
                 context=source.context,
                 summary=source.summary,
+                summary_harness_digest=source.summary_harness_digest,
+                summary_timestamp=source.summary_timestamp,
                 adapter_context=source.adapter_context,
                 turns=turn_index,
             )
@@ -2334,11 +2340,9 @@ class Runtime(RefinementServices):
                 save_harness_state,
             )
 
-            self.invalidate_refinement(sid)
             save_harness_state(self.store.harness.path(branch.id), self.store.harness.load(sid))
             for record in self.store.refinement_history(sid):
                 self.store.record_harness_refinement(branch.id, record)
-            self.context.ensure_harness_digest(branch.id)
             source_dir = self.store.directory / "kernels" / source.kernel_id
             target_dir = self.store.directory / "kernels" / branch.kernel_id
             if source_dir.exists():
@@ -2367,10 +2371,14 @@ class Runtime(RefinementServices):
                 await asyncio.sleep(0.02)
 
     async def shutdown(self):
-        # Service queued idle work before closing; active interrupted turns are cancelled.
+        if not hasattr(self, "_shutdown_task"):
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+        await asyncio.shield(self._shutdown_task)
+
+    async def _shutdown(self):
+        # Prime drains valid refinement before disposing the context/kernel stores.
         for sid in list(self._refinement_states):
-            if sid not in self.tasks and not self.refinement_state(sid).in_progress:
-                await self.refinement_checkpoint(sid)
+            await self.drain_refinement(sid)
         self._closing = True
         self._wake.set()
         if self._scheduler_task:

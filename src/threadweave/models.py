@@ -51,6 +51,14 @@ class HarnessError(Exception):
         )
 
 
+class ModelMetadata(Record):
+    """Selected model definition, distinct from a turn's requested output budget."""
+
+    maxTokens: int | None = Field(default=None, gt=0)
+    reasoning: bool | None = None
+    compat: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProviderConfig(Record):
     name: str = "codex_subscription"
     model: str = ""
@@ -60,6 +68,7 @@ class ProviderConfig(Record):
     streaming: bool = True
     timeout_seconds: float = Field(default=120, gt=0)
     max_output_tokens: int = Field(default=2048, gt=0)
+    model_metadata: ModelMetadata = Field(default_factory=ModelMetadata)
     input_cost_per_million: float | None = Field(default=None, ge=0)
     output_cost_per_million: float | None = Field(default=None, ge=0)
 
@@ -106,11 +115,40 @@ class RetryPolicy(Record):
     max_delay: float = Field(default=10, ge=0)
 
 
+class ProviderRetryPolicy(Record):
+    """Prime one-shot completion settings (Python durations are in seconds)."""
+
+    enabled: bool = True
+    max_retries: int = Field(default=3, ge=0)
+    base_delay: float = Field(default=2, ge=0)
+    max_retry_delay: float = Field(default=60, ge=0)
+
+
 class RefinementPolicy(Record):
     enabled: bool = True
-    turn_interval: int = Field(default=25, ge=1)
+    turn_interval: float = 25
     compact: bool = True
-    cooldown_seconds: float = Field(default=20 * 60, ge=0)
+    cooldown_seconds: float = 20 * 60
+
+    @model_validator(mode="before")
+    @classmethod
+    def prime_defaults(cls, value):
+        import math
+
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        for field, default, minimum in (("turn_interval", 25, 1), ("cooldown_seconds", 1200, 0)):
+            number = value.get(field)
+            value[field] = (
+                max(minimum, number)
+                if type(number) in (int, float) and math.isfinite(number)
+                else default
+            )
+        for field in ("enabled", "compact"):
+            if value.get(field) is None:
+                value[field] = True
+        return value
 
 
 class KernelStatePolicy(Record):
@@ -268,7 +306,9 @@ class RunConfig(Record):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     context: ContextPolicy = Field(default_factory=ContextPolicy)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    provider_retry: ProviderRetryPolicy = Field(default_factory=ProviderRetryPolicy)
     refinement: RefinementPolicy = Field(default_factory=RefinementPolicy)
+    serialized_refine: bool | None = None
     kernel_state: KernelStatePolicy = Field(default_factory=KernelStatePolicy)
     verification: VerificationPolicy = Field(default_factory=VerificationPolicy)
     limits: ResourceLimits = Field(default_factory=ResourceLimits)
@@ -349,6 +389,8 @@ class Session(Record):
     turns: int = 0
     context: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
+    summary_harness_digest: str | None = None
+    summary_timestamp: float = 0
     adapter_context: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @model_validator(mode="before")

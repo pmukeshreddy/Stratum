@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import json
-import logging
+import math
 import os
 import re
-import tempfile
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 KINDS = ("prompt", "memory", "skill", "subagent")
-log = logging.getLogger(__name__)
+
+
+class HarnessAuditError(Exception):
+    def __init__(self, result, cause):
+        super().__init__(str(cause))
+        self.result, self.cause = result, cause
 
 
 def timestamp():
@@ -25,30 +28,31 @@ def empty_harness_state():
     return {"schema": 1, "entries": {kind: {} for kind in KINDS}, "refinements": []}
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, python=False):
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    fd, temporary = tempfile.mkstemp(prefix=".harness-", dir=path.parent)
+    if not python:
+        value = json.loads(js_json(value))
+    data = json.dumps(value, ensure_ascii=False, indent=2) + ("" if python else "\n")
+    if not python:
+        data = data.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    existing_mode = path.stat().st_mode & 0o777 if path.exists() else None
+    mode = existing_mode if existing_mode is not None else 0o600
     try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            os.fchmod(stream.fileno(), path.stat().st_mode & 0o777 if path.exists() else 0o600)
             stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
+        if not python or existing_mode is not None:
+            os.chmod(temporary, mode)
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
     return str(path)
 
 
-def load_harness_state(directory, scope="global"):
+def load_harness_state(directory, scope="global", *, python=False):
     path = Path(directory) / "harness_state.json"
     state = empty_harness_state()
     try:
@@ -57,13 +61,14 @@ def load_harness_state(directory, scope="global"):
             raise ValueError("harness state must be an object")
     except FileNotFoundError:
         return state
-    except (OSError, ValueError) as exc:
-        log.warning("Cannot load continual harness %s: %s; using empty state", path, exc)
+    except (OSError, ValueError):
         return state
-    state["schema"] = raw.get("schema", 1) if isinstance(raw.get("schema", 1), int) else 1
+    state["schema"] = raw.get("schema", 1) if type(raw.get("schema", 1)) in (int, float) else 1
     entries = raw.get("entries")
     for kind in KINDS:
         records = entries.get(kind) if isinstance(entries, dict) else None
+        if isinstance(records, list) and not python:
+            records = {str(index): entry for index, entry in enumerate(records)}
         if not isinstance(records, dict):
             continue
         for id, entry in records.items():
@@ -82,8 +87,66 @@ def load_harness_state(directory, scope="global"):
     return state
 
 
-def save_harness_state(directory, state):
-    return atomic_json(Path(directory) / "harness_state.json", state)
+def save_harness_state(directory, state, *, python=False):
+    path = Path(directory) / "harness_state.json"
+    atomic_json(path, state, python=python)
+    return str(path)
+
+
+def python_harness_state(directory, scope="local"):
+    """Prime's Python HarnessEntry/RefinementEvent loader (not the host planner loader)."""
+    state = load_harness_state(directory, scope, python=True)
+    state["schema"] = 1
+    for kind, records in state["entries"].items():
+        clean = {}
+        for id, entry in records.items():
+            if not isinstance(entry.get("title"), str) or not isinstance(entry.get("content"), str):
+                continue
+            version = entry.get("version", 1)
+            if isinstance(version, str):
+                try:
+                    version = int(version)
+                except ValueError:
+                    version = 1
+            clean[id] = {
+                "id": str(id),
+                "kind": kind,
+                "title": entry["title"],
+                "content": entry["content"],
+                "path": entry.get("path") if isinstance(entry.get("path"), str) else "general",
+                "scope": entry["scope"],
+                **{key: entry[key] for key in ("reference", "arguments", "metadata")},
+                "source": entry.get("source") if isinstance(entry.get("source"), str) else "agent",
+                "created_at": entry.get("created_at", datetime.now(UTC).isoformat()),
+                "updated_at": entry.get("updated_at", datetime.now(UTC).isoformat()),
+                "version": version if isinstance(version, int) else 1,
+            }
+        state["entries"][kind] = clean
+    events = []
+    for event in state["refinements"]:
+        if (
+            not isinstance(event, dict)
+            or not isinstance(event.get("id"), str)
+            or not isinstance(event.get("trigger"), str)
+        ):
+            continue
+        changes = event.get("changes")
+        if not isinstance(changes, (str, list)):
+            continue
+        events.append(
+            {
+                "id": event["id"],
+                "trigger": event["trigger"],
+                "changes": [changes]
+                if isinstance(changes, str)
+                else [str(change) for change in changes],
+                "evidence": event.get("evidence", ""),
+                "outcome": event.get("outcome", ""),
+                "created_at": event.get("created_at", datetime.now(UTC).isoformat()),
+            }
+        )
+    state["refinements"] = events
+    return state
 
 
 def merge_harness_states(global_state, local_state=None):
@@ -94,7 +157,9 @@ def merge_harness_states(global_state, local_state=None):
         for scope, state in (("global", global_state), ("local", local_state)):
             for id, entry in state["entries"][kind].items():
                 entry = copy.deepcopy(entry)
-                entry.setdefault("scope", scope)
+                entry["scope"] = (
+                    entry.get("scope") if entry.get("scope") in ("local", "global") else scope
+                )
                 key = f"{entry['scope']}:{id}" if id in merged["entries"][kind] else id
                 merged["entries"][kind][key] = entry
     merged["refinements"] = copy.deepcopy(global_state["refinements"] + local_state["refinements"])
@@ -115,9 +180,6 @@ def load_refinement_history(directory, scope="global"):
     try:
         lines = path.read_text().splitlines()
     except FileNotFoundError:
-        return []
-    except OSError as exc:
-        log.warning("Cannot read refinement history %s: %s", path, exc)
         return []
     records = []
     for line in lines:
@@ -140,7 +202,6 @@ def append_refinement_history(directory, result):
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n"
     with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
         stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
@@ -160,33 +221,102 @@ def merge_refinement_history(global_history, local_history):
 
 def compact_text(value, limit=180):
     text = re.sub(r"\s+", " ", str(value)).strip()
-    return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
+    return text if js_length(text) <= limit else js_slice(text, 0, max(0, limit - 3)) + "..."
 
 
-def format_harness_state(state, *, entry_limit=6, content_limit=180, refinement_limit=5):
+def js_length(text):
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def js_slice(text, start=0, end=None):
+    units = text.encode("utf-16-le", errors="surrogatepass")
+    length = len(units) // 2
+    start = max(0, length + start) if start < 0 else min(start, length)
+    end = length if end is None else max(0, length + end) if end < 0 else min(end, length)
+    return units[2 * start : 2 * max(start, end)].decode("utf-16-le", errors="surrogatepass")
+
+
+def js_json(value):
+    """JSON.stringify ordering and numeric normalization for touched-entry equality."""
+
+    def normalize(item):
+        if isinstance(item, float):
+            return None if not math.isfinite(item) else int(item) if item.is_integer() else item
+        if isinstance(item, list):
+            return [normalize(v) for v in item]
+        if isinstance(item, dict):
+            indexed = sorted(
+                (
+                    key
+                    for key in item
+                    if str(key).isdigit() and str(int(key)) == key and int(key) < 4294967295
+                ),
+                key=int,
+            )
+            keys = [*indexed, *(key for key in item if key not in indexed)]
+            return {key: normalize(item[key]) for key in keys}
+        return item
+
+    return json.dumps(normalize(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def format_harness_state(
+    state,
+    *,
+    entry_limit=6,
+    content_limit=180,
+    refinement_limit=5,
+    include_ipython_examples=True,
+    include_shell_examples=False,
+    include_refine_examples=None,
+):
+    if include_refine_examples is None:
+        include_refine_examples = include_ipython_examples
     lines = [
         "# Continual Harness State",
         "",
-        "You have persistent learned harness state. Local entries belong to this session; global entries survive sessions.",
-        "These compact summaries are routing hints. Inspect full entries with harness.get(kind, id, global_=True/False) when detail matters.",
-        "Local entries may override global guidance for this session. Prompt entries supplement the immutable base system prompt.",
+        "Local continual harness entries belong to this Buffalo session. Global continual harness entries persist across Buffalo sessions.",
+        "The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
+        "Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
+        "Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
         "",
     ]
+    call = (
+        "call `await refine.run()`" if include_refine_examples else "refine the continual harness"
+    )
+    keep = (
+        "`await refine.run()` continual harness edits"
+        if include_refine_examples
+        else "continual harness edits"
+    )
+    lines.extend(
+        [
+            f"When to {call}: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep {keep} small and evidence-backed.",
+            "",
+            "Call contract: read each installed Python skill's SKILL.md and call its documented module function in the Python REPL; do not assume a `.run` entrypoint. Use `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a continual harness subagent spec by composing a concise task prompt and calling `handle = await rlm('sub-task')`; admission returns immediately with `rlm_child_id`, `name`, `session_dir`, and `model`, never the child's answer. Results arrive only through explicit `agent_message` replies or files; children reply with `await agent_message.send(message, receiver_role='parent')`. Use `await rlm.list_subagents()` to recover direct child handles and `await agent_message.send(..., receiver_role='child', receiver_name=handle.name)` for follow-ups. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries."
+            if include_ipython_examples
+            else "Call contract: use installed skills as shell commands when available (for example `<skill_import> ...`). Continual harness entries are routing/context hints only in sessions without the Python REPL; do not use Python `await`, `asyncio`, or `rlm` examples unless the prompt also documents a Python kernel."
+            if include_shell_examples
+            else "Call contract: continual harness entries are routing/context hints only in sessions without the Python REPL or shell access; do not use Python `await`, `asyncio`, `rlm`, or shell skill commands unless the prompt also documents those interfaces.",
+            "",
+        ]
+    )
     for kind in KINDS:
         entries = sorted(
             state["entries"][kind].values(),
             key=lambda e: tuple(str(e.get(k, "")) for k in ("path", "title", "id")),
         )
-        lines.append(f"{kind}: {len(entries)}")
+        lines.append(
+            f"{kind}: {len(entries)} (invoke a spec by turning it into a concise task prompt and spawning with `await rlm('<task>')`; admission returns a child handle, never the answer)"
+            if kind == "subagent" and entries and include_ipython_examples
+            else f"{kind}: {len(entries)}"
+        )
         for entry in entries[:entry_limit]:
             extra = ""
             if kind == "skill":
-                extra = " ref=" + compact_text(
-                    json.dumps(entry.get("reference", {})), content_limit
-                )
-                extra += " args=" + compact_text(
-                    json.dumps(entry.get("arguments", {})), content_limit
-                )
+                for field, label in (("reference", "ref"), ("arguments", "args")):
+                    if entry.get(field):
+                        extra += f" {label}=" + compact_text(js_json(entry[field]), content_limit)
             lines.append(
                 f"- [{entry.get('scope', 'global')}:{entry['id']}] {entry.get('title', '')} ({entry.get('path', 'general')}, v{entry.get('version', 1)}){extra}: {compact_text(entry.get('content', ''), content_limit)}"
             )
@@ -195,27 +325,96 @@ def format_harness_state(state, *, entry_limit=6, content_limit=180, refinement_
         lines.append("")
     if not any(state["entries"].values()):
         lines.extend(["No saved harness entries yet.", ""])
-    events = state["refinements"]
-    lines.append(f"recent refinements: {len(events)}")
-    for event in events[-refinement_limit:]:
-        lines.append(
-            f"- [{event.get('id')}] {compact_text(event.get('trigger', ''))}: {', '.join(event.get('changes', [])) or 'no applied edits'}; outcome: {compact_text(event.get('outcome', ''))}"
+    refinements = state["refinements"]
+    lines.append(f"recent refinements: {len(refinements)}")
+    for event in refinements[-refinement_limit:] if refinement_limit else []:
+        changes = ", ".join(event["changes"]) or "no applied edits"
+        outcome = (
+            f"; outcome: {compact_text(event['outcome'], content_limit)}"
+            if event.get("outcome")
+            else ""
         )
-    if len(events) > refinement_limit:
-        lines.append(f"- +{len(events) - refinement_limit} older refinement events")
+        lines.append(
+            f"- [{event['id']}] {compact_text(event['trigger'], content_limit)}: {changes}{outcome}"
+        )
+    if len(refinements) > refinement_limit:
+        lines.append(f"- +{len(refinements) - refinement_limit} older refinement events")
     return "\n".join(lines).strip()
+
+
+def overview_for_refinement(state):
+    """Prime's bounded entry overview: up to 40 entries per kind, 240 content characters."""
+    lines = []
+    for kind in KINDS:
+        entries = list(state["entries"][kind].values())
+        lines.append(f"{kind}: {len(entries)}")
+        for entry in entries[:40]:
+            extra = ""
+            if kind == "skill":
+                for field, label in (("reference", "ref"), ("arguments", "args")):
+                    if entry.get(field):
+                        extra += f" {label}=" + js_slice(js_json(entry[field]), 0, 240)
+            content = js_slice(re.sub(r"\s+", " ", entry["content"]), 0, 240)
+            lines.append(
+                f"- [{entry['scope']}:{entry['id']}] {entry['title']} "
+                f"({entry['path']}, v{entry['version']}){extra}: {content}"
+            )
+        if len(entries) > 40:
+            lines.append(f"- +{len(entries) - 40} more {kind} entries")
+    return "\n".join(lines)
+
+
+def history_for_refinement(history):
+    if not history:
+        return "No prior refinement history."
+    lines = []
+    for item in history[-20:]:
+        edits = ", ".join(
+            f"{'applied' if edit['applied'] else 'failed'} {edit['action']} {edit['kind']}:{edit['id']}"
+            for edit in item["appliedEdits"]
+        )
+        rollback = f" rollbackOf={item['rollbackOf']}" if item.get("rollbackOf") else ""
+        lines.append(
+            f"[{item['id']}]{rollback} {item['summary']}\n{edits}\n"
+            f"Expected outcome: {item['expectedOutcome']}"
+        )
+    return "\n\n".join(lines)
 
 
 def normalize_proposal(value):
     if not isinstance(value, dict):
-        raise ValueError("Refiner JSON must be an object")
+        value = {}
+    edits = value.get("edits", [])
+    normalized = []
+    for edit in edits if isinstance(edits, list) else []:
+        if isinstance(edit, list):
+            edit = {}
+        elif not isinstance(edit, dict):
+            continue
+        normalized.append(
+            {
+                **{key: edit.get(key) for key in ("action", "kind")},
+                **{
+                    key: edit[key]
+                    for key in ("id", "title", "content", "path", "reason")
+                    if isinstance(edit.get(key), str)
+                },
+                **{
+                    key: edit[key]
+                    for key in ("reference", "arguments", "metadata")
+                    if isinstance(edit.get(key), dict)
+                },
+            }
+        )
     return {
-        "summary": value.get("summary", "Refined continual harness state"),
-        "rationale": value.get("rationale", ""),
-        "expectedOutcome": value.get("expectedOutcome", ""),
-        "edits": [e for e in value.get("edits", []) if isinstance(e, dict)]
-        if isinstance(value.get("edits", []), list)
-        else [],
+        "summary": value["summary"]
+        if isinstance(value.get("summary"), str)
+        else "Refined continual harness state",
+        "rationale": value["rationale"] if isinstance(value.get("rationale"), str) else "",
+        "expectedOutcome": value["expectedOutcome"]
+        if isinstance(value.get("expectedOutcome"), str)
+        else "",
+        "edits": normalized,
     }
 
 
@@ -248,7 +447,7 @@ def validate_edit(edit, id):
     return None
 
 
-def updated_entry(kind, id, edit, before=None, *, scope="local", source="agent"):
+def updated_entry(kind, id, edit, before=None, *, scope="local", source="agent", python=False):
     """Shared version/timestamp machinery for planner edits and direct kernel writes."""
     previous = before or {}
     return {
@@ -261,8 +460,10 @@ def updated_entry(kind, id, edit, before=None, *, scope="local", source="agent")
         **{k: edit.get(k, previous.get(k, {})) for k in ("reference", "arguments", "metadata")},
         "source": source,
         "version": previous.get("version", 0) + 1,
-        "created_at": previous.get("created_at", timestamp()),
-        "updated_at": timestamp(),
+        "created_at": previous.get(
+            "created_at", datetime.now(UTC).isoformat() if python else timestamp()
+        ),
+        "updated_at": datetime.now(UTC).isoformat() if python else timestamp(),
     }
 
 
@@ -282,19 +483,21 @@ def apply_refinement_proposal(
     for raw in proposal["edits"]:
         edit = copy.deepcopy(raw)
         identifier = edit.get("id")
-        if isinstance(identifier, str):
-            identifier = re.sub(r"^(local|global):", "", identifier)
-        elif edit.get("action") == "create":
-            identifier = (
-                re.sub(
-                    r"[^a-z0-9]+", "_", str(edit.get("title") or edit.get("kind", "entry")).lower()
-                ).strip("_")[:80]
-                or "entry"
-            )
-        else:
-            identifier = ""
+        if identifier is None and edit.get("action") == "create":
+            identifier = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                str(edit.get("title", edit.get("kind", "entry"))).strip().lower(),
+            ).strip("_")[:80] or str(edit.get("kind", "entry"))
+        identifier = identifier if identifier is not None else ""
         edit["id"] = identifier
+        # Validation checks the supplied id; computed ids are only for creates.
         error = validate_edit(edit, identifier)
+        if raw.get("action") != "create" and not raw.get("id"):
+            error = error or f"{raw.get('action')} requires id"
+        if error:
+            applied.append({**edit, "applied": False, "error": error})
+            continue
         kind, action = edit.get("kind"), edit.get("action")
         before = (
             copy.deepcopy(state["entries"].get(kind, {}).get(identifier))
@@ -306,7 +509,7 @@ def apply_refinement_proposal(
             not error
             and baseline_state is not None
             and key not in modified
-            and before != baseline_state["entries"][kind].get(identifier)
+            and js_json(before) != js_json(baseline_state["entries"][kind].get(identifier))
         ):
             error = "entry changed during refinement planning"
         if not error and action == "create" and before:
@@ -342,9 +545,8 @@ def apply_refinement_proposal(
         "scope": scope,
         **{k: proposal[k] for k in ("summary", "rationale", "expectedOutcome")},
         "appliedEdits": applied,
-        "rollbackOf": rollback_of,
+        **({"rollbackOf": rollback_of} if rollback_of is not None else {}),
         "harnessStatePath": "",
-        "timestamp": timestamp(),
     }
 
 
@@ -374,29 +576,6 @@ def rollback_proposal(target):
     }
 
 
-def refinement_notice(result, source, *, expand=False):
-    edits = [e for e in result["appliedEdits"] if e["applied"]]
-    if not edits:
-        return None
-    lines = [f"[{source}-refinement]", compact_text(result["summary"])]
-    if expand and result.get("application"):
-        lines.append("Intended application to remaining work: " + json.dumps(result["application"]))
-    for edit in edits:
-        entry = edit.get("after") or edit.get("before")
-        lines.append(
-            f"- {edit['action']} {edit['kind']} [{entry['scope']}:{edit['id']}] {entry['title']}: "
-            + (entry["content"] if expand else compact_text(entry["content"]))
-        )
-    if expand:
-        lines.append(
-            "Evaluate these newly changed entries against the original task. Apply relevant "
-            "corrections to remaining work and validate the candidate before finishing. "
-            "If the issue is already corrected or the entry is irrelevant, do not perform "
-            "ceremonial work; its application has no demonstrated in-task effect."
-        )
-    return "\n".join(lines)
-
-
 class HarnessStore:
     def __init__(self, directory, *, session_history):
         self.directory = Path(directory)
@@ -412,6 +591,9 @@ class HarnessStore:
     def load(self, sid=None):
         return load_harness_state(self.path(sid), "local" if sid else "global")
 
+    def python_state(self, sid=None):
+        return python_harness_state(self.path(sid), "local" if sid else "global")
+
     def merged(self, sid):
         return merge_harness_states(self.load(), self.load(sid))
 
@@ -422,73 +604,71 @@ class HarnessStore:
         if kind not in KINDS:
             raise ValueError(f"Unknown harness kind: {kind}")
         id, global_ = scope_target(id, global_)
-        return self.load(None if global_ else sid)["entries"][kind].get(id)
+        return self.python_state(None if global_ else sid)["entries"][kind].get(id)
 
     def mutate(self, sid, action, kind=None, *, id=None, global_=False, source="agent", **fields):
         id, global_ = scope_target(id, global_)
         target = None if global_ else sid
-        with self.lock(target):
-            state = self.load(target)  # Never overwrite a host/kernel writer's newer snapshot.
-            if action == "record_refinement":
-                changes = fields["changes"]
-                result = {
-                    "id": id or f"refine_{len(state['refinements']) + 1:04d}",
-                    "trigger": fields["trigger"],
-                    "changes": [changes] if isinstance(changes, str) else list(changes),
-                    "evidence": fields.get("evidence", ""),
-                    "outcome": fields.get("outcome", ""),
-                    "created_at": timestamp(),
-                }
-                state["refinements"].append(result)
+        state = self.python_state(target)  # Reload host/kernel writes before mutating.
+        if action == "record_refinement":
+            changes = fields["changes"]
+            result = {
+                "id": id or f"refine_{len(state['refinements']) + 1:04d}",
+                "trigger": fields["trigger"],
+                "changes": [changes] if isinstance(changes, str) else list(changes),
+                "evidence": fields.get("evidence", ""),
+                "outcome": fields.get("outcome", ""),
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            state["refinements"].append(result)
+        else:
+            if kind not in KINDS:
+                raise ValueError(f"Unknown harness kind: {kind}")
+            if action not in ("create", "update", "delete", "upsert"):
+                raise ValueError(f"Unknown harness operation: {action}")
+            identifier = id or "_".join(
+                "".join(
+                    c.lower() if c.isalnum() else "_" for c in fields.get("title", "").strip()
+                ).split()
+            )
+            identifier = id or ("_".join(p for p in identifier.split("_") if p) or kind)[:80]
+            before = state["entries"][kind].get(identifier)
+            if action == "delete":
+                if before is None:
+                    return False
+                del state["entries"][kind][identifier]
+                result = True
             else:
-                if kind not in KINDS:
-                    raise ValueError(f"Unknown harness kind: {kind}")
-                if action not in ("create", "update", "delete", "upsert"):
-                    raise ValueError(f"Unknown harness operation: {action}")
-                identifier = id or "_".join(
-                    "".join(
-                        c.lower() if c.isalnum() else "_" for c in fields.get("title", "").strip()
-                    ).split()
+                if action == "create" and before is not None:
+                    raise ValueError(f"{kind} entry {identifier!r} already exists")
+                if action == "update" and before is None:
+                    raise ValueError(f"{kind} entry {identifier!r} does not exist")
+                fields = {k: v for k, v in fields.items() if v is not None}
+                result = updated_entry(
+                    kind,
+                    identifier,
+                    fields,
+                    before,
+                    scope="global" if global_ else "local",
+                    source=source,
+                    python=True,
                 )
-                identifier = id or ("_".join(p for p in identifier.split("_") if p) or kind)[:80]
-                before = state["entries"][kind].get(identifier)
-                if action == "delete":
-                    if before is None:
-                        return False
-                    del state["entries"][kind][identifier]
-                    result = True
-                else:
-                    if action == "create" and before is not None:
-                        raise ValueError(f"{kind} entry {identifier!r} already exists")
-                    if action == "update" and before is None:
-                        raise ValueError(f"{kind} entry {identifier!r} does not exist")
-                    fields = {k: v for k, v in fields.items() if v is not None}
-                    result = updated_entry(
-                        kind,
-                        identifier,
-                        fields,
-                        before,
-                        scope="global" if global_ else "local",
-                        source=source,
-                    )
-                    error = validate_edit(
-                        {**result, "action": "update" if before else "create"}, identifier
-                    )
-                    if error:
-                        raise ValueError(error)
-                    state["entries"][kind][identifier] = result
-            save_harness_state(self.path(target), state)
-            return copy.deepcopy(result)
+                state["entries"][kind][identifier] = result
+        save_harness_state(self.path(target), state, python=True)
+        return copy.deepcopy(result)
 
     def overview(self, sid, *, global_=False, max_entries_per_kind=20):
-        state = self.load(None if global_ else sid)
+        state = self.python_state(None if global_ else sid)
         lines = [
             f"Harness state ({'global' if global_ else 'local'}): {self.path(None if global_ else sid) / 'harness_state.json'}",
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
-            "harness skills use Python references and arguments. Spawn a subagent spec with "
-            "handle = await rlm('sub-task'); admission returns immediately, never the child's answer. "
-            "Children reply with await agent_message.send(message, receiver_role='parent'). "
-            "Use await rlm.list_subagents() and receiver_role='child' for follow-ups.",
+            "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
+            "Spawn a subagent spec by composing a concise task prompt and calling "
+            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
+            "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
+            "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
+            "receiver_role='child', receiver_name=handle.name) for follow-ups.",
         ]
         for kind in KINDS:
             entries = sorted(
@@ -503,8 +683,11 @@ class HarnessStore:
                             extra += f" {label}=" + compact_text(
                                 json.dumps(entry[field], ensure_ascii=False, sort_keys=True), 120
                             )
+                summary = entry["content"].strip().replace("\n", " ")
+                if len(summary) > 120:
+                    summary = summary[:117] + "..."
                 lines.append(
-                    f"  - [{entry['scope']}:{entry['id']}] {entry['title']} ({entry['path']}, v{entry['version']}){extra}: {compact_text(entry['content'], 120)}"
+                    f"  - [{entry['scope']}:{entry['id']}] {entry['title']} ({entry['path']}, v{entry['version']}){extra}: {summary}"
                 )
             if len(entries) > max_entries_per_kind:
                 lines.append(f"  - +{len(entries) - max_entries_per_kind} more")
@@ -517,14 +700,6 @@ class HarnessStore:
         return merge_refinement_history(
             load_refinement_history(self.path()), self.session_history.refinement_history(sid)
         )
-
-    @contextmanager
-    def lock(self, sid=None, *, directory=None):
-        directory = Path(directory) if directory else self.path(sid)
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / ".lock").open("a") as stream:
-            fcntl.flock(stream, fcntl.LOCK_EX)
-            yield
 
     def apply(
         self,
@@ -539,18 +714,26 @@ class HarnessStore:
     ):
         target = None if global_ else sid
         directory = Path(target_directory) if target_directory else self.path(target)
-        with self.lock(target, directory=directory):
-            state = load_harness_state(directory, "global" if global_ else "local")
-            result = apply_refinement_proposal(
-                state,
-                proposal,
-                id=id,
-                scope="global" if global_ else "local",
-                baseline_state=baseline_state,
-                rollback_of=rollback_of,
-            )
-            result["harnessStatePath"] = save_harness_state(directory, state)
-            if global_:
-                append_refinement_history(self.path(), result)
+        if rollback_of and not global_ and not (directory / "harness_state.json").exists():
+            raise ValueError(f"Refinement state file not found: {directory / 'harness_state.json'}")
+        proposal = copy.deepcopy(proposal)
+        for edit in proposal.get("edits", []):
+            if isinstance(edit.get("id"), str):
+                edit["id"] = re.sub(r"^(local|global):", "", edit["id"])
+        state = load_harness_state(directory, "global" if global_ else "local")
+        result = apply_refinement_proposal(
+            state,
+            proposal,
+            id=id,
+            scope="global" if global_ else "local",
+            baseline_state=baseline_state,
+            rollback_of=rollback_of,
+        )
+        result["harnessStatePath"] = save_harness_state(directory, state)
+        if global_:
+            append_refinement_history(self.path(), result)
+        try:
             self.session_history.record_harness_refinement(sid, result)
+        except Exception as exc:
+            raise HarnessAuditError(result, exc) from exc
         return result

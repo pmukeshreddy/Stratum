@@ -15,7 +15,7 @@ from .test_continual_harness import Refiner
 from .test_runtime_contracts import seed
 
 
-async def test_structured_refinement_disables_thinking_on_wire_only(tmp_path, config):
+async def test_structured_refinement_omits_primary_thinking_options_on_wire(tmp_path, config):
     bodies = []
 
     def handle(request):
@@ -25,6 +25,18 @@ async def test_structured_refinement_disables_thinking_on_wire_only(tmp_path, co
         content = (
             encode({"shouldRefine": True, "rationale": "useful"}) if review else '{"edits": []}'
         )
+        if body["stream"]:
+            return httpx.Response(
+                200,
+                text="data: "
+                + json.dumps(
+                    {
+                        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    }
+                )
+                + "\n\ndata: [DONE]\n\n",
+            )
         return httpx.Response(
             200,
             json={
@@ -50,7 +62,7 @@ async def test_structured_refinement_disables_thinking_on_wire_only(tmp_path, co
         runtime.refinement_compacted(root.id)
         await runtime.refinement_checkpoint(root.id)
         assert len(bodies) == 2
-        assert all(body["reasoning_effort"] == "none" for body in bodies)
+        assert all("reasoning_effort" not in body for body in bodies)
         assert runtime.store.config(root.id).provider.parameters["reasoning_effort"] == "high"
         await runtime._invoke(root.id)
         assert bodies[-1]["reasoning_effort"] == "high"
@@ -58,10 +70,8 @@ async def test_structured_refinement_disables_thinking_on_wire_only(tmp_path, co
         await runtime.shutdown()
 
 
-@pytest.mark.parametrize(
-    "supported,expected", [(["none", "low", "high"], "none"), (["low", "high"], "low")]
-)
-async def test_subscription_refinement_uses_least_supported_effort(supported, expected):
+@pytest.mark.parametrize("supported", [["none", "low", "high"], ["low", "high"]])
+async def test_subscription_refinement_omits_effort_instead_of_selecting_a_tier(supported):
     class Catalog:
         async def __aenter__(self):
             return self
@@ -87,8 +97,8 @@ async def test_subscription_refinement_uses_least_supported_effort(supported, ex
 
     provider = SubscriptionProvider(control_factory=Catalog)
     config = ProviderConfig(model="m", parameters={"reasoning_effort": "high"})
-    low, _ = await provider.resolve(config, reasoning_off=True)
-    assert low.parameters["reasoning_effort"] == expected
+    omitted, _ = await provider.resolve(config, reasoning_off=True)
+    assert "reasoning_effort" not in omitted.parameters
     unchanged, _ = await provider.resolve(config)
     assert unchanged.parameters["reasoning_effort"] == "high"
 
@@ -107,10 +117,14 @@ async def test_schema_11_migration_repairs_auxiliary_chains_without_losing_usage
         review_provider = Refiner()
         runtime.providers["mock"] = review_provider
         seed(runtime, root.id)
-        runtime.request_refinement(root.id, source="human")
-        await runtime.refinement_checkpoint(root.id)
+        await runtime.refine(root.id)
         # Two auxiliary calls reproduce the buggy v11 chain, including an old reviewer.
-        await runtime.auxiliary(root.id, "refinement_review", "review", {})
+        await runtime.auxiliary(
+            root.id,
+            "refinement_review",
+            "review",
+            runtime.refinement_input(root.id, review=True, reason="compact"),
+        )
         runtime.providers["mock"] = provider
         runtime.store.update(root.id, runnable=True)
         await runtime._run_turn(root.id)
@@ -126,12 +140,11 @@ async def test_schema_11_migration_repairs_auxiliary_chains_without_losing_usage
                 (encode([{"source": source, "kind": "continuation"}]), target),
             )
         db.execute("ALTER TABLE model_requests DROP COLUMN request_kind")
-        db.execute("ALTER TABLE refinement_requests DROP COLUMN trigger")
-        db.execute("DELETE FROM schema_migrations WHERE version=12")
+        db.execute("DELETE FROM schema_migrations WHERE version>=12")
         db.execute("PRAGMA user_version=11")
         await runtime.shutdown()
         runtime = Runtime(data, providers={"mock": provider})
-        assert runtime.store.db.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert runtime.store.db.execute("PRAGMA user_version").fetchone()[0] == 13
         graph = runtime.store.request_graph(root.id)
         assert {r["id"] for r in graph["requests"]} == {a, b}
         assert graph["edges"] == [{"source": a, "target": b, "kind": "continuation"}]

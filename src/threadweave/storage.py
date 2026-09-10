@@ -111,19 +111,12 @@ class Store(RequestHistory, TrajectoryHistory):
                 f"Database schema {version} is newer than supported schema {VERSION}"
             )
         self.db.executescript(SCHEMA)
-        if version < 11:
-            from .migrations import LEGACY_HARNESS_SCHEMA
-
-            self.db.executescript(LEGACY_HARNESS_SCHEMA)
         self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1, ?)", (now(),))
         migrate(self.db, version, now())
         self._depth = 0
         from .harness import HarnessStore
-        from .harness_migration import migrate_session_refinement_history, migrate_sqlite_harness
 
         self.harness = HarnessStore(self.directory, session_history=self)
-        migrate_sqlite_harness(self.db, self.harness)
-        migrate_session_refinement_history(self)
 
     def refinement_history(self, sid):
         return [

@@ -239,9 +239,9 @@ async def execute(args):
                 directory,
                 "refine",
                 session_id=args.session_id,
-                instructions=args.instructions,
-                global_=args.global_,
-                rollback_id=args.rollback,
+                **({"instructions": args.instructions} if args.instructions is not None else {}),
+                **({"global_": True} if args.global_ else {}),
+                **({"rollback_id": args.rollback} if args.rollback is not None else {}),
             )
         )
     elif command == "artifact":

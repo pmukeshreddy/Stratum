@@ -6,8 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from threadweave.context import Context
-from threadweave.harness import append_refinement_history
 from threadweave.host_api import harness as dispatch_harness
 from threadweave.kernel_api import Harness, Recursive
 from threadweave.models import ModelResponse
@@ -51,27 +49,8 @@ async def test_local_history_is_session_history_global_is_jsonl_and_restart_merg
     finally:
         other.close()
     for review in (False, True):
-        assert {r["id"] for r in rt.refinement_input(sid, review=review)["refinement_history"]} == {
-            "local_pass",
-            "global_pass",
-        }
-
-
-async def test_old_local_sidecar_imports_once_and_is_retired(harness_runtime):
-    rt, sid, _ = harness_runtime
-    result = rt.store.harness.apply(sid, proposal(edit()), id="legacy")
-    # Older Buffalo had only the sidecar for direct/store-applied local refinements.
-    old = {**result, "id": "only_in_sidecar"}
-    append_refinement_history(rt.store.harness.path(sid), old)
-    other = Store(rt.store.directory)
-    other.close()
-    assert not (rt.store.harness.path(sid) / "refinements.jsonl").exists()
-    assert [r["id"] for r in rt.store.refinement_history(sid)] == ["legacy", "only_in_sidecar"]
-    other = Store(rt.store.directory)
-    try:
-        assert len(other.refinement_history(sid)) == 2
-    finally:
-        other.close()
+        history = rt.refinement_input(sid, review=review)["refinement_history"]
+        assert "[local_pass]" in history and "[global_pass]" in history
 
 
 @pytest.mark.parametrize("kind", ["memory", "prompt", "skill", "subagent"])
@@ -79,16 +58,17 @@ async def test_old_local_sidecar_imports_once_and_is_retired(harness_runtime):
 async def test_writable_kernel_crud_all_kinds_scopes_and_versions(harness_runtime, kind, global_):
     rt, sid, _ = harness_runtime
     h = kernel_harness(rt, sid)
+    helper = "prompt_note" if kind == "prompt" else kind
     options = (
         {"reference": REF, "arguments": {"text": {"type": "string"}}} if kind == "skill" else {}
     )
-    entry = getattr(h, "create_" + kind)(
+    entry = getattr(h, "create_" + helper)(
         "Saved lesson", "v1", id="entry", global_=global_, metadata={"kept": True}, **options
     )
     assert entry.kind == kind and entry.version == 1 and entry.source == "agent"
     assert entry.scope == ("global" if global_ else "local")
     assert entry.path == ("policy" if kind == "prompt" else "general")
-    updated = getattr(h, "update_" + kind)("entry", "Changed", "v2", global_=global_)
+    updated = getattr(h, "update_" + helper)("entry", "Changed", "v2", global_=global_)
     assert (
         updated.version == 2 and updated.id == entry.id and updated.created_at == entry.created_at
     )
@@ -100,12 +80,12 @@ async def test_writable_kernel_crud_all_kinds_scopes_and_versions(harness_runtim
     assert "Changed" in h.overview(global_=global_)
     assert h.snapshot(global_=global_)["entries"][kind]["entry"]["version"] == 2
     with pytest.raises(ValueError, match="already exists"):
-        getattr(h, "create_" + kind)("Again", "v3", id="entry", global_=global_, **options)
-    assert getattr(h, "delete_" + kind)("entry", global_=global_) is True
-    assert getattr(h, "delete_" + kind)("entry", global_=global_) is False
+        getattr(h, "create_" + helper)("Again", "v3", id="entry", global_=global_, **options)
+    assert getattr(h, "delete_" + helper)("entry", global_=global_) is True
+    assert getattr(h, "delete_" + helper)("entry", global_=global_) is False
     assert h.get(kind, "entry", global_=global_) is None
     with pytest.raises(ValueError, match="does not exist"):
-        getattr(h, "update_" + kind)("entry", "Missing", "v3", global_=global_)
+        getattr(h, "update_" + helper)("entry", "Missing", "v3", global_=global_)
     # Prime's CRUD does not invent a planner pass/audit. record_refinement is explicit.
     assert rt.store.harness.history(sid) == []
     assert not rt.store.harness.load(None if global_ else sid)["refinements"]
@@ -336,37 +316,6 @@ async def test_new_explicit_request_supersedes_plan_that_ignores_abort(harness_r
     assert len(rt.store.refinement_history(sid)) == 1
 
 
-async def test_untouched_digest_defers_then_committed_context_resume_and_stale_refresh(
-    harness_runtime,
-):
-    rt, sid, _ = harness_runtime
-    h = kernel_harness(rt, sid)
-    h.create_memory("Global lesson", "known later", global_=True)
-    assert not rt.context.ensure_harness_digest(sid)
-    assert not rt.store.session(sid).context
-    assert not any(
-        "# Continual Harness State" in (m.get("content") or "") for m in rt.context.messages(sid)
-    )
-    rt.resume(sid)
-    assert not rt.store.session(sid).context
-    event = rt.store.event(sid, "observation", {})
-    rt.store.add_context(sid, event, [{"role": "user", "content": "Committed input"}])
-    assert rt.context.ensure_harness_digest(sid)
-    assert not rt.context.ensure_harness_digest(sid)
-    other = Store(rt.store.directory)
-    try:
-        resumed = Context(other)
-        assert not resumed.ensure_harness_digest(sid)
-        h.create_memory("Local lesson", "new")
-        assert resumed.ensure_harness_digest(sid)
-        assert not resumed.ensure_harness_digest(sid)
-        assert "Global lesson" in str(resumed.messages(sid)) and "Local lesson" in str(
-            resumed.messages(sid)
-        )
-    finally:
-        other.close()
-
-
 @pytest.mark.parametrize("explicit", [True, False])
 async def test_real_turn_plans_while_tool_waits_and_next_model_observes_notice(
     tmp_path, python_config, explicit
@@ -403,10 +352,9 @@ async def test_real_turn_plans_while_tool_waits_and_next_model_observes_notice(
                         code=code
                         + "workspace.joinpath('tool-waiting').touch()\nwhile not workspace.joinpath('release-tool').exists():\n    await asyncio.sleep(0.01)",
                     )
-                assert (
-                    "[self-refinement]" in str(request.messages)
-                    if explicit
-                    else "[auto-refinement]" in str(request.messages)
+                assert "Run checks in the project environment" not in request.messages[0]["content"]
+                assert ("[self-refinement]" if explicit else "[auto-refinement]") in str(
+                    request.messages
                 )
                 return ModelResponse(text="The learned project environment is now available.")
             finally:
@@ -439,20 +387,21 @@ async def test_real_turn_plans_while_tool_waits_and_next_model_observes_notice(
         await rt.shutdown()
 
 
-async def test_paused_background_plan_waits_without_replanning(harness_runtime):
+async def test_pause_aborts_a_settled_background_plan(harness_runtime):
     rt, sid, provider = harness_runtime
     active_turn(rt, sid)
     rt.request_refinement(sid)
     await rt.refinement_state(sid).background
-    rt.store.update(sid, pending_turn={"context_committed": True}, paused=True)
+    rt.store.update(sid, pending_turn={"context_committed": True})
+    await rt.pause(sid)
     assert not await rt.refinement_checkpoint(sid)
     assert not rt.store.refinement_history(sid)
     rt.store.update(sid, paused=False)
-    assert await rt.refinement_checkpoint(sid)
+    assert not await rt.refinement_checkpoint(sid)
     assert len(provider.requests) == 1
 
 
-async def test_restart_cancels_unapplied_background_work_without_replay(tmp_path, config):
+async def test_abort_cancels_unapplied_background_work_without_restart_replay(tmp_path, config):
     from .test_continual_harness import Refiner
 
     provider = Refiner()
@@ -462,6 +411,8 @@ async def test_restart_cancels_unapplied_background_work_without_replay(tmp_path
     active_turn(rt, root.id)
     rt.request_refinement(root.id)
     await asyncio.wait_for(provider.entered.wait(), 5)
+    rt.invalidate_refinement(root.id)
+    provider.release.set()
     await rt.shutdown()
     provider.entered = provider.release = None
     resumed = Runtime(tmp_path / "state", providers={"mock": provider})
@@ -473,8 +424,7 @@ async def test_restart_cancels_unapplied_background_work_without_replay(tmp_path
         resumed.store.update(root.id, pending_turn=None)
         resumed.resume(root.id)
         assert not await resumed.refinement_checkpoint(root.id)
-        resumed.request_refinement(root.id, source="human")
-        assert await resumed.refinement_checkpoint(root.id)
+        assert (await resumed.refine(root.id))["appliedEdits"][0]["applied"]
         assert len(resumed.store.refinement_history(root.id)) == 1
     finally:
         await resumed.shutdown()

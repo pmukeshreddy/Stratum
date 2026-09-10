@@ -42,6 +42,7 @@ def config():
         control_plane="direct",
         provider={"name": "mock", "model": "deterministic", "max_output_tokens": 128},
         retry={"initial_delay": 0, "max_delay": 0},
+        provider_retry={"base_delay": 0},
         limits={"max_turns": 50, "wall_seconds": 30},
     )
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pydantic import Field
 
+from ..auxiliary import refinement_provider_config
 from ..models import (
     HarnessError,
     ModelRequest,
@@ -21,7 +22,7 @@ from ..models import (
     new_id,
 )
 from ..providers import default_providers
-from ..refinement import refinement_provider_config
+from ..refinement_model import refinement_output_limit
 from ..runtime import Runtime
 from ..tokenization import estimate
 from ..tools import Tool
@@ -42,9 +43,14 @@ class MatchedProvider:
         # Mirror the production auxiliary reservations without changing its policy.
         self.refinement_expected = {
             purpose: refinement_provider_config(config).model_copy(
-                update={"max_output_tokens": min(config.max_output_tokens, cap)}
+                update={
+                    "max_output_tokens": refinement_output_limit(
+                        config, review=purpose == "refinement_review"
+                    ),
+                    "streaming": True,
+                }
             )
-            for purpose, cap in (("refinement_review", 4096), ("refinement", 32000))
+            for purpose in ("refinement_review", "refinement")
         }
         self.refinement_configs = dict(self.refinement_expected)
         self.request_validator = request_validator
@@ -63,10 +69,7 @@ class MatchedProvider:
             )
         if reasoning_off:
             resolved, details = await self.provider.resolve(config, reasoning_off=True)
-            # Only the catalog-selected effort may differ from the host's off request.
-            compared = resolved.model_copy(
-                update={"parameters": {**resolved.parameters, "reasoning_effort": "none"}}
-            )
+            compared = resolved
         else:
             resolved, details = await self.provider.resolve(config)
             compared = resolved

@@ -54,7 +54,6 @@ async def test_live_agents_view_recursive_sessions_compaction_and_recovery(tmp_p
         "workspace_write",
         "workspace_list",
         "finish",
-        "refine",
         "harness_list",
         "harness_get",
         "history_read",

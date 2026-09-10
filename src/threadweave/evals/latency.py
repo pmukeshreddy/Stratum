@@ -51,7 +51,6 @@ def profile(directory):
                     "session_id": session["id"],
                     "name": session["name"],
                     "kind": kind,
-                    "stage": body.get("metadata", {}).get("refinement_stage"),
                     "start_seconds": round(r["started_at"] - start, 3),
                     "end_seconds": round(end - start, 3),
                     "seconds": round(end - r["started_at"], 3),
@@ -87,7 +86,6 @@ def profile(directory):
                 "refinement_review",
                 "refine_complete",
                 "refine_failed",
-                "refinement_continuation",
                 "completion_deferred",
                 "context_compaction",
                 "child_evidence_used",
@@ -129,12 +127,10 @@ def profile(directory):
                 k: counts[k]
                 for k in (
                     "context_compaction",
-                    "refinement_continuation",
                     "completion_attempt",
                     "completion_deferred",
                     "agent_message_received",
                     "child_evidence_used",
-                    "refinement_budget_exhausted",
                     "refine_scheduled",
                 )
             },

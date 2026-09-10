@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+from .harness import format_harness_state
 from .models import HarnessError, now
+from .refinement_context import convert_to_llm, harness_digest_message
 from .storage import Store, encode
 from .tokenization import estimate, method
 
@@ -134,48 +137,36 @@ separated, not the size of the final answer. Optional requirement= describes the
     if config.features.history_retrieval:
         text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"
     if config.tool_allowlist is None:
-        text += """\nContinual harness:
-The learned kinds are prompt, memory, skill and subagent. Local state belongs to this persisted
-session; global state survives sessions. The compact harness digest is delivered at session start,
-resume and compaction, with updates when stale. rlm.harness (also harness) exposes list(),
-get(kind, id), overview() and snapshot(); rlm.get_harness_state() returns the same writable view.
-Use create_memory(title, content), update_memory(id, title, content), delete_memory(id),
-and the corresponding prompt, skill and subagent methods for direct atomic JSON writes.
-create_prompt_note/update_prompt_note/delete_prompt_note are Prime's prompt aliases.
-Updates preserve omitted path, reference, arguments and metadata; get returns None when missing.
-Direct writes are immediate; record_refinement(trigger, changes, evidence=..., outcome=...) records
-their explicit audit summary. Use global_=True or a global:id prefix to target the global store.
-Supplemental state never overrides the task or the immutable base system prompt.
-Choose refinement when you recognize a reusable correction or lesson from observed work.
-Learning is optional. If learning will help unfinished work, ask while the decision is still
-open. State the observed evidence, what remains uncertain, and the next action the
-lesson should improve in await refine.run('evidence; unresolved issue; next action'). Track a real
-unresolved decision with context.track(..., kind='decision') when it needs to survive turns.
-Do not request a retrospective checklist just because a task is finished or tests passed. If the
-root has already corrected the issue and no relevant work remains, another local lesson is not
-in-task improvement. Straightforward known fixes do not require refinement. Correct or delete
-wrong learned behavior rather than accumulating redundant notes.
-Default refinement is LOCAL. await refine.run(global_=True) explicitly targets GLOBAL state for
-stable cross-session lessons. await refine.status() reports pending and in_flight.
-refine.run() returns scheduled immediately. If your next decision depends on its result, end the
-cell after scheduling; do not implement the entire correction in that same cell. Independent work
-can continue. Planning may overlap tools; edits apply at the next safe boundary. Newly changed
-entries and their intended application arrive as a durable refinement notice. On continuation,
-evaluate the lesson against the original contract, apply it to the unresolved work, and validate
-the resulting candidate. Preserve the relevant source or candidate in Python so changes and
-checks are inspectable. Resolve tracked issues only with observed supporting evidence.
-The refinement model selects create/update/delete edits to prompt, memory, skill or subagent.
-Validate the lesson on subsequent work; merely repeating a final answer does not demonstrate use.
-Skills reference actual reusable Python callables, with reference and arguments contracts. Create
-normal module artifacts first if code is needed. Read each installed skill's SKILL.md and invoke
-its documented function; do not assume a .run entry point. skills.list()/skills.load(name) inspect
-installed skills. A subagent entry is a reusable delegation specification: compose its instructions
-into a task for native delegation when enabled. Results arrive through native messaging or files.
-Learning runs only when you choose refine.run(), or through normal automatic review at
-25 assistant turns and compaction, with a 20 minute cooldown;
-review may decline and refinement may return no edits. await compact() retains recoverable Python
-state, artifacts and history. Retrieve omitted details explicitly.
+        text += """\nContinual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Buffalo session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.
+
+Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.
 """
+        if not child:
+            text += """\nTreat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.
+
+Installed Python skill modules (pre-imported): `refine`.
+Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.
+"""
+            guide = Path(__file__).with_name("builtin_skills") / "refine" / "SKILL.md"
+            text += f"""The following skills provide specialized instructions for specific tasks.
+Use ipython to inspect a skill's file when the task matches its description.
+Skills with a python_import are prepared in the persistent Python kernel when available and can be called directly by that import name.
+When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.
+
+<available_skills>
+  <skill>
+    <name>refine</name>
+    <type>python</type>
+    <python_import>refine</python_import>
+    <description>Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends.</description>
+    <location>{guide}</location>
+  </skill>
+</available_skills>
+"""
+            if config.features.subagents:
+                text += (
+                    "Persist genuinely reusable delegation patterns with `await refine.run()`.\n"
+                )
     text += """\nAction patterns:
 Begin substantive work in IPython by inspecting the actual inputs and recording a useful next step.
 Keep hypotheses, requirements, intermediate results and evidence in named variables.
@@ -188,6 +179,7 @@ another local check, a correction, more context, or independent investigation. F
 require delegation. Your next action follows from the task and observed trajectory.
 """
     if child:
+        text = text.replace("workspace, bash, compact and refine.", "workspace, bash and compact.")
         text += "You are a persistent child. Complete your delegated assignment within the original task contract; send useful partial findings to your parent when they can inform ongoing work.\n"
     return text
 
@@ -197,6 +189,8 @@ class Context:
         self.store = store
         self.environment = environment
         self._export_cursors = {}
+        self._harness_context_ready = set()
+        self.unpersisted_refinement_messages = {}
 
         self.on_compact = None
 
@@ -273,37 +267,66 @@ class Context:
                 self._export_cursors[sid] = row["seq"]
         return path
 
-    def ensure_harness_digest(self, sid, *, committed=False):
-        from .harness import format_harness_state
-
+    def system_prompt(self, sid):
+        config = self.store.config(sid)
         session = self.store.session(sid)
-        if not committed and not session.context and not session.summary:
-            return False  # Untouched sessions defer delivery until their first input commit.
-        digest = format_harness_state(self.store.harness.merged(sid))
-        latest = None
+        base = (
+            python_instructions(config, child=bool(session.parent_id))
+            if config.control_plane == "python"
+            else FOUNDATION
+        )
+        return base
+
+    def harness_digest(self, sid):
+        session, config = self.store.session(sid), self.store.config(sid)
+        return format_harness_state(
+            self.store.harness.merged(sid),
+            include_ipython_examples=config.control_plane == "python",
+            include_shell_examples="process" in config.permissions,
+            include_refine_examples=config.control_plane == "python"
+            and session.depth == 0
+            and config.tool_allowlist is None,
+        )
+
+    def ensure_harness_digest(self, sid):
+        """Refresh only at cold context boundaries, never after individual edits."""
+        if sid in self._harness_context_ready:
+            return
+        session = self.store.session(sid)
+        candidates = [(session.summary_timestamp, session.summary_harness_digest)]
         for block in session.context:
             for message in block["messages"]:
-                if message.get("harness_digest") is not None:
-                    latest = message["harness_digest"]
-        if latest == digest:
-            return False
-        event = self.store.event(sid, "harness_digest", {"digest": digest})
-        self.store.add_context(
-            sid,
-            event,
-            [
-                {
-                    "role": "user",
-                    "content": "<harness_state>\n" + digest + "\n</harness_state>",
-                    "harness_digest": digest,
-                }
-            ],
-        )
-        return True
+                if message.get("customType") == "harness_digest":
+                    candidates.append((message.get("timestamp", 0), message["details"]["digest"]))
+        latest = max(candidates, key=lambda candidate: candidate[0])[1]
+        digest = self.harness_digest(sid)
+        if latest != digest:
+            message = harness_digest_message(digest)
+            event = self.store.event(sid, "harness_digest", {"digest": digest})
+            self.store.add_context(sid, event, [message])
+            if (
+                session.turns == 0
+                and not session.summary
+                and not any(
+                    m.get("role") == "assistant"
+                    for block in session.context
+                    for m in block["messages"]
+                )
+            ):
+                current = self.store.session(sid).context
+                self.store.update(sid, context=[current[-1], *current[:-1]])
+        self._harness_context_ready.add(sid)
 
-    def messages(self, sid: str, *, refresh_harness=True) -> list[dict]:
-        if refresh_harness:
-            self.ensure_harness_digest(sid)
+    @staticmethod
+    def compaction_message(session):
+        return {
+            "role": "compactionSummary",
+            "summary": session.summary,
+            "harnessDigest": session.summary_harness_digest,
+            "timestamp": session.summary_timestamp,
+        }
+
+    def messages(self, sid: str) -> list[dict]:
         session = self.store.session(sid)
         cap = min(6000, self.store.config(sid).context.max_tokens // 4)
         task = session.instruction[:cap]
@@ -349,12 +372,7 @@ class Context:
         messages = [
             {
                 "role": "system",
-                "content": python_instructions(
-                    self.store.config(sid),
-                    child=bool(session.parent_id),
-                )
-                if self.store.config(sid).control_plane == "python"
-                else FOUNDATION,
+                "content": self.system_prompt(sid),
             },
             {"role": "user", "content": "Session: " + encode(metadata)},
         ]
@@ -387,6 +405,13 @@ class Context:
                     + self.context_task_excerpt(root.instruction, cap),
                 }
             )
+        # Prime's first committed prompt carries the cold digest before the user.
+        first_digest = None
+        if not session.summary and session.context:
+            first = session.context[0]["messages"]
+            if len(first) == 1 and first[0].get("customType") == "harness_digest":
+                first_digest = first[0]
+                messages.extend(convert_to_llm(first))
         messages.append({"role": "user", "content": task})
         if self.store.config(sid).control_plane == "python":
             # Bounded state/skill menus mirror available capabilities, not a ranking
@@ -462,15 +487,9 @@ class Context:
                 }
             )
         if session.summary:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Earlier trajectory digest (details remain in history):\n"
-                    + session.summary,
-                }
-            )
+            messages.extend(convert_to_llm([self.compaction_message(session)]))
         for block in session.context:
-            for source in block["messages"]:
+            for source in convert_to_llm([m for m in block["messages"] if m is not first_digest]):
                 message = dict(source)
                 event = message.get("provider_response_event")
                 if event:
@@ -487,6 +506,7 @@ class Context:
                 messages.append(message)
         if self.environment:
             messages.extend(self.environment().call(sid, "context_messages", sid, default=[]))
+        messages.extend(convert_to_llm(self.unpersisted_refinement_messages.get(sid, [])))
         messages.append(
             {
                 "role": "developer",
@@ -555,7 +575,22 @@ class Context:
             except ValueError:
                 parsed = None
             if not isinstance(parsed, dict):
-                parsed = extractive_summary(session.summary, removed)
+                parsed = extractive_summary(
+                    session.summary,
+                    [
+                        {
+                            **block,
+                            "messages": convert_to_llm(
+                                [
+                                    m
+                                    for m in block["messages"]
+                                    if m.get("customType") != "harness_digest"
+                                ]
+                            ),
+                        }
+                        for block in removed
+                    ],
+                )
                 if summary:
                     parsed["established_facts"].append(summary)
             resolutions = [
@@ -621,14 +656,19 @@ class Context:
                     self.store.event_by_id(eid)["timestamp"],
                 ),
             )
-            self.store.update(sid, context=session.context[count:], summary=summary)
+            self.store.update(
+                sid,
+                context=session.context[count:],
+                summary=summary,
+                summary_harness_digest=self.harness_digest(sid),
+                summary_timestamp=now(),
+            )
             if provenance:
                 request = self.store.db.execute(
                     "SELECT id FROM model_requests WHERE response_event=?", (provenance,)
                 ).fetchone()
                 if request:
                     self.store.commit_compaction(sid, request[0])
-            self.ensure_harness_digest(sid)
             if review_checkpoint and self.on_compact:
                 self.on_compact(sid)
             return eid

@@ -79,17 +79,24 @@ class ChatProvider:
             body["tools"] = request.tools
         if config.streaming:
             body["stream_options"] = {"include_usage": True}
+        refinement = request.metadata.get("purpose") in {"refinement", "refinement_review"}
+        if refinement:
+            from .refinement_model import chat_refinement_body
+
+            body = chat_refinement_body(config, chat_messages(request.messages))
         try:
             async with httpx.AsyncClient(
                 timeout=config.timeout_seconds, transport=self.transport
             ) as client:
                 url = config.base_url.rstrip("/") + "/chat/completions"
-                if config.streaming:
+                if body["stream"]:
                     async with client.stream("POST", url, json=body, headers=headers) as response:
                         if response.is_error:
                             await response.aread()
                         self._check(response)
-                        data = await self._collect(response.aiter_lines(), emit)
+                        data = await self._collect(
+                            response.aiter_lines(), emit, require_done=not refinement
+                        )
                 else:
                     response = await client.post(url, json=body, headers=headers)
                     self._check(response)
@@ -122,12 +129,18 @@ class ChatProvider:
                 and config.output_cost_per_million is not None
                 else None,
             )
+            metadata = {"stop_reason": choices[0].get("finish_reason", "stop")}
+            if refinement:
+                from .refinement_retry import completion_metadata
+
+                metadata = completion_metadata(metadata["stop_reason"])
             return ModelResponse(
                 text=message.get("content") or "",
                 actions=actions,
                 usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost),
                 usage_reported=bool(raw_usage),
                 provider_id=data.get("id"),
+                metadata=metadata,
             )
         except HarnessError:
             raise
@@ -142,7 +155,10 @@ class ChatProvider:
     def _check(response):
         if response.is_error:
             try:
-                code = response.json().get("error", {}).get("code")
+                body = response.json().get("error", {})
+                if isinstance(body.get("error"), dict):
+                    body = body["error"]
+                code = body.get("type") or body.get("code")
             except (ValueError, AttributeError):
                 code = None
             if code in {"context_length_exceeded", "context_window_exceeded", "context_overflow"}:
@@ -150,16 +166,24 @@ class ChatProvider:
                     "provider", "context_overflow", "Provider context capacity reached"
                 )
             # Never persist request headers or credentials in provider failures.
-            raise HarnessError(
+            error = HarnessError(
                 "provider",
                 f"http_{response.status_code}",
                 f"Provider returned HTTP {response.status_code}",
                 retryable=response.status_code in (408, 409, 429) or response.status_code >= 500,
             )
+            from .refinement_retry import classify_failure, retry_after_ms
+
+            error.provider_failure = {
+                "kind": classify_failure(code, response.status_code),
+                "retryAfterMs": retry_after_ms(response.headers),
+            }
+            raise error
 
     @staticmethod
-    async def _collect(lines: AsyncIterator[str], emit):
+    async def _collect(lines: AsyncIterator[str], emit, *, require_done=True):
         text, calls, usage, provider_id = [], {}, None, None
+        finish_reason = None
         finished = False
         async for line in lines:
             if not line.startswith("data:"):
@@ -170,12 +194,20 @@ class ChatProvider:
                 break
             data = json.loads(payload)
             if data.get("error"):
-                raise HarnessError(
+                from .refinement_retry import classify_failure
+
+                error = HarnessError(
                     "provider", "stream_error", "Provider stream reported an error", retryable=True
                 )
+                details = data["error"] if isinstance(data["error"], dict) else {}
+                error.provider_failure = {
+                    "kind": classify_failure(details.get("type") or details.get("code")),
+                }
+                raise error
             provider_id = data.get("id", provider_id)
             usage = data.get("usage") or usage
             for choice in data.get("choices", []):
+                finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta", {})
                 if delta.get("content"):
                     text.append(delta["content"])
@@ -189,7 +221,7 @@ class ChatProvider:
                         call["id"] = item["id"]
                     for key in ("name", "arguments"):
                         call["function"][key] += item.get("function", {}).get(key) or ""
-        if not finished:
+        if require_done and not finished:
             raise HarnessError(
                 "provider",
                 "incomplete_stream",
@@ -202,10 +234,11 @@ class ChatProvider:
             "usage": usage,
             "choices": [
                 {
+                    "finish_reason": finish_reason,
                     "message": {
                         "content": "".join(text),
                         "tool_calls": [calls[i] for i in sorted(calls)],
-                    }
+                    },
                 }
             ],
         }

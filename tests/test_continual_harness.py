@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import re
 import time
 from pathlib import Path
 
@@ -19,7 +20,6 @@ from threadweave.harness import (
     load_refinement_history,
     merge_harness_states,
     merge_refinement_history,
-    refinement_notice,
     rollback_proposal,
     save_harness_state,
 )
@@ -28,6 +28,10 @@ from threadweave.runtime import Runtime
 from threadweave.storage import Store
 
 REF = {"type": "python", "import": "json", "callable": "loads", "call_pattern": "loads(text)"}
+
+
+def input_sections(request):
+    return dict(re.findall(r"<([a-z_]+)>\n([\s\S]*?)\n</\1>", request.messages[-1]["content"]))
 
 
 def edit(kind="memory", action="create", id="lesson", **kwargs):
@@ -62,11 +66,10 @@ def apply(state, *edits, **options):
 
 
 @pytest.mark.parametrize("payload", [None, "not json", "null", "[]", '"string"', "123"])
-def test_missing_and_corrupt_state(tmp_path, caplog, payload):
+def test_missing_and_corrupt_state(tmp_path, payload):
     if payload is not None:
         (tmp_path / "harness_state.json").write_text(payload)
     assert load_harness_state(tmp_path) == empty_harness_state()
-    assert bool(caplog.records) == (payload is not None)
 
 
 def test_atomic_save_roundtrip_and_failure(tmp_path, monkeypatch):
@@ -167,19 +170,17 @@ def test_inverse_rollback_restores_create_update_delete():
     assert rollback["rollbackOf"] == result["id"]
 
 
-def test_digest_bounded_and_notices():
+def test_harness_digest_bounded_with_five_recent_refinements():
     state = empty_harness_state()
     for i in range(9):
         apply(state, edit(id=str(i), content="x" * 500), id=str(i))
     digest = format_harness_state(state)
     assert "[local:0]" in digest and "[local:6]" not in digest
-    assert "+3 more memory" in digest and "+4 older refinement" in digest
+    assert "+3 more memory" in digest
     assert "x" * 181 not in digest
-    empty = apply(state)
-    assert refinement_notice(empty, "self") is None
-    result = apply(state, edit())
-    assert refinement_notice(result, "self").startswith("[self-refinement]")
-    assert refinement_notice(result, "auto").startswith("[auto-refinement]")
+    assert digest.count("Retain project lesson") == 5
+    assert "+4 older refinement events" in digest
+    assert "Observed repeated error" not in digest
 
 
 class Refiner:
@@ -230,24 +231,28 @@ def test_prime_defaults():
     }
 
 
-async def test_schedule_status_coalesce_and_safe_boundary(harness_runtime):
+@pytest.mark.parametrize("override", [None, False])
+async def test_schedule_status_coalesce_and_safe_boundary(harness_runtime, override):
     rt, sid, provider = harness_runtime
     assert not rt.request_refinement(sid)["scheduled"]
     rt.store.update(sid, pending_turn={"context_committed": False})
     assert rt.request_refinement(sid, instructions="first", global_=True)["scheduled"]
-    rt.request_refinement(sid, instructions="last")
+    rt.request_refinement(
+        sid, instructions="last", **({} if override is None else {"global_": override})
+    )
     assert rt.refinement_status(sid) == {"pending": True, "in_flight": True}
     assert not await rt.refinement_checkpoint(sid)
     assert not provider.requests and not rt.store.harness.entries(sid)
     rt.store.update(sid, pending_turn={"context_committed": True})
     assert await rt.refinement_checkpoint(sid)
     assert len(provider.requests) == 1 and provider.requests[0].metadata["purpose"] == "refinement"
-    evidence = json.loads(provider.requests[0].messages[-1]["content"])
+    evidence = input_sections(provider.requests[0])
     assert (
         evidence["user_refine_instructions"] == "last"
-        and "scope: global" in evidence["scope_policy"]
+        and ("scope: global" if override is None else "scope: local") in evidence["scope_policy"]
     )
-    assert rt.store.harness.load()["entries"]["memory"]["lesson"]
+    assert rt.store.harness.load(None if override is None else sid)["entries"]["memory"]["lesson"]
+    assert not rt.store.harness.load(sid if override is None else None)["entries"]["memory"]
     assert rt.refinement_status(sid) == {"pending": False, "in_flight": False}
 
 
@@ -258,13 +263,12 @@ async def test_local_cannot_update_or_delete_global_and_can_override(harness_run
         edit(action="update", id="global:lesson", content="wrong"),
         edit(action="delete", id="global:lesson"),
     )
-    rt.request_refinement(sid, source="human")
-    assert not await rt.refinement_checkpoint(sid)
+    result = await rt.refine(sid)
+    assert not any(e["applied"] for e in result["appliedEdits"])
     assert rt.store.harness.load()["entries"]["memory"]["lesson"]["version"] == 1
     assert all(not e["applied"] for e in rt.store.harness.history(sid)[-1]["appliedEdits"])
     provider.proposal = proposal(edit(content="local override"))
-    rt.request_refinement(sid, source="human")
-    assert await rt.refinement_checkpoint(sid)
+    assert (await rt.refine(sid))["appliedEdits"][0]["applied"]
     assert len(rt.store.harness.merged(sid)["entries"]["memory"]) == 2
 
 
@@ -277,10 +281,7 @@ async def test_interval_gate_cooldown_and_no_duplicates(harness_runtime, decisio
     assert not provider.requests
     assert await rt.refinement_checkpoint(sid, completed_turn=True) == decision
     assert len(provider.requests) == (2 if decision else 1)
-    notices = rt.store.events(sid, kind="refinement_notice")
-    assert len(notices) == int(decision)
-    if decision:
-        assert "[auto-refinement]" in notices[0]["payload"]["content"]
+    assert bool(rt.store.events(sid, kind="refinement_notice")) == decision
     for _ in range(25):
         await rt.refinement_checkpoint(sid, completed_turn=True)
     assert len(provider.requests) == (2 if decision else 1)
@@ -302,15 +303,13 @@ async def test_compaction_pending_cooldown_disabled_fallback(harness_runtime):
     provider.decision = False
     await rt.refinement_checkpoint(sid)
     assert not state.pending_compact and len(provider.requests) == 1
-    assert (
-        json.loads(provider.requests[0].messages[-1]["content"])["trigger"]["reason"] == "compact"
-    )
+    assert input_sections(provider.requests[0])["trigger"].startswith("compact;")
 
 
 async def test_inflight_protection_branch_invalidation_and_recovery(harness_runtime):
     rt, sid, provider = harness_runtime
     provider.entered, provider.release = asyncio.Event(), asyncio.Event()
-    rt.request_refinement(sid, source="human")
+    rt.refinement_state(sid).pending_request = {"source": "self"}
     task = asyncio.create_task(rt.refinement_checkpoint(sid))
     await provider.entered.wait()
     assert rt.refinement_status(sid)["in_flight"]
@@ -322,16 +321,17 @@ async def test_inflight_protection_branch_invalidation_and_recovery(harness_runt
     await asyncio.gather(task, other, return_exceptions=True)
     assert not rt.refinement_status(sid)["in_flight"]
     assert not rt.store.harness.entries(sid)
-    rt.request_refinement(sid, source="human")
+    rt.refinement_state(sid).pending_request = {"source": "self"}
     assert await rt.refinement_checkpoint(sid)
     assert len(provider.requests) == 2
 
 
 async def test_approved_review_deferred_until_safe_and_failure_unwedges(harness_runtime):
     rt, sid, provider = harness_runtime
+    rt.store.reconfigure(sid, rt.store.config(sid).model_copy(update={"serialized_refine": False}))
     provider.entered, provider.release = asyncio.Event(), asyncio.Event()
     rt.refinement_compacted(sid)
-    task = asyncio.create_task(rt.refinement_checkpoint(sid))
+    task = rt.refinement_state(sid).auto_task
     await provider.entered.wait()
     rt.store.update(sid, paused=True)
     provider.release.set()
@@ -340,11 +340,12 @@ async def test_approved_review_deferred_until_safe_and_failure_unwedges(harness_
     assert len(provider.requests) == 1
     rt.store.update(sid, paused=False)
     provider.fail = True
-    await rt.refinement_checkpoint(sid)
+    await rt.maybe_auto_refine(sid)
     assert not rt.refinement_status(sid)["in_flight"]
     provider.fail = False
     rt.refinement_state(sid).last_review_at = 0
-    assert await rt.refinement_checkpoint(sid)
+    await rt.maybe_auto_refine(sid)
+    assert rt.store.harness.entries(sid)
     assert sum(r.metadata["purpose"] == "refinement_review" for r in provider.requests) == 1
 
 
@@ -356,27 +357,30 @@ async def test_planner_input_bounded_state_history_scope_and_empty(harness_runti
         evidence = rt.refinement_input(sid, review=review)
         assert len(evidence["conversation"]) == bound
         assert "RECENT" in evidence["conversation"]
-        assert evidence["current_harness_state"] and "local" in evidence["scope_policy"]
+        assert evidence["current_harness_state"]
+        assert set(evidence) == (
+            {"current_harness_state", "refinement_history", "conversation", "trigger"}
+            if review
+            else {"current_harness_state", "refinement_history", "conversation", "scope_policy"}
+        )
     provider.proposal = proposal()
     # Keep actual model request within the configured context cap.
     rt.store.update(sid, context=[], summary="Compacted reusable observation")
     assert "Compacted reusable observation" in rt.refinement_input(sid)["conversation"]
-    rt.request_refinement(sid, source="human")
-    assert not await rt.refinement_checkpoint(sid)
+    assert not (await rt.refine(sid))["appliedEdits"]
     assert not rt.store.events(sid, kind="refinement_notice")
     assert len(rt.store.harness.history(sid)) == 1
 
 
 @pytest.mark.parametrize("completed", [True, False])
-async def test_idle_refinement_edits_schedule_root_continuation(harness_runtime, completed):
+async def test_idle_refinement_does_not_schedule_root_continuation(harness_runtime, completed):
     rt, sid, provider = harness_runtime
     rt.store.update(sid, runnable=False, outcome="completed" if completed else "active")
-    rt.request_refinement(sid, source="human")
-    await rt._run_turn(sid)
+    await rt.refine(sid)
     root = rt.store.session(sid)
-    assert root.outcome == "active" and root.runnable
-    assert len(provider.requests) == 1  # Planner only; the root is queued for its next turn.
-    assert rt.store.events(sid, kind="refinement_continuation")
+    assert root.outcome == ("completed" if completed else "active") and not root.runnable
+    assert len(provider.requests) == 1
+    assert not rt.store.events(sid, kind="refinement_continuation")
 
 
 async def test_idle_compaction_is_serviced_when_safe(harness_runtime):
@@ -388,7 +392,7 @@ async def test_idle_compaction_is_serviced_when_safe(harness_runtime):
     assert rt.has_pending_refinement(sid)
     await rt._run_turn(sid)
     assert [r.metadata["purpose"] for r in provider.requests] == ["refinement_review", "refinement"]
-    assert rt.store.session(sid).runnable
+    assert not rt.store.session(sid).runnable
     assert not rt.has_pending_refinement(sid)
 
 
@@ -405,128 +409,43 @@ def test_digest_cannot_loop_compaction_below_fixed_context_capacity(tmp_path, co
         store.close()
 
 
-async def test_durable_notice_digest_resume_compact_stale_and_stable_prefix(harness_runtime):
-    rt, sid, provider = harness_runtime
-    context = rt.context
-    assert not rt.store.session(sid).context
-    first = context.messages(sid)
-    prefix = first[0]["content"]
-    assert not context.ensure_harness_digest(sid)
-    rt.request_refinement(sid, source="human")
-    await rt.refinement_checkpoint(sid)
-    assert rt.store.events(sid, kind="refinement_notice")
-    assert context.ensure_harness_digest(sid)
-    assert context.messages(sid)[0]["content"] == prefix
-    assert not context.ensure_harness_digest(sid)
-    other = Store(rt.store.directory)
-    try:
-        resumed = Context(other)
-        messages = resumed.messages(sid)
-        assert any("[self-refinement]" in str(m.get("content")) for m in messages)
-        assert not resumed.ensure_harness_digest(sid)
-    finally:
-        other.close()
-    for _ in range(3):
-        event = rt.store.event(sid, "observation", {"content": "work"})
-        rt.store.add_context(sid, event, [{"role": "user", "content": "work"}])
-    context.compact(sid, count=len(rt.store.session(sid).context) - 1)
-    assert any(
-        m.get("harness_digest") for b in rt.store.session(sid).context for m in b["messages"]
-    )
-    assert rt.refinement_state(sid).pending_compact
-
-
 async def test_rollback_history_across_sessions(harness_runtime, tmp_path, config):
     rt, sid, provider = harness_runtime
-    rt.request_refinement(sid, source="human", global_=True)
-    await rt.refinement_checkpoint(sid)
+    await rt.refine(sid, global_=True)
     target = rt.store.harness.history(sid)[-1]
     other = rt.create("new", tmp_path, config=config)
-    rt.request_refinement(other.id, source="human", rollback_id=target["id"])
-    assert await rt.refinement_checkpoint(other.id)
+    assert (await rt.refine(other.id, rollback_id=target["id"]))["appliedEdits"][0]["applied"]
     assert not rt.store.harness.load()["entries"]["memory"]
     assert rt.store.harness.history(other.id)[-1]["rollbackOf"] == target["id"]
-
-
-def test_one_time_sqlite_migration_and_retired_tables_never_read(tmp_path, config):
-    from threadweave.models import Workspace
-
-    store = Store(tmp_path)
-    root = store.create("old", Workspace(path=str(tmp_path)), config)
-    marker = store.harness.path() / ".sqlite-migrated.json"
-    marker.unlink()
-    for kind, content in (
-        ("memory", {"text": "fact"}),
-        ("prompt_note", {"text": "instruction"}),
-        ("subagent_spec", {"instruction": "delegate reviews"}),
-        ("skill", {"description": "parse", "reference": REF, "arguments": {}}),
-    ):
-        store.db.execute("INSERT INTO state_entries VALUES(?,?,?,?,?)", (kind, root.id, kind, 3, 0))
-        store.db.execute(
-            "INSERT INTO state_versions VALUES(?,?,?)",
-            (kind, 3, json.dumps({"title": kind, "content": content, "created_at": 100})),
-        )
-    store.db.execute("INSERT INTO state_entries VALUES('untranslatable',NULL,'skill',1,0)")
-    store.db.execute(
-        "INSERT INTO state_versions VALUES('untranslatable',1,?)",
-        (json.dumps({"title": "old code", "content": {"code": "print(123)"}}),),
-    )
-    old = config.model_dump()
-    old["refinement"] = {"automatic": True, "enabled": True, "every_turns": 10}
-    old["features"]["automatic_refinement"] = True
-    store.db.execute("UPDATE configs SET body=?", (json.dumps(old),))
-    store.close()
-    store = Store(tmp_path)
-    state = store.harness.load(root.id)
-    assert all(state["entries"][k] for k in KINDS)
-    assert state["entries"]["memory"]["memory"]["version"] == 3
-    assert store.config(root.id).refinement.turn_interval == 25
-    report = json.loads(marker.read_text())
-    assert report["skipped"][0]["id"] == "untranslatable"
-    # Failure of any SELECT on old tables must not affect startup or reads.
-    store.db.execute("DROP TABLE state_versions")
-    store.db.execute("DROP TABLE state_entries")
-    store.close()
-    store = Store(tmp_path)
-    assert store.harness.load(root.id) == state
-    store.close()
-
-
-async def test_paused_plan_is_applied_once_without_replanning(harness_runtime):
-    rt, sid, provider = harness_runtime
-    provider.entered, provider.release = asyncio.Event(), asyncio.Event()
-    rt.request_refinement(sid, source="human")
-    task = asyncio.create_task(rt.refinement_checkpoint(sid))
-    await provider.entered.wait()
-    rt.store.update(sid, paused=True)
-    provider.release.set()
-    await task
-    assert rt.refinement_state(sid).pending_plan
-    rt.store.update(sid, paused=False)
-    assert await rt.refinement_checkpoint(sid)
-    assert len(provider.requests) == 1
 
 
 async def test_copied_local_history_rollback_targets_original_file(
     harness_runtime, tmp_path, config
 ):
     rt, sid, provider = harness_runtime
-    rt.request_refinement(sid, source="human")
-    await rt.refinement_checkpoint(sid)
+    await rt.refine(sid)
     target = rt.store.harness.history(sid)[-1]
     branch = rt.create("branch", tmp_path, config=config)
     rt.store.harness.apply(branch.id, proposal(edit(content="branch keeps this")), id="branch")
     rt.store.record_harness_refinement(branch.id, target)
-    rt.request_refinement(branch.id, source="human", rollback_id=target["id"])
-    assert await rt.refinement_checkpoint(branch.id)
+    assert (await rt.refine(branch.id, rollback_id=target["id"]))["appliedEdits"][0]["applied"]
     assert not rt.store.harness.load(sid)["entries"]["memory"]
     assert rt.store.harness.get(branch.id, "memory", "lesson")["content"] == "branch keeps this"
     assert rt.store.harness.history(branch.id)[-1]["rollbackOf"] == target["id"]
 
 
-async def test_only_interval_compact_or_explicit_requests_schedule(harness_runtime):
+async def test_only_prime_triggers_schedule_review(harness_runtime):
     rt, sid, provider = harness_runtime
-    for kind in ("verifier_result", "failure", "child_evidence_used", "experiment", "completion"):
+    for kind in (
+        "failure",
+        "child_evidence_used",
+        "experiment",
+        "completion",
+        "python_error",
+        "verification_result",
+        "verifier_result",
+        "semantic_state_updated",
+    ):
         rt.store.event(sid, kind, {"passed": False, "finding": "reusable lesson"})
         assert not await rt.refinement_checkpoint(sid)
     assert not provider.requests
@@ -534,9 +453,7 @@ async def test_only_interval_compact_or_explicit_requests_schedule(harness_runti
         sid, rt.store.config(sid).model_copy(update={"refinement": RefinementPolicy(enabled=False)})
     )
     rt.refinement_compacted(sid)
-    await rt.refinement_checkpoint(sid)
+    assert not await rt.refinement_checkpoint(sid)
     assert not provider.requests
-    rt.request_refinement(sid, source="human")
-    assert await rt.refinement_checkpoint(
-        sid
-    )  # Explicit refinement is independent of auto settings.
+    assert (await rt.refine(sid))["appliedEdits"][0]["applied"]
+    assert [r.metadata["purpose"] for r in provider.requests] == ["refinement"]

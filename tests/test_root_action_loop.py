@@ -161,7 +161,7 @@ async def test_root_actions_run_without_feature_completion_requirements(
     markers = [
         "Recursive mechanics:",
         "Independent work:",
-        "Continual harness:",
+        "Continual harness state is available",
         "Action patterns:",
     ]
     assert [foundation.index(m) for m in markers] == sorted(foundation.index(m) for m in markers)

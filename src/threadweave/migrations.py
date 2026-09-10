@@ -1,8 +1,6 @@
 """Forward-only product schema migrations; the v1 trajectory is never rewritten."""
 
-VERSION = 12
-
-LEGACY_HARNESS_SCHEMA = "CREATE TABLE IF NOT EXISTS state_entries(\n id TEXT PRIMARY KEY, owner_id TEXT REFERENCES sessions(id), kind TEXT NOT NULL,\n current_version INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0\n);\nCREATE TABLE IF NOT EXISTS state_versions(\n entry_id TEXT NOT NULL REFERENCES state_entries(id), version INTEGER NOT NULL,\n body TEXT NOT NULL, PRIMARY KEY(entry_id, version)\n);\nCREATE TRIGGER IF NOT EXISTS versions_immutable_update BEFORE UPDATE ON state_versions\nBEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;\nCREATE TRIGGER IF NOT EXISTS versions_immutable_delete BEFORE DELETE ON state_versions\nBEGIN SELECT RAISE(ABORT, 'state versions are immutable'); END;\nCREATE TABLE IF NOT EXISTS refinements(\n id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),\n edit TEXT NOT NULL, status TEXT NOT NULL, source_event TEXT NOT NULL, error TEXT\n);\n"
+VERSION = 13
 
 CODING_SCHEMA = """
 CREATE TABLE repository_files(
@@ -26,8 +24,6 @@ CREATE TABLE routing_decisions(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REF
  created_at REAL NOT NULL, body TEXT NOT NULL);
 CREATE TABLE failure_memories(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
  created_at REAL NOT NULL, body TEXT NOT NULL);
-CREATE TABLE skill_outcomes(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- entry_id TEXT NOT NULL, version INTEGER NOT NULL, passed INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE TABLE candidates(child_id TEXT PRIMARY KEY REFERENCES sessions(id), parent_id TEXT NOT NULL,
  checkpoint_id TEXT NOT NULL, body TEXT NOT NULL);
 CREATE VIRTUAL TABLE history_fts USING fts5(id UNINDEXED, session_id UNINDEXED, root_id UNINDEXED,
@@ -65,10 +61,6 @@ def migrate(db, previous, timestamp):
     if previous < 5:
         db.executescript(
             "BEGIN IMMEDIATE;"
-            "CREATE TABLE refinement_requests(id TEXT PRIMARY KEY, "
-            "session_id TEXT NOT NULL REFERENCES sessions(id), trigger_event TEXT NOT NULL REFERENCES events(id), "
-            "status TEXT NOT NULL, result TEXT NOT NULL);"
-            "CREATE INDEX refinement_requests_pending ON refinement_requests(session_id,status);"
             f"INSERT INTO schema_migrations VALUES(5,{timestamp}); PRAGMA user_version=5; COMMIT;"
         )
     if previous < 6:
@@ -138,10 +130,6 @@ def migrate(db, previous, timestamp):
             "FROM sessions s,json_each(s.body,'$.context') b JOIN events e ON e.id=json_extract(b.value,'$.event_id');"
             "ALTER TABLE messages ADD COLUMN delivery TEXT NOT NULL DEFAULT 'boundary';"
             "ALTER TABLE messages ADD COLUMN causal_request_id TEXT;"
-            "ALTER TABLE refinements ADD COLUMN baseline TEXT;"
-            "CREATE TABLE refinement_runs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), "
-            "status TEXT NOT NULL, body TEXT NOT NULL);"
-            "CREATE INDEX refinement_run_session ON refinement_runs(session_id,status);"
             f"INSERT INTO schema_migrations VALUES(11,{timestamp}); PRAGMA user_version=11; COMMIT;"
         )
     if previous < 12:
@@ -149,10 +137,6 @@ def migrate(db, previous, timestamp):
             "BEGIN IMMEDIATE;"
             "ALTER TABLE model_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'trajectory';"
             "UPDATE model_requests SET request_kind='auxiliary' WHERE purpose NOT IN ('agent','compaction');"
-            "ALTER TABLE refinement_requests ADD COLUMN trigger TEXT NOT NULL DEFAULT 'manual';"
-            "UPDATE refinement_requests SET trigger=COALESCE((SELECT json_extract(e.payload,'$.trigger') "
-            "FROM refinement_runs r JOIN events e ON e.id=json_extract(r.body,'$.marker') "
-            "WHERE r.id=refinement_requests.id),'manual');"
         )
         try:
             _separate_auxiliary_edges(db)
@@ -162,6 +146,18 @@ def migrate(db, previous, timestamp):
         except BaseException:
             db.rollback()
             raise
+
+    if previous < 13:
+        db.executescript(
+            "BEGIN IMMEDIATE;"
+            "DROP TABLE IF EXISTS refinement_runs;"
+            "DROP TABLE IF EXISTS refinement_requests;"
+            "DROP TABLE IF EXISTS refinements;"
+            "DROP TABLE IF EXISTS state_versions;"
+            "DROP TABLE IF EXISTS state_entries;"
+            "DROP TABLE IF EXISTS skill_outcomes;"
+            f"INSERT INTO schema_migrations VALUES(13,{timestamp}); PRAGMA user_version=13; COMMIT;"
+        )
 
 
 def _separate_auxiliary_edges(db):

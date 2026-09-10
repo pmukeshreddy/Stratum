@@ -17,6 +17,7 @@ from .models import RunConfig
 from .runtime import Runtime
 
 MAX_PACKET = 8 * 1024 * 1024
+REFINE_REQUEST_TIMEOUT_SECONDS = 10 * 60
 
 
 def socket_path(directory: str | Path) -> Path:
@@ -32,7 +33,13 @@ async def request(directory, method, **arguments):
     try:
         writer.write((json.dumps({"method": method, "arguments": arguments}) + "\n").encode())
         await writer.drain()
-        async with asyncio.timeout(86400 if method == "verify" else 60):
+        async with asyncio.timeout(
+            86400
+            if method == "verify"
+            else REFINE_REQUEST_TIMEOUT_SECONDS
+            if method == "refine"
+            else 60
+        ):
             line = await reader.readline()
         if not line:
             raise ConnectionError("Daemon disconnected before responding")
@@ -265,12 +272,13 @@ class Daemon:
                 "infrastructure_error": error,
             }
         if method == "refine":
-            return runtime.request_refinement(
+            return await runtime.refine(
                 args["session_id"],
-                source="human",
-                instructions=args.get("instructions"),
-                global_=args.get("global_", False),
-                rollback_id=args.get("rollback_id"),
+                **{
+                    key: args[key]
+                    for key in ("instructions", "global_", "rollback_id")
+                    if key in args
+                },
             )
         if method == "refinement_status":
             return runtime.refinement_status(args["session_id"])

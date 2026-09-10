@@ -47,9 +47,6 @@ def capture(runtime_context, sid):
     session = store.session(sid)
     children = [child for child in store.sessions() if child.parent_id == sid]
     snapshots = store.events(sid, kind="kernel_snapshot", limit=1)
-    refinements = [
-        {k: e[k] for k in ("id", "kind", "version", "title")} for e in store.harness.entries(sid)
-    ]
     evidence = store.events(sid, kind="verification_evidence", limit=3) + store.events(
         sid, kind="verifier_result", limit=1
     )
@@ -82,7 +79,6 @@ def capture(runtime_context, sid):
         ],
         "verification": [{"event_id": e["id"], "evidence": e["payload"]} for e in evidence],
         "kernel_snapshot": snapshots[-1]["payload"] if snapshots else None,
-        "harness_versions": refinements,
     }
 
 
@@ -123,7 +119,7 @@ def protected_summary(tree):
 def compact_reference(tree, artifact):
     return {
         "id": artifact,
-        "purpose": "Live trajectory tree: unresolved work, child conclusions, verification, REPL manifest/recipes and harness versions",
+        "purpose": "Live trajectory tree: unresolved work, child conclusions, verification, REPL manifest/recipes",
         "reference": f"artifacts.load({artifact!r}); children="
         + encode([{"id": b["id"], "status": b["status"]} for b in tree["branches"]]),
     }

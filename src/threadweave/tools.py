@@ -270,11 +270,6 @@ class HarnessGetArgs(Record):
     global_: bool = False
 
 
-class RefineArgs(Record):
-    instructions: str | None = None
-    global_: bool = False
-
-
 class ScheduleArgs(Record):
     interval_seconds: float | None = Field(default=None, ge=0.1)
     cron: str | None = None
@@ -400,9 +395,6 @@ def builtins() -> ToolRegistry:
     async def harness_get(c, a):
         return c.runtime.store.harness.get(c.session_id, **a.model_dump())
 
-    async def refine(c, a):
-        return c.runtime.request_refinement(c.session_id, **a.model_dump())
-
     async def schedule(c, a):
         return {"schedule_id": c.runtime.schedule(c.session_id, **a.model_dump())}
 
@@ -524,13 +516,6 @@ def builtins() -> ToolRegistry:
         "Inspect a full local or global harness entry.",
         HarnessGetArgs,
         harness_get,
-        ("state",),
-    )
-    add(
-        "refine",
-        "Schedule local refinement at the turn boundary; global scope is explicit.",
-        RefineArgs,
-        refine,
         ("state",),
     )
     add(

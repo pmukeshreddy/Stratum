@@ -194,9 +194,12 @@ async def test_root_rlm_messages_layers_refinement_detach_recovery(tmp_path, con
         entry = runtime.store.harness.get(root.id, "memory", "lesson")
         runtime.context.compact(root.id, count=len(runtime.store.session(root.id).context))
         assert runtime.store.event_by_id(evidence)["type"] == "python_result"
-        assert runtime.context.messages(root.id)[0] == {"role": "system", "content": FOUNDATION}
+        system = runtime.context.messages(root.id)[0]
+        assert system["role"] == "system" and system["content"].startswith(FOUNDATION)
+        assert "updated" not in system["content"]
+        assert "updated" in runtime.store.session(root.id).summary_harness_digest
         info = runtime.information(root.id)
-        assert info["L1"]["blocks"] == 1 and "x" in info["L2"]["checkpointed_names"]
+        assert info["L1"]["blocks"] == 0 and "x" in info["L2"]["checkpointed_names"]
         assert len(info["L2"]["children"]) == 2 and info["L3"]["compactions"] > 0
         assert "L2_ONLY_SECRET" not in json.dumps(info)
         await runtime.pause(root.id)

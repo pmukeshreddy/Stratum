@@ -54,8 +54,7 @@ print({'scheduled': receipt['scheduled'], 'state_before_boundary': harness.list(
                     "ipython",
                     code="assert harness.get('memory', 'lesson').content == 'Run checks in the project environment'\nawait compact()\nprint('Resumed lesson verified; compact checkpoint requested')",
                 )
-            if request.turn == 1:
-                assert "[self-refinement]" in text
+            assert "Run checks in the project environment" not in request.messages[0]["content"]
             return ModelResponse(
                 text="I retained the project validation lesson and will use the project environment."
             )
@@ -86,12 +85,8 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
         assert provider.peak == 1
         events = runtime.store.events(root.id, limit=100)
         kinds = [e["type"] for e in events]
-        assert (
-            kinds.index("refine_scheduled")
-            < kinds.index("refine_complete")
-            < kinds.index("refinement_notice")
-            < kinds.index("refinement_continuation")
-        )
+        assert kinds.index("refine_scheduled") < kinds.index("refine_complete")
+        assert "refinement_notice" in kinds and "refinement_continuation" not in kinds
     finally:
         await runtime.shutdown()
     resumed_provider = LearningSession(resume=True)
@@ -120,10 +115,7 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
                     "refine_scheduled",
                     "refine_complete",
                     "harness_refinement",
-                    "refinement_notice",
-                    "refinement_continuation",
                     "resumed",
-                    "harness_digest",
                     "context_compaction",
                     "refinement_review",
                     "completion",

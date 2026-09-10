@@ -113,7 +113,7 @@ def harness(context, operation, payload):
         return store.harness.get(sid, kind, p["id"], global_=global_)
     if operation == "overview":
         return store.harness.overview(sid, global_=global_, **p)
-    state = store.harness.load(None if global_ else sid)
+    state = store.harness.python_state(None if global_ else sid)
     if operation == "snapshot":
         return {
             "file_path": str(store.harness.path(None if global_ else sid) / "harness_state.json"),
