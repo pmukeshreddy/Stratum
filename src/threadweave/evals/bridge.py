@@ -13,9 +13,8 @@ from .schema import NotRun
 
 
 class OfficialWorker:
-    def __init__(self, setup, benchmark, directory, judge=None):
+    def __init__(self, setup, benchmark, directory):
         self.setup, self.benchmark, self.directory = setup, benchmark, Path(directory)
-        self.judge = judge
         self.process = None
         self.lock = asyncio.Lock()
         self.sequence = 0
@@ -78,17 +77,6 @@ class OfficialWorker:
                             # Drain its reply without mistaking it for a later scorecard/checkpoint.
                             with (self.directory / "late-replies.jsonl").open("a") as stream:
                                 stream.write(json.dumps(result) + "\n")
-                            continue
-                        if "judge_request" in result:
-                            if self.judge is None:
-                                await self.send({"error": "No ManyIH IF judge configured"})
-                            else:
-                                try:
-                                    await self.send(
-                                        {"text": await self.judge(result["judge_request"])}
-                                    )
-                                except Exception as exc:
-                                    await self.send({"error": str(exc)})
                             continue
                         if "error" in result:
                             raise NotRun(result["error"])

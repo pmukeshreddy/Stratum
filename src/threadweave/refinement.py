@@ -305,6 +305,7 @@ class RefinementServices(AuxiliaryServices):
         )
 
     def invalidate_refinement(self, sid, *, branch_change=False):
+        self.context._pending_harness_digest.pop(sid, None)
         state = self.refinement_state(sid)
         state.branch_version += 1
         if branch_change:
@@ -329,6 +330,9 @@ class RefinementServices(AuxiliaryServices):
                 task.cancel()
 
     async def refinement_branch_changed(self, sid):
+        command = self.refinement_state(sid).command_task
+        if command and command is not asyncio.current_task():
+            await asyncio.gather(asyncio.shield(command), return_exceptions=True)
         self.invalidate_refinement(sid, branch_change=True)
         state = self.refinement_state(sid)
         tasks = {state.background, state.plan_task, state.apply_task, state.auto_task, state.claim}
@@ -338,9 +342,20 @@ class RefinementServices(AuxiliaryServices):
         )
         state.background = state.background_options = None
 
-    def queue_refine_command(self, sid, command):
+    def start_queued_refine_command(self, sid):
+        """Commands share durable FIFO input ownership with ordinary user input."""
         state = self.refinement_state(sid)
-        previous = state.command_task
+        session = self.store.session(sid)
+        if state.command_task or sid in self.tasks or session.pending_turn or session.paused:
+            return None
+        queued = self.store.messages(sid, pending=True, limit=1)
+        if not queued or queued[0]["sender_id"] is not None:
+            return None
+        message = queued[0]
+        command = refine_command(message["body"])
+        if command is None:
+            return None
+        message_id = message["id"]
 
         def record(content, *, result=False, error=False):
             message = custom_message(
@@ -364,10 +379,13 @@ class RefinementServices(AuxiliaryServices):
 
         async def run():
             try:
-                if previous:
-                    await asyncio.shield(previous)
                 await self._wait_refinement_quiescence(sid)
-                record(command["text"])
+                with self.store.transaction():
+                    record(command["text"])
+                    self.store.db.execute(
+                        "UPDATE messages SET received_at=? WHERE id=?",
+                        (time.time(), message_id),
+                    )
                 try:
                     result = await self.refine(sid, **refine_command_options(command["args"]))
                 except Exception as exc:
@@ -382,6 +400,8 @@ class RefinementServices(AuxiliaryServices):
             finally:
                 if state.command_task is asyncio.current_task():
                     state.command_task = None
+                    if not self._closing:
+                        self.start_queued_refine_command(sid)
                 self._wake.set()
 
         state.command_task = asyncio.create_task(run(), name=f"refine-command-{sid}")
@@ -406,6 +426,10 @@ class RefinementServices(AuxiliaryServices):
             return False
         if session.pending_turn and not session.pending_turn.get("context_committed"):
             return False
+        if session.pending_turn is None and (
+            sid in self.tasks or self.store.messages(sid, pending=True, limit=1)
+        ):
+            return False  # Prime gives already-owned/preparing user input its turn.
         if sid in self._transitioning:
             return False
         if self.store.db.execute(
@@ -730,7 +754,7 @@ class RefinementServices(AuxiliaryServices):
                             self.store.event(sid, "refine_failed", {"error": str(exc)})
                         finally:
                             state.apply_task = None
-                    if current or not state.pending_request:
+                    if current or (not state.pending_request and not state.draining):
                         state.last_review_at, state.turns_since_review = time.time(), 0
                         state.pending_interval = False
                 elif result["status"] == "failure":
@@ -778,6 +802,7 @@ class RefinementServices(AuxiliaryServices):
                 if asyncio.current_task().cancelling():
                     raise
         options = state.pending_request
+        explicit = options is not None
         reason = None
         if options is None:
             if not policy.enabled:
@@ -851,6 +876,12 @@ class RefinementServices(AuxiliaryServices):
         except asyncio.CancelledError:
             if state.branch_version == branch:
                 self.invalidate_refinement(sid)
+            if explicit and not state.draining:
+                self.store.event(
+                    sid,
+                    "refine_failed",
+                    {"error": "Refinement cancelled because the session was disposed."},
+                )
             raise
         except RefineSkippedError as exc:
             if state.branch_version == branch:
@@ -869,6 +900,11 @@ class RefinementServices(AuxiliaryServices):
                     self.store.event(sid, "refine_failed", {"error": str(exc)})
             return False
         finally:
+            if explicit:
+                # Prime consumes an explicit boundary round even when an abort
+                # or navigation races its completion; automatic rounds differ.
+                state.last_review_at, state.turns_since_review = time.time(), 0
+                state.pending_interval = False
             state.in_progress, state.task = False, None
 
     @staticmethod
@@ -1012,6 +1048,10 @@ class RefinementServices(AuxiliaryServices):
         if self._closing or state.draining or state.auto_task or state.reviewing:
             return
         if self.has_pending_refinement(sid) and self.refinement_boundary(sid):
+            if not state.pending_compact:
+                # Prime consumes the deferred interval flag before dispatch;
+                # a below-threshold check must not reschedule itself forever.
+                state.pending_interval = False
             state.auto_task = asyncio.create_task(self.maybe_auto_refine(sid))
             state.auto_task.add_done_callback(lambda task: self._auto_refine_finished(sid, task))
 
@@ -1083,12 +1123,16 @@ class RefinementServices(AuxiliaryServices):
                 )
             except RefineSkippedError:
                 pass
-            if branch == state.branch_version and not self._closing:
-                state.pending_review = None
-                state.pending_interval = False
-                if reason == "compact":
-                    state.pending_compact = False
-                state.last_review_at, state.turns_since_review = time.time(), 0
+            except (Exception, asyncio.CancelledError):
+                # Prime's interactive _runApprovedRefine consumes its failure
+                # and stamps cooldown even if an abort raced the planner.
+                state.last_review_at = time.time()
+                return
+            state.pending_review = None
+            state.pending_interval = False
+            if reason == "compact":
+                state.pending_compact = False
+            state.last_review_at, state.turns_since_review = time.time(), 0
         except Exception:
             if branch == state.branch_version:
                 state.last_review_at = time.time()
@@ -1115,26 +1159,41 @@ class RefinementServices(AuxiliaryServices):
             await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
         state.draining = True
         try:
-            if self.serialized_refinement(sid) or state.pending_request or state.background:
+            if state.pending_request or state.background or state.claim:
                 await self.refinement_checkpoint(sid)
-                # Prime checks compaction separately, then re-reads settings for
-                # an interval drain (settings can change during teardown).
-                if state.pending_compact:
-                    policy = self.store.config(sid).refinement
-                    due = (
-                        policy.enabled
-                        and policy.compact
-                        and (
-                            not state.last_review_at
-                            or time.time() - state.last_review_at >= policy.cooldown_seconds
-                        )
+            # Compaction is checked separately, before re-reading live settings
+            # for the interval drain. No speculative checkpoint comes first.
+            if self.serialized_refinement(sid) and state.pending_compact:
+                policy = self.store.config(sid).refinement
+                due = (
+                    policy.enabled
+                    and policy.compact
+                    and (
+                        not state.last_review_at
+                        or time.time() - state.last_review_at >= policy.cooldown_seconds
                     )
-                    if due:
+                )
+                if due:
+                    try:
                         await self.refinement_checkpoint(sid)
-                        return
-                    state.pending_compact = False
+                    except Exception:
+                        pass  # Prime's compaction disposal drain is best effort.
+                    finally:
+                        state.pending_compact = False
+                    return
+                state.pending_compact = False
+            policy = self.store.config(sid).refinement
+            if (
+                policy.enabled
+                and state.turns_since_review >= policy.turn_interval
+                and (
+                    not state.last_review_at
+                    or time.time() - state.last_review_at >= policy.cooldown_seconds
+                )
+            ):
+                if self.serialized_refinement(sid):
                     await self.refinement_checkpoint(sid)
-            elif state.turns_since_review >= self.store.config(sid).refinement.turn_interval:
-                await self.maybe_auto_refine(sid, "turn_interval")
+                else:
+                    await self.maybe_auto_refine(sid, "turn_interval")
         finally:
             state.draining = False

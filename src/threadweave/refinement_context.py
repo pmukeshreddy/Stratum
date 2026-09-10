@@ -2,7 +2,7 @@
 
 import json
 
-from .harness import compact_text, js_json, js_length, js_slice
+from .harness import format_refinement_notice, js_json, js_length, js_slice
 from .models import now
 
 HARNESS_PREFIX = "The persistent memories produced across this session so far:\n\n<harness_state>\n"
@@ -44,18 +44,10 @@ def refinement_messages(result, source):
     ]
     applied = [edit for edit in result["appliedEdits"] if edit["applied"]]
     if applied:
-        lines = [compact_text(result["summary"])]
-        for edit in applied:
-            entry = edit.get("after") or edit.get("before") or {}
-            scope = entry.get("scope") or result.get("scope") or "local"
-            lines.append(
-                f"- {edit['action']} {edit['kind']} [{scope}:{edit['id']}] "
-                f"{entry.get('title', edit['id'])}: {compact_text(entry.get('content', ''))}"
-            )
         messages.append(
             custom_message(
                 "refinement_notice",
-                f"[{source}-refinement]\n\n" + "\n".join(lines),
+                f"[{source}-refinement]\n\n" + format_refinement_notice(result),
                 {**details, "source": source},
             )
         )
@@ -112,7 +104,10 @@ def serialize_conversation(messages):
             if calls:
                 rendered = []
                 for call in calls:
-                    args = ", ".join(f"{k}={js_json(v)}" for k, v in call["arguments"].items())
+                    args = ", ".join(
+                        f"{k}={js_json(v)}"
+                        for k, v in json.loads(js_json(call["arguments"])).items()
+                    )
                     rendered.append(f"{call['name']}({args})")
                 parts.append("[Assistant tool calls]: " + "; ".join(rendered))
         elif text:

@@ -11,6 +11,7 @@ real-model evaluation is part of this work.
 | --- | --- | --- |
 | `core/prompts/rlm.ts`, `REPL_CONTROL_PROMPT`: continual harness CRUD and `global_=True` | `context.python_instructions` | Same text, product-name substitution only. Deleted Buffalo's extra direct-write and per-request SYSTEM delivery explanations. |
 | `core/prompts/rlm.ts`, `buildRlmPrompt`: “Treat continual harness refinement…” | `context.python_instructions`, root only | Retained verbatim, including diagnose/update/validate/record, kind selection, immediate return, normal work, and focused edits. These are Prime instructions, not evaluation additions. |
+| `core/prompts/rlm.ts`, `buildSubagentGuidance`: “Persist genuinely reusable delegation patterns…” | Visible refine skill plus enabled delegation | Retained verbatim and only advertised when Prime's equivalent capabilities are visible. |
 | `core/prompts/rlm.ts`: read SKILL.md, help/dir/signature discovery | Root's refine skill description and file location | Exposed on demand. No stronger invocation policy. |
 | `skills/refine/SKILL.md`, entire file | `builtin_skills/refine/SKILL.md` | Exact copy. The two examples and “One request per turn” belong here, not an extra unconditional SYSTEM block. |
 | `skills/refine/src/refine/__init__.py` | `kernel_api.refine_run` / `refine_status` module exports | Python signature and false-flag omission must match. Host omission is distinct from explicit false. |
@@ -26,13 +27,19 @@ the notice alone does not start an idle turn.
 
 ## Section 16: test inventory and validation
 
-The [complete candidate test map](prime-refinement-test-map.md) currently inventories
-317 definitions: 245 applicable to the scoped Buffalo surfaces, 136 mapped passing,
-109 explicitly open, and 72 explained structural/out-of-scope exclusions. These
-are definitions, not expanded parameter cases. Every candidate has a disposition;
-the inventory bookkeeping is complete, but the exact-variant parity proof is not.
-Open rows are not automatically runtime bugs, and related coverage is not counted
-as an exact pass. There is no claim of 245 passing applicable invariants.
+The [complete test map](prime-refinement-test-map.md) inventories **317 test
+definitions in 42 files: 235 applicable, 235 mapped and passing, 0 unmapped
+applicable, and 82 individually explained structural/out-of-scope exclusions**.
+Counts refer to definitions, not expanded parameter cases. All 236 regression
+references resolve. Ten formerly open candidates were classified as structural
+exclusions after checking their exact APIs, not counted as implemented behavior;
+the map identifies each one and its supported-path coverage.
+
+Inspected suites include serialized refinement, refine skill/extension, refinement
+units, outcomes/notices, harness Python CRUD, settings, provider retry, serializers,
+prompt/digest delivery, action/input races, queues, daemon/RPC/config integration,
+history, rollback, conflicts, navigation, abort and disposal. The map lists every
+file, source test name and disposition; no applicable candidate remains open.
 
 Prime's eight core suites were executed against the supplied checkout:
 `refinement.test.ts`, `refinement-outcome-message.test.ts`,
@@ -73,12 +80,12 @@ root skill coalesces requests and preserves omitted scope/instructions.
 
 | Section | Corrections and remaining audit work |
 | --- | --- |
-| 17 | Background/safe-boundary exact-plan ownership, single-consumer claims, public planning/apply barriers, interactive path, explicit failure boundary retry. Exact variants still open in the test map. |
+| 17 | Background/safe-boundary exact-plan ownership, single-consumer claims, public planning/apply barriers, interactive path, explicit failure boundary retry; no duplicate apply or forbidden model overlap. Queued input remains behind the current refinement boundary and slash commands share FIFO ownership. |
 | 18 | Root module exposure and docstrings, active-turn checks, immediate receipt, explicit bypass, coalescing, supersession, host omission versus explicit false. Removed the extra native model-facing refine tool and human/rollback arguments from the root scheduling API. Manual CLI/RPC uses public refinement, not root coalescing. |
-| 19 | Late planner failures and extension skips are classified as invalidated against the originating branch. Aborted root responses clear pending explicit work even without a separate host abort. Actual task cancellation remains authoritative when providers ignore it. Automatic apply rechecks branch identity before stamping cooldown. Direct apply owns the admission barrier. Drain re-reads live task ownership and compaction/interval settings; explicit disposal errors are best effort, while normal boundary failures remain visible. Claimed application and memoized shutdown regressions pass. Remaining exact variants are explicitly open. |
+| 19 | Late planner failures and extension skips are classified as invalidated against the originating branch. Aborted root responses clear pending explicit work even without a separate host abort. Actual task cancellation remains authoritative when providers ignore it. Automatic apply rechecks branch identity before stamping cooldown. Direct apply owns the admission barrier. Drain re-reads live task ownership and compaction/interval settings without a speculative checkpoint. Valid work drains once; stale results/failures cannot write. Explicit-boundary cancellation and interactive approved-plan failures consume cooldown exactly where Prime does; stale disposal plans do not. Claimed application, navigation, shutdown and late-result variants pass. |
 | 20 | Prime XML input blocks; ordinary-message serializer; SYSTEM/developer exclusion; model-visible notices and compaction summaries; 40,000/80,000 UTF-16 conversation limits; 40 entries/kind, 240-character content, 20 history records. Global planner receives global state only. |
-| 21 | Active model maxTokens, not the primary turn budget, controls reviewer/planner caps (4096/32000). Bundled metadata is projected from the supplied Prime catalog; custom definitions use Prime's defaults and explicit overrides. Chat one-shot streaming, developer-role and provider compatibility settings, finish-reason classification, Retry-After and EOF handling are ported. Native refinement now preserves incomplete-response length and retry delays. Non-JSON constants are rejected. Prime only special-cases error/length tags before JSON parsing; actual cancellation is enforced by session/task ownership. No extra reasoning pass or fallback planner. |
-| 22 | Typed edits, baseline touched-entry conflicts, partial failures, sequential same-entry edits, scope display IDs, rollback recorded paths, local/global history, atomic symlink-preserving persistence. Removed Buffalo's extra file locks. Python CRUD now uses Prime's Python normalization/validation, distinct from planner validation as in Prime. |
+| 21 | Active model maxTokens, not the primary turn budget, controls reviewer/planner caps (4096/32000). Bundled metadata is projected from the supplied Prime catalog; custom definitions use Prime's defaults and explicit overrides. Chat one-shot streaming, developer-role and provider compatibility settings, finish-reason classification, Retry-After and EOF handling are ported. Native one-shot refinement uses WebSocket first and pre-stream-only SSE fallback, bypasses SDK retries/401 recovery, and preserves provider error codes, terminal statuses, usage-limit delays, malformed protocol errors and SSE EOF behavior. Non-JSON constants are rejected. Prime only special-cases error/length tags before JSON parsing; actual cancellation is enforced by session/task ownership. No extra reasoning pass or fallback planner. |
+| 22 | Typed edits, baseline touched-entry conflicts, partial failures, sequential same-entry edits, scope display IDs, rollback recorded paths, local/global history, atomic symlink-preserving persistence. Removed Buffalo's extra file locks. Python CRUD uses Prime's dictionary coercion/omission and normalization/validation, distinct from planner validation. Host formatter functions are copied directly into JavaScript, including locale ordering, JSON numbers/property order and history slice behavior. |
 
 ## Production files changed by the source-parity work
 
@@ -151,7 +158,7 @@ narrowed pass; the 567-pass full-suite result above predates these changes.
 
 Scoped Ruff checks and `git diff --check` passed. The changed native bridge built
 successfully against the already available pinned Codex source; no inference was
-performed. Existing binaries and diagnostic artifacts were preserved.
+performed.
 
 Production changes in this narrowed pass:
 
@@ -195,30 +202,123 @@ Custom/proxied models can provide `provider.model_metadata` with Prime's
 four-kind harness schema. Prime's custom-model default is 16384 output tokens and
 `reasoning=false`; it is not a newly invented fallback.
 
-The native Codex and Prime direct-fetch clients still differ in transport-internal
-authentication recovery and the detail retained for opaque SDK errors. The port
-preserves available classifications and retry delays, but does not claim every
-provider/SDK diagnostic is byte-for-byte identical. Prime's other provider APIs
-are not implemented by Buffalo; this work did not add unrelated providers.
+That earlier transport gap is now closed for refinement's supported transports:
+the native bridge retains the shared credential resolver but no longer sends
+one-shot refinement through the SDK response parser or 401-recovery loop. Raw
+WebSocket/SSE events preserve the provider's error type, status and retry timing.
+Underlying Rust/Python exception wording and the host credential-store location
+are not a byte-for-byte TypeScript API contract. Other Prime provider APIs remain
+structurally outside Buffalo's supported transports; none was added.
 
-## Known remaining work — no parity claim
+## Closure pass: queued input, formatter/resources, native transport and exact variants
 
-1. Close the 109 explicitly open exact-variant proofs in the completed inventory.
-2. Audit/port cold first-context commit rollback/re-arming and cleared-input behavior;
-   Buffalo currently persists its initial digest before model-request ownership is
-   fully committed, unlike Prime's staged input mechanism.
-3. Complete refinement command ownership/order against ordinary queued inputs and
-   branch/abort/restart races. The new refinement-command queue is not yet proven
-   equivalent to Prime's unified session-input pump.
-4. Model/output-cap parity for supported transports is implemented. Remaining
-   transport differences concern native authentication recovery and opaque SDK
-   error detail, not the 25-turn scheduler or planner output budget.
-5. Audit exact formatter/JSON edge behavior: Python ordering is not JavaScript
-   localeCompare, and numeric JSON edge formatting is not yet proven identical.
-6. Finish built-in skill override/resource filtering and all remaining serialized,
-   interactive, disposal, and failure variants listed in the table.
-7. Finish Python CRUD edge normalization, including generic reference/arguments/
-   metadata dictionary coercion; planner validation and Python helper validation
-   are intentionally distinct in Prime and must remain so.
+- First-input digests are staged, refreshed from disk at request admission, and
+  persisted atomically with the request. Failed admission/abort can re-arm them.
+  Equal timestamps select the latest digest. A compaction head supersedes the
+  staged digest, so a request never receives both copies.
+- Slash `/refine` commands use the durable ordinary input queue: they cannot
+  overtake earlier user work, disappear on restart before admission, or become
+  user evidence. Command receipts/results have Prime's context filtering and
+  context-only persistence-failure behavior.
+- Refinement runs before handing queued next-turn input to the root. Interactive
+  deferred interval scheduling consumes its pending flag before dispatch; an
+  under-25-turn check cannot repeatedly reschedule itself.
+- Disposal waits for current ownership, re-reads settings, and handles pending
+  explicit, automatic, compact and interval work in Prime's order. The regression
+  matrix covers late review/plan success/failure, authoritative cancellation,
+  supersession, branch navigation, exact-plan claims and already-completed roots.
+- User refine skills override the built-in by name; disabled/model-hidden and
+  Markdown-only resources do not advertise a pre-imported Python API. Child
+  sessions do not advertise the root-only refine API. Kernel reload removes
+  only its owned built-in module before loading a user override.
+- `harness_format.mjs` directly copies Prime's five formatting functions
+  (TypeScript annotations removed and product name translated). A source
+  comparison confirms the copy. Node.js **22.8+** is now an explicit prerequisite,
+  matching the supplied Prime minimum; validation used Node 24.11.0. No Python
+  collation/numeric approximation or fallback formatter remains.
+- Native one-shot calls have no session cache or reasoning option. They use
+  Prime's headers and WebSocket-first/pre-start-only SSE fallback; API/protocol
+  errors never trigger that fallback. Shared retries receive original provider
+  codes/status, Retry-After/reset delays, terminal stop/length status, and
+  malformed JSON/UTF-8/EOF behavior. Missing credentials fail before retries.
+  Primary inference's transport is unchanged.
 
-SELF-REINFORCEMENT PARITY: NOT COMPLETE
+### Source → implementation → regression for the closure
+
+| Prime source/contract | Buffalo implementation | Direct regression |
+| --- | --- | --- |
+| `agent-session.ts` staged first input, cold digest, input queue | `context.py` staging/commit methods; `runtime.py` admission; `refinement.py:start_queued_refine_command` | `test_prime_refinement_edges.py` first-digest/FIFO tests; `test_prime_refinement_variants.py` abort/re-arm, command ownership tests |
+| `agent-session.ts` serialized/interactive barriers and disposal | `refinement.py` checkpoint, background ownership, drain and deferred scheduling | `test_prime_refinement_races.py`, `test_prime_refinement_variants.py`, production 25-turn test in `test_prime_refinement_lifecycle.py` |
+| `refinement/refinement.ts:407–565` formatters and JavaScript serialization | `harness_format.mjs`; `harness.py` thin formatter/JSON wrappers | `test_prime_refinement_edges.py` locale/numeric/property-order/zero-history tests; direct source comparison |
+| `prime-agent-runtime/src/rlm/harness.py` dictionary coercion | `harness.py:HarnessStore.mutate` | `test_prime_refinement_edges.py` dictionary/invalid-edit/scope/atomic-write cases |
+| `resource-loader.ts`, `package-manager.ts`, `system-prompt.ts`, `agent-session.ts:_modelVisibleSkills` | `skills.py:refine_skill`, `context.py`, `kernel_api.py` | `test_prime_refinement_variants.py` root/resource/module-reload cases; `test_refinement_prompt.py` |
+| `openai-codex-responses.ts` WebSocket/SSE normalization and errors | `native/inference.rs`, `refinement_transport.py`, `subscription.py` | Rust loopback transport tests; `test_prime_refinement_edges.py` raw events; `test_prime_refinement_provider.py` caps/retry tests |
+
+### Files changed in this closure
+
+Production: `context.py`, `harness.py`, `kernel_api.py`, `models.py`,
+`native/inference.rs`, `native_client.py`, `refinement.py`,
+`refinement_context.py`, `runtime.py`, `skills.py`, `subscription.py`;
+new `harness_format.mjs` and `refinement_transport.py`.
+
+Tests: new `test_prime_refinement_edges.py` and
+`test_prime_refinement_variants.py`; strengthened
+`test_prime_refinement_lifecycle.py`, `test_prime_refinement_races.py` and the
+existing hardening compaction regression. Documentation: this report, the
+complete map, README, subscription transport notes and the stale root-prompt
+snapshot's refinement section.
+
+Deleted/replaced in this closure: `queue_refine_command` and its separate
+command chain; eager first-digest persistence; Python `compact_text` and
+formatter/overview/history/notice approximations; the temporary `js_entries`
+locale adapter; the SDK-specific incomplete-response string shim; refinement's
+inner native SDK retry/401-recovery path; extra speculative disposal checkpoint;
+stale conditional/unconditional cooldown behavior; repeated under-threshold
+deferred scheduling. No old reinforcement architecture or compatibility path was
+retained.
+
+Remaining dedicated production reinforcement files: `refinement.py`,
+`harness.py`, `harness_format.mjs`, `refinement_context.py`,
+`refinement_model.py`, `refinement_retry.py`, `refinement_transport.py`,
+`prime_refinement_models.json`, `builtin_skills/refine/SKILL.md`.
+The shared runtime, context, kernel, providers and control-plane modules contain
+only their integration points, not a second reinforcement loop.
+
+### Closure verification
+
+- Focused five-file parity set: **269 passed** before the two full-suite
+  integration regressions were found.
+- Native bridge built successfully against pinned Codex source; **2 Rust tests
+  passed**, including seven local WebSocket framing/fallback variants. No model
+  or authentication request was made by these tests.
+- First full-suite attempt: **689 passed, 6 skipped, 1 failed** before stopping
+  an interactive scheduling stall. This exposed duplicate staged/compaction
+  digest delivery and the under-threshold deferred-scheduling loop. Both were
+  fixed; the affected regressions plus edge/variant set then **146 passed**.
+- Final full Buffalo suite: **770 passed, 10 skipped, 2 warnings in 169.16 seconds**
+  (`uv run pytest -q --disable-warnings --timeout=45`). The per-test timeout only
+  bounds the offline test runner; it changes no runtime or refinement policy.
+- Scoped Ruff and whitespace checks pass. All **236** mapped test references
+  resolve; copied formatter source comparison passes.
+
+### Remaining differences / applicability boundary
+
+No known behavioral deviations remain in the self-reinforcement loop on the
+supported Buffalo surfaces. The 82 exclusions are not claimed as implemented:
+they concern absent ACP/TUI/print adapters, generic non-refinement behavior,
+Prime-only extension/custom-input/skip-abort APIs, synchronous disposal (Buffalo
+has asynchronous shutdown), non-persisted/standalone environment-bound harness
+constructors, and other structurally unavailable operations. Each source test's
+specific reason is in the map. This is not a claim that Buffalo implements every
+Prime application/API/provider.
+
+Source provenance (supplied checkout has no Git metadata):
+
+- `agent-session.ts` SHA-256:
+  `c8c3b5b2793472ef5d7d1f949ed65786dc8b44529e0bc8566ea5505112d835f2`
+- `refinement/refinement.ts` SHA-256:
+  `81438d5b4acb013c40eae05f12402eb8d7052df3a522baec972c773fd5431f86`
+- `prompts/rlm.ts` SHA-256:
+  `8df7b497524d33aa4e7aae30bf12604029084cfd8747c00bd6df31c9076b32ef`
+
+SELF-REINFORCEMENT PARITY: NO KNOWN BEHAVIORAL DEVIATIONS

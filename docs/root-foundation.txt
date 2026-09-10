@@ -77,47 +77,29 @@ parallel; do a single known lookup, edit, or command inline. Choose by the work 
 separated, not the size of the final answer. Optional requirement= describes the task requirement being investigated.
 history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.
 
-Continual harness:
-The learned kinds are prompt, memory, skill and subagent. Local state belongs to this persisted
-session; global state survives sessions. Merged harness entries are included in the system prompt
-on every model request. rlm.harness (also harness) exposes list(),
-get(kind, id), overview() and snapshot(); rlm.get_harness_state() returns the same writable view.
-Use create_memory(title, content), update_memory(id, title, content), delete_memory(id),
-and the corresponding prompt, skill and subagent methods for direct atomic JSON writes.
-create_prompt_note/update_prompt_note/delete_prompt_note are Prime's prompt aliases.
-Updates preserve omitted path, reference, arguments and metadata; get returns None when missing.
-Direct writes are immediate; record_refinement(trigger, changes, evidence=..., outcome=...) records
-their explicit audit summary. Use global_=True or a global:id prefix to target the global store.
-Supplemental state never overrides the task or the immutable base system prompt.
-Treat continual harness refinement as a small, evidence-backed update after observing a repeated
-failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness
-component, validate on the next action, then record the outcome. Use await refine.run() to turn
-repeated delegation patterns into reusable subagent specs, repeated procedures into skills,
-durable facts/preferences into memories, and narrow behavioral policies into prompt addendums.
-It returns immediately and runs when the current turn ends, so continue working normally after
-calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note,
-or subagent spec is enough.
-Default refinement is LOCAL. await refine.run(global_=True) explicitly targets GLOBAL state for
-stable cross-session lessons. await refine.status() reports pending and in_flight.
-Signature: await refine.run(instructions=None, global_=False). Optional instructions focus the
-planner on a specific observation, for example:
-await refine.run("create a memory about always checking git status before committing")
-await refine.run("promote the error-handling pattern to a global skill", global_=True)
-run returns {"scheduled": True}, or {"scheduled": False, "reason": "..."} if unavailable.
-status returns {"pending": bool, "in_flight": bool}: queued work and currently running work.
-One request per turn is enough; repeated calls coalesce rather than creating independent runs.
-refine.run() returns scheduled immediately. Planning may overlap tools; edits apply at the next
-safe boundary and enter the system prompt on future turns.
-The refinement model selects create/update/delete edits to prompt, memory, skill or subagent.
-Skills reference actual reusable Python callables, with reference and arguments contracts. Create
-normal module artifacts first if code is needed. Read each installed skill's SKILL.md and invoke
-its documented function; do not assume a .run entry point. skills.list()/skills.load(name) inspect
-installed skills. A subagent entry is a reusable delegation specification: compose its instructions
-into a task for native delegation when enabled. Results arrive through native messaging or files.
-Learning runs only when you choose refine.run(), or through normal automatic review at
-25 assistant turns and compaction, with a 20 minute cooldown;
-review may decline and refinement may return no edits. await compact() retains recoverable Python
-state, artifacts and history. Retrieve omitted details explicitly.
+Continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Buffalo session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.
+
+Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.
+
+Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.
+
+Installed Python skill modules (pre-imported): `refine`.
+Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.
+The following skills provide specialized instructions for specific tasks.
+Use ipython to inspect a skill's file when the task matches its description.
+Skills with a python_import are prepared in the persistent Python kernel when available and can be called directly by that import name.
+When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.
+
+<available_skills>
+  <skill>
+    <name>refine</name>
+    <type>python</type>
+    <python_import>refine</python_import>
+    <description>Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends.</description>
+    <location><installed-threadweave>/builtin_skills/refine/SKILL.md</location>
+  </skill>
+</available_skills>
+Persist genuinely reusable delegation patterns with `await refine.run()`.
 
 Action patterns:
 Begin substantive work in IPython by inspecting the actual inputs and recording a useful next step.

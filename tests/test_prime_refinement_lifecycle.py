@@ -605,8 +605,9 @@ async def test_missing_rollback_id_emits_command_failure_without_calling_planner
 
 
 @pytest.mark.parametrize("decision,nonempty", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("creation", ["runtime", "daemon"])
 async def test_twenty_five_real_runtime_turn_boundaries(
-    tmp_path, python_config, decision, nonempty
+    tmp_path, python_config, decision, nonempty, creation
 ):
     """Deterministic provider, real turn/tool scheduler: no direct checkpoint calls."""
     from threadweave.models import Action
@@ -623,6 +624,7 @@ async def test_twenty_five_real_runtime_turn_boundaries(
             if purpose == "refinement_review":
                 reviews += 1
                 assert primary_turns == 25
+                assert "queued boundary input" not in str(request.messages)
                 return ModelResponse(
                     text=json.dumps({"shouldRefine": decision, "rationale": "review"})
                 )
@@ -631,6 +633,8 @@ async def test_twenty_five_real_runtime_turn_boundaries(
                 assert primary_turns == 25 and decision
                 return ModelResponse(text=json.dumps(proposal(*([edit()] if nonempty else []))))
             primary_turns += 1
+            if primary_turns == 25:
+                runtime.message(None, root.id, "queued boundary input")
             if primary_turns <= 25:
                 assert reviews == 0
                 return ModelResponse(
@@ -642,6 +646,7 @@ async def test_twenty_five_real_runtime_turn_boundaries(
                     ]
                 )
             assert reviews == 1 and planners == int(decision)
+            assert "queued boundary input" in str(request.messages)
             assert ("[auto-refinement]" in str(request.messages)) == nonempty
             return ModelResponse(text="Done")
 
@@ -650,9 +655,24 @@ async def test_twenty_five_real_runtime_turn_boundaries(
     config.context.compact_at = 0.95
     runtime = Runtime(tmp_path / "state", providers={"mock": Provider()})
     try:
-        root = runtime.create(
-            "Execute the deterministic scheduler regression", tmp_path, config=config
-        )
+        if creation == "daemon":
+            from threadweave.daemon import Daemon
+
+            daemon = object.__new__(Daemon)
+            daemon.runtime = runtime
+            created = await daemon.dispatch(
+                "create",
+                {
+                    "instruction": "Execute the deterministic scheduler regression",
+                    "workspace": str(tmp_path),
+                    "config": config.model_dump(mode="json"),
+                },
+            )
+            root = runtime.store.session(created["id"])
+        else:
+            root = runtime.create(
+                "Execute the deterministic scheduler regression", tmp_path, config=config
+            )
         await runtime.start()
         await runtime.wait(root.id, timeout=30)
         assert primary_turns == 26

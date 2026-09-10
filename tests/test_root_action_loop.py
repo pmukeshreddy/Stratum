@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from threadweave.evals.harness import run_buffalo
-from threadweave.evals.manyih_full_harness import experiment_config
+from threadweave.evals.root_loop_validation import validation_config
 from threadweave.gitops import git
 from threadweave.models import Action, ModelResponse, Usage
 
@@ -111,7 +111,7 @@ async def test_root_actions_run_without_feature_completion_requirements(
     monkeypatch.setattr(
         "threadweave.evals.harness.default_providers", lambda: {"codex_subscription": peer}
     )
-    config = experiment_config()
+    config = validation_config()
     task = {
         "messages": [
             {
@@ -300,7 +300,7 @@ async def test_evaluation_wrapper_preserves_original_contract_for_python_and_rev
     monkeypatch.setattr(
         "threadweave.evals.harness.default_providers", lambda: {"codex_subscription": Peer()}
     )
-    config = experiment_config()
+    config = validation_config()
     result = await run_buffalo(config, {"messages": original}, tmp_path / "run")
     assert result["response"] == "five"
 

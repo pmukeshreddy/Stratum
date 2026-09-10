@@ -9,6 +9,10 @@ Ordinary conversation does not require a repository or a coding workflow.
 
 ## Open the Agents View
 
+Prerequisites: Python 3.11+, uv, and Node.js 22.8+ (the supplied Prime minimum).
+Node executes the copied Prime harness formatters and JSON serialization, preserving
+JavaScript ordering, Unicode and numeric behavior without Python approximations.
+
 ```sh
 uv sync --extra dev
 uv run threadweave auth status
@@ -65,9 +69,8 @@ auth logout signs out of the shared Codex login.
 ## Architecture
 
 The root's ordinary action loop chooses how to solve each task. See the
-[execution architecture and Python API](docs/adaptive-orchestration.md),
-[exact root foundation](docs/root-foundation.txt), and
-[targeted validation](docs/adaptive-validation.md).
+[execution architecture and Python API](docs/adaptive-orchestration.md) and
+[exact root foundation](docs/root-foundation.txt).
 
 ```text
 Human ↔ Agents View ↔ Root Session ↔ Environment
@@ -109,15 +112,18 @@ Automatic review runs at 25 assistant turns and compaction, with a 20 minute coo
 only in root sessions. The reviewer alone decides whether to run the planner.
 Explicit refinement bypasses review. An empty edits array is valid.
 
-Each legitimate model request rebuilds its SYSTEM prompt from the merged local/global
-harness JSON. Refinement results stay in audit history; no synthetic refinement messages
-enter conversation, and applied edits do not resume completed or idle tasks.
+As in the supplied Prime runtime, applying refinement preserves the SYSTEM prefix.
+The audit records the result; an applied-only refinement notice delivers changed state
+to the next legitimate model request. Presentation-only outcomes stay out of model
+context. Cold session/resume boundaries and compaction heads carry the merged harness
+digest as user context. Applied edits do not resume completed or idle tasks.
 Colliding global/local IDs remain visible with
 scope labels; local guidance can override global guidance within the session.
 Skills reference existing Python callables and their argument contracts; reusable
 subagent specifications execute through native `rlm` delegation.
 
-See [the source, deletion, and test mapping](docs/continual-harness-parity.md).
+See [the current source-parity specification](docs/prime-refinement-specification.md)
+and [complete Prime test mapping](docs/prime-refinement-test-map.md).
 
 Compaction only changes L1. History, REPL values and children remain intact.
 Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,
@@ -201,7 +207,7 @@ Standard runner are not included in this checkout.
 
 Run `buffalo eval arc-agi-3 --config /absolute/evaluation.json` to evaluate Buffalo
 on the official 25 ARC-AGI-3 environments. Its reports retain the measured scores
-and usage. The other four official benchmark families are paused.
+and usage. LongBench v2 and Factorio integrations remain paused.
 
 See [evaluation setup and reproducibility](docs/evaluation.md).
 

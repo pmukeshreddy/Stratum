@@ -2,9 +2,6 @@
 
 import asyncio
 import json
-import os
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -283,49 +280,6 @@ async def test_long_context_is_exactly_preserved_in_repl_task(tmp_path, monkeypa
     assert "unique suffix" in json.dumps(provider.requests[1].messages)
 
 
-@pytest.mark.parametrize("error", ["Empty response", "Missing checker dependency"])
-def test_if_preserves_official_empty_response_nulls_but_rejects_setup_errors(tmp_path, error):
-    worker = Official()
-    worker.benchmark = "manyih-if"
-    worker.output = tmp_path
-    worker.rows = {"0": {"constraints": [{"score": None, "eval_details": [{"error": error}]}]}}
-    worker.if_evaluator = SimpleNamespace(_evaluate_single=lambda args: args[0])
-    if error == "Empty response":
-        result = worker.grade("0", "")
-        assert result["constraints"][0]["score"] is None
-        assert result["constraints"][0]["eval_details"][0]["error"] == error
-    else:
-        with pytest.raises(RuntimeError, match="Missing checker dependency"):
-            worker.grade("0", "")
-
-
-def test_if_judge_recovery_keeps_scored_checks_and_the_original_answer(tmp_path):
-    worker = Official()
-    worker.benchmark = "manyih-if"
-    worker.output = tmp_path
-    worker.rows = {"0": {"constraints": [{"name": "first"}, {"name": "second"}]}}
-    prior = {
-        "output": {"content": "original answer"},
-        "constraints": [
-            {"name": "first", "score": True, "eval_details": [{"error": None}]},
-            {"name": "second", "score": None, "eval_details": [{"error": "transport_failure"}]},
-        ],
-    }
-
-    def official_evaluator(args):
-        entry = args[0]
-        assert entry["constraints"][0]["score"] is True
-        assert "score" not in entry["constraints"][1]
-        entry["constraints"][1]["score"] = False
-        return entry
-
-    worker.if_evaluator = SimpleNamespace(_evaluate_single=official_evaluator)
-    result = worker.grade("0", "original answer", previous_grade=prior)
-    assert [c["score"] for c in result["constraints"]] == [True, False]
-    with pytest.raises(ValueError, match="Cannot change an agent answer"):
-        worker.grade("0", "a different answer", previous_grade=prior)
-
-
 def test_arc_frame_pixels_are_included_even_when_sdk_uses_private_arrays():
     class Frame:
         def tolist(self):
@@ -415,55 +369,6 @@ def test_comparison_contract_changes_when_any_required_setting_changes():
     assert first["task_ids"] == ["id"]
 
 
-@pytest.mark.skipif(
-    not os.environ.get("BUFFALO_TEST_MANYIH_SOURCE"),
-    reason="Official ManyIH checkout not configured",
-)
-async def test_real_official_manyih_formatter_and_coding_analyzer(tmp_path):
-    setup = BenchmarkSetup(
-        source=Path(os.environ["BUFFALO_TEST_MANYIH_SOURCE"]),
-        python=os.environ.get("BUFFALO_TEST_OFFICIAL_PYTHON", sys.executable),
-    )
-    worker = OfficialWorker(setup, "manyih-coding", tmp_path)
-    try:
-        provenance = await worker.start()
-        tid = provenance["task_ids"][0]
-        task = await worker.call("task", task_id=tid)
-        assert [m["role"] for m in task["messages"]] == ["system", "user"]
-        assert "test_code" not in task and "expected_styles" not in task
-        # Empty model output tests scorer plumbing; no agent capability run occurs.
-        grade = await worker.call("grade", task_id=tid, response="")
-        assert grade["evaluation"]["overall_passed"] is False
-        result = await worker.call("summarize", grades=[grade], profile="unit-test")
-        assert result["primary_score"] == 0
-        assert result["raw"]["failure_stats"]["test_failures"] == 1
-    finally:
-        await worker.close()
-
-
-@pytest.mark.skipif(
-    not os.environ.get("BUFFALO_TEST_MANYIH_SOURCE"),
-    reason="Official ManyIH checkout not configured",
-)
-async def test_real_official_manyih_if_inputs_are_unchanged(tmp_path):
-    setup = BenchmarkSetup(
-        source=Path(os.environ["BUFFALO_TEST_MANYIH_SOURCE"]),
-        python=os.environ.get("BUFFALO_TEST_OFFICIAL_PYTHON", sys.executable),
-    )
-    worker = OfficialWorker(setup, "manyih-if", tmp_path)
-    try:
-        provenance = await worker.start()
-        tid = provenance["task_ids"][0]
-        raw = json.loads((setup.source / "manyih/data/instruction_following.json").read_text())
-        assert len(provenance["task_ids"]) == len(raw) == 426
-        row = raw[provenance["task_identity_map"][tid]["row_index"]]
-        task = await worker.call("task", task_id=tid)
-        assert task["messages"] == row["input"]
-        assert "constraints" not in task
-    finally:
-        await worker.close()
-
-
 async def test_evaluation_can_use_production_coding_adapter_without_rewriting_task(
     tmp_path, repository, monkeypatch
 ):
@@ -509,71 +414,3 @@ async def test_evaluation_can_use_production_coding_adapter_without_rewriting_ta
     assert sessions[0]["instruction"] == "Official task verbatim"
     saved = RunConfig.model_validate_json((tmp_path / "run/buffalo-config.json").read_text())
     assert saved.task.adapter == "coding"
-
-
-def test_manyih_reporting_excludes_unreported_transport_reservations(tmp_path):
-    import sqlite3
-
-    from threadweave.evals.manyih_coding import measured_usage, records_summary
-
-    (tmp_path / "state").mkdir()
-    with sqlite3.connect(tmp_path / "state/history.sqlite3") as db:
-        db.execute("CREATE TABLE model_attempts(usage TEXT)")
-        db.executemany(
-            "INSERT INTO model_attempts VALUES(?)",
-            [
-                (json.dumps(row),)
-                for row in [
-                    {"input_tokens": 2000, "output_tokens": 32768, "estimated_calls": 1},
-                    {"input_tokens": 100, "output_tokens": 20, "estimated_calls": 0},
-                ]
-            ],
-        )
-    record = {
-        "system": "buffalo",
-        "run_artifact": str(tmp_path),
-        "input_tokens": None,
-        "output_tokens": None,
-        "total_tokens": None,
-        "estimated_cost": None,
-        "functional_pass": True,
-        "style_pass": False,
-        "overall_pass": False,
-        "wall_time_seconds": 12,
-    }
-    record.update(measured_usage(record))
-    assert record["known_total_tokens"] == 120
-    assert record["unknown_usage_attempts"] == 1
-    summary = records_summary([record])
-    assert summary["total_tokens"] is None
-    assert summary["known_total_tokens"] == 120
-    assert summary["denominator"] == 1 and summary["overall_pass"] == 0
-
-
-@pytest.mark.parametrize("interrupted", [False, True])
-def test_manyih_native_usage_preserves_measurements_but_flags_interrupted_streams(
-    tmp_path, interrupted
-):
-    from threadweave.evals.manyih_coding import measured_usage
-
-    usage = {
-        "input_tokens": 100,
-        "output_tokens": 20,
-        "cached_input_tokens": 40,
-        "total_tokens": 120,
-    }
-    (tmp_path / "agent-result.json").write_text(json.dumps({"usage": usage}))
-    events = [{"type": "turn.completed", "usage": usage}]
-    if interrupted:
-        events.insert(
-            0,
-            {
-                "type": "error",
-                "message": "Reconnecting... 2/5 (stream disconnected before completion)",
-            },
-        )
-    (tmp_path / "codex.jsonl").write_text("\n".join(json.dumps(event) for event in events))
-    measured = measured_usage({"system": "codex", "run_artifact": str(tmp_path)})
-    assert measured["known_total_tokens"] == 120
-    assert measured["known_cached_input_tokens"] == 40
-    assert measured["unknown_usage_attempts"] == int(interrupted)

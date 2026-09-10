@@ -905,11 +905,20 @@ def bootstrap(bridge, values, metadata):
         return await bridge.acall("schedule_turn", **options)
 
     values.update(compact=compact, heartbeat=heartbeat)
-    if metadata.get("depth", 0) == 0:
-        import sys
-        import types
+    import sys
+    import types
 
+    previous = sys.modules.get("refine")
+    if getattr(previous, "__buffalo_builtin__", False):
+        sys.modules.pop("refine")
+    if (
+        metadata.get("depth", 0) == 0
+        and metadata.get("enable_builtin_skills", True)
+        and (Path(__file__).with_name("builtin_skills") / "refine" / "SKILL.md").is_file()
+        and not any(entry["name"] == "refine" for entry in metadata.get("skills", []))
+    ):
         module = types.ModuleType("refine", "Continual harness refinement from the kernel.")
+        module.__buffalo_builtin__ = True
         module.run, module.status = refine_run, refine_status
         refine_run.__name__, refine_status.__name__ = "run", "status"
         refine_run.__module__ = refine_status.__module__ = "refine"

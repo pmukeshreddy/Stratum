@@ -41,7 +41,7 @@ def token_bound(value, model=None) -> int:
     return estimate(value, model)
 
 
-def python_instructions(config, *, child=False):
+def python_instructions(config, *, child=False, refine_skill=True):
     """Expose only usable capabilities; compact help remains in the live namespace."""
     text = """You are Buffalo, a code-using agent that solves tasks through persistent IPython: inspect,
 decompose, execute, observe, validate and iterate.
@@ -141,13 +141,27 @@ separated, not the size of the final answer. Optional requirement= describes the
 
 Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.
 """
-        if not child:
-            text += """\nTreat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.
+        if (
+            not child
+            and refine_skill
+            and not (
+                isinstance(refine_skill, dict) and refine_skill.get("disable_model_invocation")
+            )
+        ):
+            python_refine = refine_skill is True or refine_skill.get("import_name") == "refine"
+            if python_refine:
+                text += """\nTreat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.
 
 Installed Python skill modules (pre-imported): `refine`.
 Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.
 """
             guide = Path(__file__).with_name("builtin_skills") / "refine" / "SKILL.md"
+            description = "Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends."
+            if isinstance(refine_skill, dict):
+                from html import escape
+
+                guide = escape(refine_skill["path"])
+                description = escape(refine_skill.get("description", ""))
             text += f"""The following skills provide specialized instructions for specific tasks.
 Use ipython to inspect a skill's file when the task matches its description.
 Skills with a python_import are prepared in the persistent Python kernel when available and can be called directly by that import name.
@@ -156,9 +170,9 @@ When a skill file references a relative path, resolve it against the skill direc
 <available_skills>
   <skill>
     <name>refine</name>
-    <type>python</type>
-    <python_import>refine</python_import>
-    <description>Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends.</description>
+    <type>{"python" if python_refine else "markdown"}</type>
+    {"<python_import>refine</python_import>" if python_refine else ""}
+    <description>{description}</description>
     <location>{guide}</location>
   </skill>
 </available_skills>
@@ -178,8 +192,19 @@ After a failed check or a new finding, inspect the actual evidence and choose th
 another local check, a correction, more context, or independent investigation. Failure alone does not
 require delegation. Your next action follows from the task and observed trajectory.
 """
-    if child:
+    if (
+        child
+        or not refine_skill
+        or (
+            isinstance(refine_skill, dict)
+            and (
+                refine_skill.get("disable_model_invocation")
+                or refine_skill.get("import_name") != "refine"
+            )
+        )
+    ):
         text = text.replace("workspace, bash, compact and refine.", "workspace, bash and compact.")
+    if child:
         text += "You are a persistent child. Complete your delegated assignment within the original task contract; send useful partial findings to your parent when they can inform ongoing work.\n"
     return text
 
@@ -190,6 +215,7 @@ class Context:
         self.environment = environment
         self._export_cursors = {}
         self._harness_context_ready = set()
+        self._pending_harness_digest = {}
         self.unpersisted_refinement_messages = {}
 
         self.on_compact = None
@@ -268,24 +294,45 @@ class Context:
         return path
 
     def system_prompt(self, sid):
+        from .skills import refine_skill
+
         config = self.store.config(sid)
         session = self.store.session(sid)
         base = (
-            python_instructions(config, child=bool(session.parent_id))
+            python_instructions(
+                config,
+                child=bool(session.parent_id),
+                refine_skill=refine_skill(
+                    Path(session.workspace.path),
+                    config.skill_paths,
+                    child=bool(session.parent_id),
+                    enabled=config.enable_builtin_skills,
+                ),
+            )
             if config.control_plane == "python"
             else FOUNDATION
         )
         return base
 
     def harness_digest(self, sid):
+        from .skills import refine_skill
+
         session, config = self.store.session(sid), self.store.config(sid)
+        skill = refine_skill(
+            Path(session.workspace.path),
+            config.skill_paths,
+            child=bool(session.parent_id),
+            enabled=config.enable_builtin_skills,
+        )
         return format_harness_state(
             self.store.harness.merged(sid),
             include_ipython_examples=config.control_plane == "python",
             include_shell_examples="process" in config.permissions,
             include_refine_examples=config.control_plane == "python"
             and session.depth == 0
-            and config.tool_allowlist is None,
+            and config.tool_allowlist is None
+            and bool(skill)
+            and not skill.get("disable_model_invocation"),
         )
 
     def ensure_harness_digest(self, sid):
@@ -298,24 +345,49 @@ class Context:
             for message in block["messages"]:
                 if message.get("customType") == "harness_digest":
                     candidates.append((message.get("timestamp", 0), message["details"]["digest"]))
-        latest = max(candidates, key=lambda candidate: candidate[0])[1]
+        latest = max(enumerate(candidates), key=lambda item: (item[1][0], item[0]))[1][1]
         digest = self.harness_digest(sid)
         if latest != digest:
             message = harness_digest_message(digest)
-            event = self.store.event(sid, "harness_digest", {"digest": digest})
-            self.store.add_context(sid, event, [message])
-            if (
-                session.turns == 0
-                and not session.summary
-                and not any(
-                    m.get("role") == "assistant"
-                    for block in session.context
-                    for m in block["messages"]
-                )
+            if not session.summary and not any(
+                m.get("role") == "assistant" for block in session.context for m in block["messages"]
             ):
-                current = self.store.session(sid).context
-                self.store.update(sid, context=[current[-1], *current[:-1]])
+                # First input owns this message. Preparation/admission failures
+                # must not leave an orphan digest in durable conversation.
+                self._pending_harness_digest[sid] = message
+                return
+            try:
+                with self.store.transaction():
+                    event = self.store.event(sid, "harness_digest", {"digest": digest})
+                    self.store.add_context(sid, event, [message])
+            except Exception:
+                self.unpersisted_refinement_messages.setdefault(sid, []).append(message)
+        self._pending_harness_digest.pop(sid, None)
         self._harness_context_ready.add(sid)
+
+    def commit_harness_digest(self, sid):
+        """Called inside the first primary request's admission transaction."""
+        message = self._pending_harness_digest.get(sid)
+        if message is None or self.store.session(sid).summary:
+            return
+        event = self.store.event(sid, "harness_digest", message["details"])
+        self.store.add_context(sid, event, [message])
+        current = self.store.session(sid).context
+        self.store.update(sid, context=[current[-1], *current[:-1]])
+
+    def refresh_prepared_harness_digest(self, sid, messages):
+        """Read disk at commit, after asynchronous preparation/auth has settled."""
+        previous = self._pending_harness_digest.get(sid)
+        if previous is None or self.store.session(sid).summary:
+            return messages
+        current = harness_digest_message(self.harness_digest(sid))
+        self._pending_harness_digest[sid] = current
+        before, after = convert_to_llm([previous])[0], convert_to_llm([current])[0]
+        return [after if message == before else message for message in messages]
+
+    def harness_digest_committed(self, sid):
+        if self._pending_harness_digest.pop(sid, None) is not None:
+            self._harness_context_ready.add(sid)
 
     @staticmethod
     def compaction_message(session):
@@ -407,6 +479,8 @@ class Context:
             )
         # Prime's first committed prompt carries the cold digest before the user.
         first_digest = None
+        if sid in self._pending_harness_digest and not session.summary:
+            messages.extend(convert_to_llm([self._pending_harness_digest[sid]]))
         if not session.summary and session.context:
             first = session.context[0]["messages"]
             if len(first) == 1 and first[0].get("customType") == "harness_digest":
@@ -425,6 +499,7 @@ class Context:
                 "skills": [
                     {k: e[k] for k in ("name", "path", "description", "import_name") if k in e}
                     for e in discover(Path(session.workspace.path), config.skill_paths)[:20]
+                    if not e.get("disable_model_invocation")
                 ],
             }
             if menu["skills"]:

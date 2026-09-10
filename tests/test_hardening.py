@@ -344,6 +344,8 @@ async def test_remaining_budget_compaction_keeps_policy_and_durable_evidence(tmp
         assert all(runtime.store.event_by_id(e) for e in ids)
         assert runtime.store.config(session.id).limits.token_budget == 20000
         assert runtime.store.usage(session.id).input_tokens == 12010
+        assert str(provider.requests[0].messages).count("<harness_state>") == 1
+        assert session.id not in runtime.context._pending_harness_digest
         assert [s["function"]["name"] for s in provider.requests[0].tools] == ["ipython"]
     finally:
         await runtime.shutdown()

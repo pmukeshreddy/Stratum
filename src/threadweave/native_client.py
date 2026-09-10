@@ -76,6 +76,12 @@ def install_client(*, checkout=None):
             package = build / "codex-rs" / "model-provider"
             manifest = package / "Cargo.toml"
             text = manifest.read_text()
+            if "tokio-tungstenite =" not in text:
+                text = text.replace(
+                    "[dependencies]\n",
+                    "[dependencies]\ntokio-tungstenite = { workspace = true }\n",
+                    1,
+                )
             if 'name = "threadweave-inference"' not in text:
                 text = text.replace(
                     "[dependencies]\n",
@@ -83,7 +89,7 @@ def install_client(*, checkout=None):
                     1,
                 )
                 text += '\n[[bin]]\nname = "threadweave-inference"\npath = "src/bin/threadweave_inference.rs"\n'
-                manifest.write_text(text)
+            manifest.write_text(text)
             entry = package / "src" / "bin" / "threadweave_inference.rs"
             entry.parent.mkdir(parents=True, exist_ok=True)
             entry.write_text(source())

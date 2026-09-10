@@ -20,15 +20,13 @@ import sys
 import time
 import traceback
 import uuid
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
 WIRE = sys.stdout
 CURRENT_REQUEST_ID = None
 SOURCES = {
-    "manyih-coding": "https://github.com/JHU-CLSP/ManyIH",
-    "manyih-if": "https://github.com/JHU-CLSP/ManyIH",
     "longbench-v2": "https://github.com/THUDM/LongBench",
     "arc-agi-3": "https://github.com/arcprize/arc-agi",
     "factorio": "https://github.com/JackHopkins/factorio-learning-environment",
@@ -141,23 +139,6 @@ class FixedArcGame:
         return self.observe()
 
 
-class Judge:
-    def generate(self, query, max_tokens=40960, temperature=0.0):
-        emit(
-            {
-                "judge_request": {
-                    "prompt": query,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                }
-            }
-        )
-        response = json.loads(sys.stdin.readline())
-        if "error" in response:
-            raise RuntimeError(response["error"])
-        return response["text"]
-
-
 class Official:
     def prepare(self, benchmark, setup, output):
         self.benchmark, self.setup = benchmark, setup
@@ -192,35 +173,7 @@ class Official:
             "starting_state": None,
         }
         self.rows = {}
-        if benchmark.startswith("manyih"):
-            subset = "coding" if benchmark == "manyih-coding" else "instruction_following"
-            path = self.source / "manyih" / "data" / f"{subset}.json"
-            raw = json.loads(path.read_text())
-            self.data_config = raw.get("config", {}) if isinstance(raw, dict) else {}
-            rows = raw["data"] if isinstance(raw, dict) else raw
-            if subset == "coding":
-                from manyih.coding import evaluate, evaluator
-
-                self.coding, self.coding_evaluator = evaluate, evaluator
-            else:
-                from manyih.instruction_following import evaluator, model_adapter
-
-                self.if_evaluator = evaluator
-                # Only transport changes: the official checker, hierarchy and metrics are untouched.
-                model_adapter.create_model = lambda *args, **kwargs: Judge()
-            self.provenance["dataset_environment_version"] = {"commit": commit, "sha256": sha(path)}
-            counts = Counter(str(row["id"]) for row in rows)
-            identities = {
-                str(row["id"]) if counts[str(row["id"])] == 1 else f"{row['id']}@{i}": {
-                    "official_id": row["id"],
-                    "row_index": i,
-                }
-                for i, row in enumerate(rows)
-            }
-            self.rows = {key: rows[identity["row_index"]] for key, identity in identities.items()}
-            self.provenance["task_identity_map"] = identities
-            self.provenance["data_config"] = self.data_config
-        elif benchmark == "longbench-v2":
+        if benchmark == "longbench-v2":
             if not setup["dataset"] or not Path(setup["dataset"]).is_file():
                 raise ValueError(
                     "Missing official LongBench v2 dataset JSON; configure dataset, dataset_revision and dataset_sha256"
@@ -356,21 +309,6 @@ class Official:
 
     def task(self, task_id):
         row = self.rows[task_id]
-        if self.benchmark == "manyih-coding":
-            formatted = self.coding_evaluator.format_datapoint_for_llm(
-                row,
-                include_system_prompt=True,
-                hierarchy_format=self.data_config.get("hierarchy_format", "scalar"),
-                annotation_style=self.data_config.get("annotation_style", "inline"),
-            )
-            return {
-                "messages": [
-                    {"role": "system", "content": formatted["system_prompt"]},
-                    {"role": "user", "content": formatted["user_prompt"]},
-                ]
-            }
-        if self.benchmark == "manyih-if":
-            return {"messages": row["input"]}
         if self.benchmark == "longbench-v2":
             prompt = self.template
             for placeholder, field in {
@@ -382,56 +320,8 @@ class Official:
             return {"messages": [{"role": "user", "content": prompt}]}
         raise ValueError("Interactive tasks require start_task")
 
-    def grade(self, task_id, response, previous_grade=None):
+    def grade(self, task_id, response):
         row = self.rows[task_id]
-        if self.benchmark == "manyih-coding":
-            grade = self.coding.judge_response(
-                response, row["test_code"], row["metadata"]["expected_styles"], timeout=3.0
-            )
-            return {"id": row["id"], "task_id": row["task_id"], "evaluation": grade}
-        if self.benchmark == "manyih-if":
-            entry = json.loads(json.dumps(row))
-            entry["output"] = {"content": response}
-            if previous_grade is not None:
-                if previous_grade.get("output") != entry["output"]:
-                    raise ValueError("Cannot change an agent answer when retrying judge transport")
-                previous = previous_grade.get("constraints", [])
-                if len(previous) != len(entry["constraints"]):
-                    raise ValueError("Previous grade does not match the official constraints")
-                for original, prior in zip(entry["constraints"], previous, strict=True):
-                    if any(prior.get(k) != v for k, v in original.items()):
-                        raise ValueError("Previous grade changed an official constraint")
-                entry["constraints"] = json.loads(json.dumps(previous))
-                for constraint in entry["constraints"]:
-                    if any(
-                        d.get("error") and d["error"] != "Empty response"
-                        for d in constraint.get("eval_details", [])
-                    ):
-                        for key in ("score", "eval_details", "llm_output"):
-                            constraint.pop(key, None)
-                # The upstream evaluator skips the already-scored constraints itself.
-            graded = self.if_evaluator._evaluate_single(
-                (entry, "buffalo-judge-transport", None, None)
-            )
-            write(
-                self.output
-                / f"if-grade-{list(self.rows).index(task_id)}-{self.profile if hasattr(self, 'profile') else 'grading'}.json",
-                graded,
-            )
-            errors = [
-                d["error"]
-                for c in graded["constraints"]
-                for d in c.get("eval_details", [])
-                # Upstream deliberately emits null for an empty agent answer (including
-                # a task that exhausts its budget). Preserve that official denominator
-                # behavior and null count; it is not a missing evaluator dependency.
-                if d.get("error") and d["error"] != "Empty response"
-            ]
-            if errors:
-                raise RuntimeError("Official ManyIH IF checker failed: " + "; ".join(errors))
-            if any("score" not in c for c in graded["constraints"]):
-                raise RuntimeError("Official ManyIH IF evaluator returned incomplete constraints")
-            return graded
         pred = self.extract_answer(response.strip())
         return {
             **{key: value for key, value in row.items() if key != "context"},
@@ -441,42 +331,6 @@ class Official:
         }
 
     def summarize(self, grades, profile):
-        if self.benchmark == "manyih-coding":
-            stats = {
-                "total": len(grades),
-                **{
-                    key: sum(bool(r["evaluation"][key]) for r in grades)
-                    for key in ("test_passed", "style_passed", "overall_passed")
-                },
-            }
-            path = self.output / f"coding-{profile}.json"
-            write(path, {"results": grades})
-            analysis = self.coding_evaluator.analyze_results(str(path), save_to_file=True)
-            raw = json.loads(path.read_text())
-            return {
-                "primary_score": analysis["summary"]["overall_passed_pct"],
-                "metric": "overall_passed_pct",
-                "tasks_passed": stats["overall_passed"],
-                "raw": raw,
-            }
-        if self.benchmark == "manyih-if":
-            accuracy = self.if_evaluator.compute_accuracy(grades)
-            categories = defaultdict(list)
-            for row in grades:
-                categories[row["agent_name"]].append(row)
-            return {
-                "primary_score": accuracy["ISR"]["accuracy"],
-                "metric": "ISR",
-                "csr": accuracy["CSR"]["accuracy"],
-                "isr_counts": accuracy["ISR"],
-                "csr_counts": accuracy["CSR"],
-                "null_constraints": accuracy["null_constraints"],
-                "categories": {
-                    key: self.if_evaluator.compute_accuracy(value)
-                    for key, value in categories.items()
-                },
-                "raw": {"accuracy": accuracy, "results": grades},
-            }
         directory = self.output / f"longbench-score-{profile}"
         (directory / "results").mkdir(parents=True)
         write(directory / "results/predictions.json", grades)

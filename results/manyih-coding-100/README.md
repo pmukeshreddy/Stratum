@@ -1,1 +1,0 @@
-Measured ManyIH Coding results. See [the report](../../docs/manyih-coding-100-results.md). Raw artifacts are retained locally at /Users/mukeshreddypochamreddy/Downloads/buffalo-manyih-coding-100-results. Per-task artifact paths here are relative to that archive. Exact totals are null where interrupted transport usage was not reported; known_* fields are lower bounds.

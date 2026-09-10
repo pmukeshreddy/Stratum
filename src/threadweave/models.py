@@ -302,6 +302,7 @@ class RunConfig(Record):
     schema_version: Literal[1] = 1
     control_plane: Literal["python", "direct"] = "python"
     skill_paths: list[str] = Field(default_factory=list)
+    enable_builtin_skills: bool = True
     mcp_servers: dict[str, McpServerConfig] = Field(default_factory=dict)
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     context: ContextPolicy = Field(default_factory=ContextPolicy)

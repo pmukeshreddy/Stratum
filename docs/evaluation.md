@@ -16,9 +16,8 @@ harness is external; no implementation of that harness is bundled here.
 
 ## Run Buffalo
 
-The current evaluation CLI runs **ARC-AGI-3 only**. ManyIH Coding, ManyIH
-Instruction Following, LongBench v2, and Factorio are paused. Their official
-integration code remains available for future work; the current CLI cannot run them.
+The current evaluation CLI runs **ARC-AGI-3 only**. LongBench v2 and Factorio
+integrations remain paused. No replacement dataset is configured yet.
 
 Install with `uv sync --extra dev --locked`. Authenticate the normal subscription
 provider as described in [subscription transport](subscription.md). Copy

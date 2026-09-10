@@ -9,7 +9,7 @@ from threadweave.coding_config import coding_options
 from threadweave.host_api import Request, dispatch
 from threadweave.models import Action, HarnessError, ModelResponse, Usage, new_id
 from threadweave.runtime import Runtime
-from threadweave.storage import Store, encode
+from threadweave.storage import encode
 from threadweave.tools import ToolContext
 
 from .conftest import response
@@ -626,45 +626,6 @@ async def test_custom_allowed_tool_executes_in_child_and_disallowed_tool_stays_h
         assert not runtime.store.events(child.id, kind="failure")
     finally:
         await runtime.shutdown()
-
-
-async def test_evaluation_judge_uses_durable_runtime_retry_path(tmp_path, config, monkeypatch):
-    from threadweave.evals import harness
-
-    class Judge:
-        def __init__(self):
-            self.requests = []
-
-        async def invoke(self, request, emit):
-            self.requests.append(request)
-            assert request.messages == [{"role": "user", "content": "Official judge prompt"}]
-            assert request.tools == []
-            if len(self.requests) == 1:
-                raise HarnessError("provider", "transient", "retry", retryable=True)
-            return ModelResponse(text="judgment", usage=Usage(input_tokens=4, output_tokens=2))
-
-    judge = Judge()
-    monkeypatch.setattr(harness, "default_providers", lambda: {"mock": judge})
-    usages = []
-    result = await harness.invoke_judge(
-        config.provider,
-        {"prompt": "Official judge prompt", "max_tokens": 128, "temperature": 0},
-        tmp_path,
-        usages,
-    )
-    assert result == "judgment"
-    assert len(judge.requests) == 2
-    assert judge.requests[0].request_id == judge.requests[1].request_id
-    history = Store(next((tmp_path / "judge-state").iterdir()))
-    try:
-        assert history.request_graph(judge.requests[0].session_id) == {"requests": [], "edges": []}
-        calls = history.request_history(judge.requests[0].session_id, kind="auxiliary")
-        assert len(calls) == 1
-        assert len(calls[0]["attempts"]) == 2
-        assert sum(u.model_calls for u in usages) == 2
-        assert sum(u.retries for u in usages) == 1
-    finally:
-        history.close()
 
 
 async def test_child_tool_snapshot_does_not_expand_when_another_session_loads_tools(

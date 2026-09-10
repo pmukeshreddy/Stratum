@@ -74,9 +74,9 @@ async def test_abort_and_branch_change_cancel_owned_work_without_late_apply(
     release.set()
     await asyncio.gather(task, *([invalidation] if invalidation else []), return_exceptions=True)
     assert not rt.store.harness.history(sid)
-    assert not rt.store.events(sid, kind="refine_failed")
+    assert len(rt.store.events(sid, kind="refine_failed")) == (1 if path == "direct" else 0)
     assert state.pending_request is None
-    assert state.last_review_at == 0
+    assert (state.last_review_at > 0) if path == "direct" else state.last_review_at == 0
     rt.store.update(sid, pending_turn=None)
     if branch_change:
         assert state.background is None and state.turns_since_review == 0

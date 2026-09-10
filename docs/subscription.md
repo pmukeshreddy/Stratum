@@ -30,7 +30,14 @@ Parallel function calls become Threadweave actions. Inference processes can run
 concurrently; a local lock coordinates refresh without serializing inference.
 
 Codex's auth manager handles proactive refresh, same-account reload and 401 refresh
-recovery. Rejected refresh produces `AUTH_REQUIRED`, with no API fallback. Logout
+recovery for primary inference. Refinement's one-shot requests use Prime's
+WebSocket-first transport, falling back to SSE only before streaming starts and
+never on protocol/API errors. They bypass the SDK response parser and its 401
+recovery loop, retaining original provider error codes, retry delays and terminal
+statuses for Prime's shared completion retry policy. They have no session cache
+key, reasoning option or extra transport retries. Initial credential resolution
+still uses the official shared Codex store; missing credentials fail immediately.
+Rejected refresh produces `AUTH_REQUIRED`, with no API fallback. Logout
 removes/revokes the shared Codex credentials through the official account protocol.
 Login/logout must not be used as a benchmark test against a human's active account.
 

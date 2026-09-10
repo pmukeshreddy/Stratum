@@ -11,11 +11,14 @@ import asyncio
 import contextlib
 import json
 import os
+import platform
 import signal
+import sys
 
 from .codex_auth import CodexControl
 from .models import Action, HarnessError, ModelResponse, Usage
 from .native_client import CODEX_REVISION, client_path
+from .refinement_transport import native_events
 
 
 def responses_input(messages, *, provider=None):
@@ -184,6 +187,15 @@ class SubscriptionProvider:
             "body": body,
             "request_id": request.request_id,
             "refinement": request.metadata.get("purpose") in {"refinement", "refinement_review"},
+            "user_agent": f"pi ({sys.platform} {platform.release()}; "
+            + {
+                "x86_64": "x64",
+                "AMD64": "x64",
+                "aarch64": "arm64",
+                "i386": "ia32",
+                "i686": "ia32",
+            }.get(platform.machine(), platform.machine())
+            + ")",
         }
         try:
             async with asyncio.timeout(config.timeout_seconds):
@@ -233,8 +245,7 @@ class SubscriptionProvider:
         }
         allowed = {tool["function"]["name"] for tool in request.tools}
         try:
-            async for line in lines:
-                event = json.loads(line)
+            async for event in native_events(lines):
                 kind = event.get("type")
                 if kind in ("text_delta", "tool_delta", "reasoning_summary"):
                     delta = event.get("text", event.get("delta", ""))
@@ -277,6 +288,12 @@ class SubscriptionProvider:
                         if code == "AUTH_REQUIRED"
                         else f"Subscription inference failed: {code}"
                     )
+                    is_refinement = request.metadata.get("purpose") in {
+                        "refinement",
+                        "refinement_review",
+                    }
+                    if is_refinement and isinstance(event.get("error_message"), str):
+                        message = event["error_message"]
                     error = HarnessError(
                         "provider",
                         code,
@@ -284,18 +301,23 @@ class SubscriptionProvider:
                         retryable=bool(event.get("retryable")),
                         uncertain=True,
                     )
-                    if request.metadata.get("purpose") in {"refinement", "refinement_review"}:
+                    if is_refinement:
                         from .refinement_retry import classify_failure, retry_after_ms
 
                         error.provider_failure = {
                             "kind": classify_failure(
-                                "unauthorized" if code == "AUTH_REQUIRED" else code,
+                                event.get(
+                                    "provider_error_type",
+                                    "unauthorized" if code == "AUTH_REQUIRED" else code,
+                                ),
                                 event.get("status"),
                             ),
                             "retryAfterMs": event.get("retryAfterMs")
                             if event.get("retryAfterMs") is not None
                             else retry_after_ms(event.get("retry_headers", {})),
                         }
+                        if code == "AUTH_REQUIRED" and event.get("status") is None:
+                            error.provider_failure["permanent"] = True
                     raise error
                 elif kind == "completed":
                     raw = event.get("usage") or {}

@@ -7,7 +7,9 @@ import json
 import math
 import os
 import re
+import subprocess
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,9 +33,11 @@ def empty_harness_state():
 def atomic_json(path, value, *, python=False):
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not python:
-        value = json.loads(js_json(value))
-    data = json.dumps(value, ensure_ascii=False, indent=2) + ("" if python else "\n")
+    data = (
+        json.dumps(value, ensure_ascii=False, indent=2)
+        if python
+        else js_json(value, indent=2) + "\n"
+    )
     if not python:
         data = data.encode("utf-8", errors="backslashreplace").decode("utf-8")
     temporary = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
@@ -167,11 +171,13 @@ def merge_harness_states(global_state, local_state=None):
 
 
 def infer_scope(result, default="local"):
-    scopes = {
-        (e.get("after") or e.get("before") or {}).get("scope")
-        for e in result.get("appliedEdits", [])
-    }
-    scopes.discard(None)
+    scopes = set()
+    for edit in result.get("appliedEdits", []):
+        scope = (edit.get("after") or {}).get("scope")
+        if scope is None:
+            scope = (edit.get("before") or {}).get("scope")
+        if scope:
+            scopes.add(scope)
     return result.get("scope") or (next(iter(scopes)) if len(scopes) == 1 else default)
 
 
@@ -200,7 +206,7 @@ def load_refinement_history(directory, scope="global"):
 def append_refinement_history(directory, result):
     path = Path(directory) / "refinements.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n"
+    data = js_json(result) + "\n"
     with path.open("a", encoding="utf-8") as stream:
         stream.write(data)
         stream.flush()
@@ -219,11 +225,6 @@ def merge_refinement_history(global_history, local_history):
     return list(by_id.values())
 
 
-def compact_text(value, limit=180):
-    text = re.sub(r"\s+", " ", str(value)).strip()
-    return text if js_length(text) <= limit else js_slice(text, 0, max(0, limit - 3)) + "..."
-
-
 def js_length(text):
     return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
 
@@ -236,28 +237,33 @@ def js_slice(text, start=0, end=None):
     return units[2 * start : 2 * max(start, end)].decode("utf-16-le", errors="surrogatepass")
 
 
-def js_json(value):
-    """JSON.stringify ordering and numeric normalization for touched-entry equality."""
-
+def _json_input(value):
     def normalize(item):
         if isinstance(item, float):
-            return None if not math.isfinite(item) else int(item) if item.is_integer() else item
+            return None if not math.isfinite(item) else item
         if isinstance(item, list):
             return [normalize(v) for v in item]
         if isinstance(item, dict):
-            indexed = sorted(
-                (
-                    key
-                    for key in item
-                    if str(key).isdigit() and str(int(key)) == key and int(key) < 4294967295
-                ),
-                key=int,
-            )
-            keys = [*indexed, *(key for key in item if key not in indexed)]
-            return {key: normalize(item[key]) for key in keys}
+            return {key: normalize(val) for key, val in item.items()}
         return item
 
-    return json.dumps(normalize(value), ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(normalize(value), ensure_ascii=True, separators=(",", ":"))
+
+
+@lru_cache(maxsize=256)
+def _javascript_harness(operation, payload, indent=None):
+    """Use Prime's runtime semantics for its public JSON format; no approximate fallback."""
+    return subprocess.run(
+        ["node", str(Path(__file__).with_name("harness_format.mjs")), operation, str(indent or 0)],
+        input=payload,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+def js_json(value, *, indent=None):
+    return _javascript_harness("stringify", _json_input(value), indent)
 
 
 def format_harness_state(
@@ -270,115 +276,27 @@ def format_harness_state(
     include_shell_examples=False,
     include_refine_examples=None,
 ):
-    if include_refine_examples is None:
-        include_refine_examples = include_ipython_examples
-    lines = [
-        "# Continual Harness State",
-        "",
-        "Local continual harness entries belong to this Buffalo session. Global continual harness entries persist across Buffalo sessions.",
-        "The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
-        "Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
-        "Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
-        "",
-    ]
-    call = (
-        "call `await refine.run()`" if include_refine_examples else "refine the continual harness"
-    )
-    keep = (
-        "`await refine.run()` continual harness edits"
-        if include_refine_examples
-        else "continual harness edits"
-    )
-    lines.extend(
-        [
-            f"When to {call}: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep {keep} small and evidence-backed.",
-            "",
-            "Call contract: read each installed Python skill's SKILL.md and call its documented module function in the Python REPL; do not assume a `.run` entrypoint. Use `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a continual harness subagent spec by composing a concise task prompt and calling `handle = await rlm('sub-task')`; admission returns immediately with `rlm_child_id`, `name`, `session_dir`, and `model`, never the child's answer. Results arrive only through explicit `agent_message` replies or files; children reply with `await agent_message.send(message, receiver_role='parent')`. Use `await rlm.list_subagents()` to recover direct child handles and `await agent_message.send(..., receiver_role='child', receiver_name=handle.name)` for follow-ups. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries."
-            if include_ipython_examples
-            else "Call contract: use installed skills as shell commands when available (for example `<skill_import> ...`). Continual harness entries are routing/context hints only in sessions without the Python REPL; do not use Python `await`, `asyncio`, or `rlm` examples unless the prompt also documents a Python kernel."
-            if include_shell_examples
-            else "Call contract: continual harness entries are routing/context hints only in sessions without the Python REPL or shell access; do not use Python `await`, `asyncio`, `rlm`, or shell skill commands unless the prompt also documents those interfaces.",
-            "",
-        ]
-    )
-    for kind in KINDS:
-        entries = sorted(
-            state["entries"][kind].values(),
-            key=lambda e: tuple(str(e.get(k, "")) for k in ("path", "title", "id")),
-        )
-        lines.append(
-            f"{kind}: {len(entries)} (invoke a spec by turning it into a concise task prompt and spawning with `await rlm('<task>')`; admission returns a child handle, never the answer)"
-            if kind == "subagent" and entries and include_ipython_examples
-            else f"{kind}: {len(entries)}"
-        )
-        for entry in entries[:entry_limit]:
-            extra = ""
-            if kind == "skill":
-                for field, label in (("reference", "ref"), ("arguments", "args")):
-                    if entry.get(field):
-                        extra += f" {label}=" + compact_text(js_json(entry[field]), content_limit)
-            lines.append(
-                f"- [{entry.get('scope', 'global')}:{entry['id']}] {entry.get('title', '')} ({entry.get('path', 'general')}, v{entry.get('version', 1)}){extra}: {compact_text(entry.get('content', ''), content_limit)}"
-            )
-        if len(entries) > entry_limit:
-            lines.append(f"- +{len(entries) - entry_limit} more {kind} entries")
-        lines.append("")
-    if not any(state["entries"].values()):
-        lines.extend(["No saved harness entries yet.", ""])
-    refinements = state["refinements"]
-    lines.append(f"recent refinements: {len(refinements)}")
-    for event in refinements[-refinement_limit:] if refinement_limit else []:
-        changes = ", ".join(event["changes"]) or "no applied edits"
-        outcome = (
-            f"; outcome: {compact_text(event['outcome'], content_limit)}"
-            if event.get("outcome")
-            else ""
-        )
-        lines.append(
-            f"- [{event['id']}] {compact_text(event['trigger'], content_limit)}: {changes}{outcome}"
-        )
-    if len(refinements) > refinement_limit:
-        lines.append(f"- +{len(refinements) - refinement_limit} older refinement events")
-    return "\n".join(lines).strip()
+    options = {
+        "maxEntriesPerKind": entry_limit,
+        "maxContentLength": content_limit,
+        "maxRefinements": refinement_limit,
+        "includeIpythonExamples": include_ipython_examples,
+        "includeShellExamples": include_shell_examples,
+        "includeRefineExamples": include_refine_examples,
+    }
+    return _javascript_harness("format", _json_input({"state": state, "options": options}))
 
 
 def overview_for_refinement(state):
-    """Prime's bounded entry overview: up to 40 entries per kind, 240 content characters."""
-    lines = []
-    for kind in KINDS:
-        entries = list(state["entries"][kind].values())
-        lines.append(f"{kind}: {len(entries)}")
-        for entry in entries[:40]:
-            extra = ""
-            if kind == "skill":
-                for field, label in (("reference", "ref"), ("arguments", "args")):
-                    if entry.get(field):
-                        extra += f" {label}=" + js_slice(js_json(entry[field]), 0, 240)
-            content = js_slice(re.sub(r"\s+", " ", entry["content"]), 0, 240)
-            lines.append(
-                f"- [{entry['scope']}:{entry['id']}] {entry['title']} "
-                f"({entry['path']}, v{entry['version']}){extra}: {content}"
-            )
-        if len(entries) > 40:
-            lines.append(f"- +{len(entries) - 40} more {kind} entries")
-    return "\n".join(lines)
+    return _javascript_harness("overview", _json_input(state))
 
 
 def history_for_refinement(history):
-    if not history:
-        return "No prior refinement history."
-    lines = []
-    for item in history[-20:]:
-        edits = ", ".join(
-            f"{'applied' if edit['applied'] else 'failed'} {edit['action']} {edit['kind']}:{edit['id']}"
-            for edit in item["appliedEdits"]
-        )
-        rollback = f" rollbackOf={item['rollbackOf']}" if item.get("rollbackOf") else ""
-        lines.append(
-            f"[{item['id']}]{rollback} {item['summary']}\n{edits}\n"
-            f"Expected outcome: {item['expectedOutcome']}"
-        )
-    return "\n\n".join(lines)
+    return _javascript_harness("history", _json_input(history))
+
+
+def format_refinement_notice(result):
+    return _javascript_harness("notice", _json_input(result))
 
 
 def normalize_proposal(value):
@@ -644,6 +562,9 @@ class HarnessStore:
                 if action == "update" and before is None:
                     raise ValueError(f"{kind} entry {identifier!r} does not exist")
                 fields = {k: v for k, v in fields.items() if v is not None}
+                for key in ("reference", "arguments", "metadata"):
+                    if key in fields:
+                        fields[key] = dict(fields[key] if before else fields[key] or {})
                 result = updated_entry(
                     kind,
                     identifier,
@@ -680,8 +601,9 @@ class HarnessStore:
                 if kind == "skill":
                     for field, label in (("reference", "ref"), ("arguments", "args")):
                         if entry.get(field):
-                            extra += f" {label}=" + compact_text(
-                                json.dumps(entry[field], ensure_ascii=False, sort_keys=True), 120
+                            encoded = json.dumps(entry[field], ensure_ascii=False, sort_keys=True)
+                            extra += f" {label}=" + (
+                                encoded[:117] + "..." if len(encoded) > 120 else encoded
                             )
                 summary = entry["content"].strip().replace("\n", " ")
                 if len(summary) > 120:

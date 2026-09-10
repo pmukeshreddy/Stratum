@@ -45,6 +45,7 @@ def discover(workspace: Path, configured=()):
                     "sha256": hashlib.sha256(text.encode()).hexdigest(),
                     "kind": "markdown",
                     "required_permissions": permissions,
+                    "disable_model_invocation": front.get("disable-model-invocation") is True,
                 }
                 module = name.replace("-", "_")
                 project, package = (
@@ -77,6 +78,29 @@ def discover(workspace: Path, configured=()):
                     },
                 )
     return list(found.values())
+
+
+def refine_skill(workspace, configured=(), *, child=False, enabled=True):
+    """User skills win by name; the bundled root-only skill is the last source."""
+    found = next(
+        (entry for entry in discover(workspace, configured) if entry["name"] == "refine"), None
+    )
+    if found is not None:
+        return found
+    if child or not enabled:
+        return None
+    path = Path(__file__).with_name("builtin_skills") / "refine" / "SKILL.md"
+    return (
+        {
+            "name": "refine",
+            "kind": "python",
+            "import_name": "refine",
+            "path": str(path),
+            "description": "Trigger continual harness refinement from the Python REPL. Use when you notice a repeated failure, reusable tactic, delegation role, or behavior policy that should be persisted as a harness entry. Returns immediately; refinement runs when the current turn ends.",
+        }
+        if path.is_file()
+        else None
+    )
 
 
 class CallableSkill(types.ModuleType):

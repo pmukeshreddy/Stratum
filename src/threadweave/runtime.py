@@ -491,11 +491,9 @@ class Runtime(RefinementServices):
                 delivery=delivery,
                 causal_request_id=causal_request_id,
             )
-            if sender_id is None and (command := refine_command(body)):
-                self.queue_refine_command(recipient_id, command)
-                # Control input is consumed by the refinement queue, not by an
-                # ordinary agent turn (and is not evidence of reusable learning).
-                self.store.db.execute("UPDATE messages SET received_at=? WHERE id=?", (now(), mid))
+            if sender_id is None and refine_command(body):
+                self.start_queued_refine_command(recipient_id)
+                self._wake.set()
                 return mid
             self._continue_completed_child(recipient_id)
             recipient = self.store.session(recipient_id)
@@ -568,7 +566,22 @@ class Runtime(RefinementServices):
                 }
             )
 
-        return self.store.receive(sid, render, limit=20, include_followups=include_followups)
+        queued = self.store.messages(
+            sid, pending=True, limit=20, include_followups=include_followups
+        )
+        limit = next(
+            (
+                i
+                for i, message in enumerate(queued)
+                if message["sender_id"] is None and refine_command(message["body"])
+            ),
+            len(queued),
+        )
+        return (
+            self.store.receive(sid, render, limit=limit, include_followups=include_followups)
+            if limit
+            else []
+        )
 
     def interact(self, sid, body):
         """Atomic human input + continuation; no client-side input/resume race."""
@@ -974,6 +987,9 @@ class Runtime(RefinementServices):
                     root_counts[root] = root_counts.get(root, 0) + 1
                 sessions = sorted(self.store.sessions(), key=lambda s: (s.updated_at, s.created_at))
                 for session in sessions:
+                    self.start_queued_refine_command(session.id)
+                    if self.refinement_state(session.id).command_task:
+                        continue
                     if len(self.tasks) >= self.concurrency:
                         break
                     if (
@@ -1178,6 +1194,9 @@ class Runtime(RefinementServices):
             verifier_ok = verification is not None and verification.passed
             if verification_error and config.task.require_verifier:
                 explicit_ok = False
+            # Prime services refinement before handing queued steering/follow-up
+            # input to the next root turn. Undelivered input is not its trajectory.
+            await self.refinement_checkpoint(sid, completed_turn=True)
             delivered = self.receive(
                 sid, include_followups=explicit_ok or verifier_ok or not response.actions
             )
@@ -1203,7 +1222,6 @@ class Runtime(RefinementServices):
                     )
                 explicit_ok = verifier_ok = False
                 self.store.update(sid, runnable=True, wake_at=None)
-            await self.refinement_checkpoint(sid, completed_turn=True)
             if (explicit_ok or verifier_ok) and not self._active_descendants(sid):
                 late_delivery = self.receive(sid)
                 if late_delivery:
@@ -1360,7 +1378,6 @@ class Runtime(RefinementServices):
     async def _invoke(self, sid):
         if sid not in self._admitted_turns:
             await self.wait_refinement_barrier(sid)
-        self.context.ensure_harness_digest(sid)
         config = self.store.config(sid)
         if config.control_plane == "python" and config.features.persistent_repl:
             kernel = self._kernel(sid)
@@ -1385,6 +1402,7 @@ class Runtime(RefinementServices):
         # Drain their queued evidence at the last safe boundary before assembling
         # this request, rather than needlessly withholding it until after the reply.
         self.receive(sid, include_followups=False)
+        self.context.ensure_harness_digest(sid)
         schemas = self.tools.schemas(config)
         messages, size = self.context.assemble(sid, schemas, proactive=compacted is not False)
         if await self._sync_l2_compaction(sid):
@@ -1547,7 +1565,7 @@ class Runtime(RefinementServices):
                 },
             )
         # One logical identity per body; transport retries below reuse it.
-        request_artifact = self.artifacts.put(sid, request.public_dump())
+        request_artifact = None
         registered = False
         for attempt in range(attempts):
             while True:
@@ -1557,8 +1575,22 @@ class Runtime(RefinementServices):
                             sid, resource="model_calls", input_bound=size, provider=provider
                         )
                         if not registered:
+                            if persist_turn:
+                                messages = self.context.refresh_prepared_harness_digest(
+                                    sid, request.messages
+                                )
+                                size, _ = self.context.request_estimate(
+                                    sid, messages, request.tools, provider
+                                )
+                                request = request.model_copy(
+                                    update={"messages": messages, "input_token_bound": size}
+                                )
+                                self._check_limits(
+                                    sid, resource="model_calls", input_bound=size, provider=provider
+                                )
+                                self.context.commit_harness_digest(sid)
+                            request_artifact = self.artifacts.put(sid, request.public_dump())
                             self.store.begin_request(request, request_artifact)
-                            registered = True
                         eid = self.store.event(
                             sid,
                             "model_invocation_started",
@@ -1597,13 +1629,16 @@ class Runtime(RefinementServices):
                             (eid, sid, size, provider.max_output_tokens, cost),
                         )
                         self.store.charge(sid, Usage(model_calls=1), parent=eid)
+                    registered = True
+                    if persist_turn:
+                        self.context.harness_digest_committed(sid)
                     break
                 except BudgetBusy:
                     await asyncio.sleep(0.05)
             buffer = []
             last_flush = 0.0
 
-            async def emit(delta, buffer=buffer, eid=eid):
+            async def emit(delta, buffer=buffer, eid=eid, request=request):
                 nonlocal last_flush
                 buffer.append(delta)
                 if sum(map(len, buffer)) >= 512 or now() - last_flush >= 0.1:
@@ -1983,6 +2018,7 @@ class Runtime(RefinementServices):
                         if set(e.get("required_permissions", []))
                         <= set(self.store.config(sid).permissions)
                     ],
+                    "enable_builtin_skills": self.store.config(sid).enable_builtin_skills,
                 },
             )
         return self.kernels[sid]

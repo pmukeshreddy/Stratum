@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
-from ..models import ProviderConfig, Record, RunConfig, Usage
+from ..models import Record, RunConfig, Usage
 
 
 class BenchmarkSetup(Record):
@@ -24,7 +24,6 @@ class BenchmarkSetup(Record):
 
 class EvaluationConfig(Record):
     run: RunConfig
-    judge: ProviderConfig | None = None
     benchmarks: dict[str, BenchmarkSetup] = Field(default_factory=dict)
 
 

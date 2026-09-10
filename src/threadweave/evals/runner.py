@@ -46,13 +46,13 @@ def load(path):
             run=RunConfig()
         ), "Missing evaluation manifest: pass --config (see configs/evaluation.example.json)"
     raw = json.loads(path.read_text())
-    for provider in [raw.get("run", {}).get("provider", {}), raw.get("judge") or {}]:
-        model = provider.get("model", "")
-        if model.startswith("${") and model.endswith("}"):
-            name = model[2:-1]
-            if not os.environ.get(name):
-                raise NotRun(f"Set {name} to the model ID for this evaluation")
-            provider["model"] = os.environ[name]
+    provider = raw.get("run", {}).get("provider", {})
+    model = provider.get("model", "")
+    if model.startswith("${") and model.endswith("}"):
+        name = model[2:-1]
+        if not os.environ.get(name):
+            raise NotRun(f"Set {name} to the model ID for this evaluation")
+        provider["model"] = os.environ[name]
     config = EvaluationConfig.model_validate(raw)
     unknown = config.benchmarks.keys() - BENCHMARKS.keys()
     if unknown:
@@ -86,19 +86,13 @@ async def resolve(config):
     if not config.run.features.persistent_repl:
         raise NotRun("Buffalo evaluation requires features.persistent_repl=true")
     config.run = await resolved_config(config.run)
-    providers = [config.run.provider]
-    if config.judge:
-        temporary = config.run.model_copy(deep=True)
-        temporary.provider = config.judge
-        config.judge = (await resolved_config(temporary)).provider
-        providers.append(config.judge)
-    for provider in providers:
-        if provider.name not in default_providers():
-            raise NotRun(f"Unsupported model provider: {provider.name}")
-        if not provider.model:
-            raise NotRun("Missing provider.model")
-        if provider.api_key_env and not os.environ.get(provider.api_key_env):
-            raise NotRun(f"Missing API credentials: {provider.api_key_env} is unset")
+    provider = config.run.provider
+    if provider.name not in default_providers():
+        raise NotRun(f"Unsupported model provider: {provider.name}")
+    if not provider.model:
+        raise NotRun("Missing provider.model")
+    if provider.api_key_env and not os.environ.get(provider.api_key_env):
+        raise NotRun(f"Missing API credentials: {provider.api_key_env} is unset")
     return config
 
 

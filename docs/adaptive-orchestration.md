@@ -78,7 +78,7 @@ scope labels; local guidance can override global guidance within the session.
 Skills reference existing Python callables and their argument contracts; reusable
 subagent specifications execute through native `rlm` delegation.
 
-See [the source, deletion, and test mapping](continual-harness-parity.md).
+See [the source, deletion, and test mapping](prime-refinement-specification.md).
 
 ## Code-level reference comparison
 
@@ -100,7 +100,3 @@ This review inspected a fresh upstream checkout at commit `71766abb2c1e427382871
 | Harness state | `core/refinement/refinement.ts` | `harness.py` | JSON state, JSONL history, scope-preserving merge, digest and rollback; see the current parity matrix. |
 | Refinement | serialized turn-boundary checkpoint, review, plan and apply | `refinement.py` | One serialized state machine; explicit requests, interval and compaction only. |
 | Completion | Tool-free response, queued work/goal continuation, child quiescence and terminal notices | Normal final text plus configured task verification/child-wait policy, late-message continuation | A. Different task adapters/goals; no feature-count completion condition. |
-
-The concrete gaps identified during this cleanup were the extra classifier, synchronous Python RLM override, task-wrapper contamination/order, omitted failure records in planner evidence, misleading wait/await documentation, overbroad activity attribution, delayed delivery of child results arriving during automatic review, and an optimistic continuation-time estimate for optional refinement. Those paths were corrected. Behavioral utilization is assessed separately from mechanical parity in [adaptive-validation.md](adaptive-validation.md); a small live sample cannot establish performance on 100 tasks.
-
-Historical audits remain in [runtime-review-history.md](runtime-review-history.md) and [refinement-review-history.md](refinement-review-history.md). Their earlier validation counts describe earlier source, not this refactor.
