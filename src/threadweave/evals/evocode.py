@@ -206,7 +206,8 @@ class BuffaloEvoCodeAgent(BaseAgent):
         # the actual formatter dependency; avoid changing the project's interpreter.
         uv = f"UV_PYTHON_INSTALL_DIR={REMOTE_ROOT}/python {REMOTE_ROOT}/uv/bin/uv"
         commands = [
-            f"python3 -m pip install --target {REMOTE_ROOT}/uv uv==0.11.8",
+            f"curl -fsSL https://github.com/astral-sh/uv/releases/download/0.11.8/uv-$(uname -m)-unknown-linux-gnu.tar.gz -o {REMOTE_ROOT}/uv.tar.gz",
+            f"mkdir -p {REMOTE_ROOT}/uv/bin && tar -xzf {REMOTE_ROOT}/uv.tar.gz --strip-components=1 -C {REMOTE_ROOT}/uv/bin",
             f"{uv} python install 3.12.12 --no-bin",
             f"{uv} venv --python 3.12.12 --managed-python {REMOTE_ROOT}/venv",
             f"{REMOTE_ROOT}/uv/bin/uv pip install --python {REMOTE_PYTHON} {REMOTE_ROOT}/source",

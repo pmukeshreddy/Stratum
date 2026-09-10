@@ -37,6 +37,10 @@ recovery loop, retaining original provider error codes, retry delays and termina
 statuses for Prime's shared completion retry policy. They have no session cache
 key, reasoning option or extra transport retries. Initial credential resolution
 still uses the official shared Codex store; missing credentials fail immediately.
+The WebSocket connector uses Codex's TLS configuration builder to select the
+process crypto provider and preserve native roots and configured custom CAs.
+Native client crashes are reported as `CLIENT_EXIT` with an exit status, rather
+than being mistaken for an incomplete response stream; raw stderr is not exposed.
 Rejected refresh produces `AUTH_REQUIRED`, with no API fallback. Logout
 removes/revokes the shared Codex credentials through the official account protocol.
 Login/logout must not be used as a benchmark test against a human's active account.

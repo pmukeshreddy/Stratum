@@ -5,6 +5,7 @@ use codex_api::{
 };
 use codex_http_client::{
     ClientRouteClass, HttpClientFactory, HttpTransport, OutboundProxyPolicy, Request,
+    build_rustls_client_config_with_custom_ca,
 };
 use codex_login::{AuthCredentialsStoreMode, AuthKeyringBackendKind, AuthManager, AuthRouteConfig};
 use codex_model_provider::auth_provider_from_auth_manager;
@@ -46,7 +47,20 @@ async fn refinement_websocket(wire: &Request, body: &Value, request_id: &str) ->
         .headers_mut()
         .insert("x-client-request-id", id.clone());
     handshake.headers_mut().insert("session_id", id);
-    let Ok((mut socket, _)) = tokio_tungstenite::connect_async(handshake).await else {
+    // Both ring and aws-lc-rs are enabled by the pinned dependency graph. The
+    // default tungstenite connector cannot choose a provider and panics. Codex's
+    // builder selects its provider and retains native roots/custom CA policy.
+    let Ok(tls) = build_rustls_client_config_with_custom_ca() else {
+        return false;
+    };
+    let Ok((mut socket, _)) = tokio_tungstenite::connect_async_tls_with_config(
+        handshake,
+        None,
+        false,
+        Some(tokio_tungstenite::Connector::Rustls(tls)),
+    )
+    .await
+    else {
         return false;
     };
     let mut request = body.clone();
@@ -396,6 +410,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn secure_websocket_starts_tls_without_crypto_provider_panic() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut header = [0; 5];
+            tcp.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x16); // TLS handshake record, not HTTP plaintext.
+            assert_eq!(header[1], 0x03);
+            // Close before a server handshake: this is a transport failure and
+            // must permit SSE fallback rather than crash the native process.
+        });
+        let wire = Request::new(http::Method::POST, format!("https://{address}/responses"));
+        let handled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refinement_websocket(&wire, &json!({"model":"fixture"}), "tls-request"),
+        )
+        .await
+        .unwrap();
+        assert!(!handled);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn one_shot_websocket_fallback_and_protocol_boundaries() {

@@ -202,7 +202,23 @@ class SubscriptionProvider:
                 process.stdin.write((json.dumps(packet) + "\n").encode())
                 await process.stdin.drain()
                 process.stdin.close()
-                result = await self.collect(process.stdout, request, config, emit)
+                try:
+                    result = await self.collect(process.stdout, request, config, emit)
+                except HarnessError as exc:
+                    if exc.failure.code != "incomplete_stream":
+                        raise
+                    # EOF can mean the native client crashed before emitting a
+                    # terminal event. Preserve that distinction without exposing
+                    # stderr, which may contain sensitive transport details.
+                    await process.wait()
+                    if process.returncode:
+                        raise HarnessError(
+                            "provider",
+                            "CLIENT_EXIT",
+                            f"Codex inference client exited with status {process.returncode}",
+                            uncertain=True,
+                        ) from exc
+                    raise
                 await process.wait()
                 if process.returncode:
                     raise HarnessError(

@@ -289,6 +289,33 @@ async def test_cancellation_terminates_client_process(tmp_path, monkeypatch):
         await asyncio.wait_for(task, 3)
 
 
+@pytest.mark.parametrize("exit_code, expected", [(0, "incomplete_stream"), (101, "CLIENT_EXIT")])
+async def test_client_exit_is_distinguished_from_stream_eof(
+    tmp_path, monkeypatch, exit_code, expected
+):
+    executable = tmp_path / "client"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stdin.readline()\n"
+        "print('private transport details SECRET', file=sys.stderr)\n"
+        f"sys.exit({exit_code})\n"
+    )
+    executable.chmod(0o700)
+    provider = SubscriptionProvider(executable=executable)
+
+    async def resolve(config):
+        return config, {}
+
+    monkeypatch.setattr(provider, "resolve", resolve)
+    with pytest.raises(HarnessError) as caught:
+        await provider.invoke(model_request(), discard)
+    assert caught.value.failure.code == expected
+    assert "SECRET" not in str(caught.value)
+    if exit_code:
+        assert str(exit_code) in str(caught.value)
+
+
 async def test_account_model_resolution_and_unsupported_parameters():
     class Catalog(AccountControl):
         async def __aenter__(self):
