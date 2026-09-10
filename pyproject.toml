@@ -38,6 +38,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+evocode = [
+    "harbor @ git+https://github.com/harbor-framework/harbor.git@191d1b989bbba1d77c2db23e17aec308d7c08046 ; python_version >= '3.12'",
+]
 dev = [
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
@@ -52,6 +55,10 @@ semantic = [
 [project.scripts]
 threadweave = "threadweave.cli:main"
 buffalo = "threadweave.cli:main"
+buffalo-evocode = "threadweave.evals.evocode:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

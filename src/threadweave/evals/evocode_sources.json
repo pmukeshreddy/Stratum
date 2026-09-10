@@ -1,0 +1,38 @@
+{
+  "prime": {
+    "packages/coding-agent/src/core/autonomous.ts": "8b73a3cac1e3cf9075b8d1780493daad9d58343ea234dd2459e10dbb75419f89",
+    "packages/coding-agent/src/core/agent-session.ts": "c8c3b5b2793472ef5d7d1f949ed65786dc8b44529e0bc8566ea5505112d835f2",
+    "packages/coding-agent/src/core/settings-manager.ts": "59da74a830ee3b1035d79a3f280e940cc639e9f51c5261bea5206c03612ee942",
+    "packages/coding-agent/src/core/prompts/rlm.ts": "8df7b497524d33aa4e7aae30bf12604029084cfd8747c00bd6df31c9076b32ef",
+    "packages/coding-agent/src/core/refinement/refinement.ts": "81438d5b4acb013c40eae05f12402eb8d7052df3a522baec972c773fd5431f86",
+    "packages/coding-agent/skills/refine/SKILL.md": "048b0e5a3df1d8d5b17ad2650d08956fd2fd92bf60f9d2d02430a87aca2e6173",
+    "packages/coding-agent/skills/refine/src/refine/__init__.py": "00737a6e2d3951dff6df6f4eb02578beccfe81caccbc09cfeb1f1ac6bb618844",
+    "prime-agent-runtime/src/rlm/skill.py": "23f1ecba340b24a4e75880437f33fa72fbd510a2da496a87a9d033fc66b92a7a",
+    "prime-agent-runtime/src/rlm/harness.py": "8be6882fc18b7cc79c1ac7e75aa61f7cf6b14889f06ef15fa3db04080ab2f09c",
+    "prime-agent-runtime/src/rlm/repl.py": "c18cfb4a603512d794dc7bb45780c2ec4198d615e715ba8f2d5c0bfb28da08e5",
+    "prime-agent-runtime/src/rlm/bash.py": "c458153a57a27f0168635a47f5bb69513610c9cfafe555956eafb9152323e642",
+    "prime-agent-runtime/src/rlm/__init__.py": "6fc00c752696583f557ea9cbfc04b2130d91a209553c9b4fd51b36facc3eafaa",
+    "prime-agent-runtime/src/rlm/mcp.py": "065ecd94412ae67070d6adaa2ba8b1f9f6544f55afddd025be31d9303aa5495d",
+    "prime-agent-runtime/src/rlm/_winjob.py": "11243f5c7ba6527e70ed1f20a0e875a374b9013aca6fc4c70bcdb4653ea11296",
+    "prime-agent-runtime/src/rlm/mcp_base.py": "0f1e5b1d66806bf4af12b1ef81f13453d5e9413846d3e5b4bb254f0c40aec4cb"
+  },
+  "harbor": {
+    "commit": "191d1b989bbba1d77c2db23e17aec308d7c08046",
+    "files": {
+      "agents/base.py": "32252867c60a34e063a0d3369349a1ba7bf1a8cae05ed6a0aa8011e15353e73f",
+      "agents/capabilities.py": "adb113c338db3ba8211c38455a7325dfd37fa8b452199cf9a6505777acfcbba3",
+      "trial/multi_step.py": "de274865d8b137b204c07f05eda33cbc3fade525da3a8bc0ab6e54f7a5a7ff77",
+      "trial/trial.py": "35586a7eb1db77e15fc89497f3a5511c888752017626fcc7dce3373ef8b1c467",
+      "verifier/verifier.py": "66cef84dc1dcfc111990c9748655726abf1298c28558e2c6b9366d7bce24c6ce",
+      "models/task/config.py": "f9f63db9128f64243394c43d5bba18845554adcf5e86a661979fd5cdf3b1801f",
+      "models/trial/config.py": "c95acedd896e7bab9f4007ed6373adc7e414ac2b63dfd188b7bbcae6ce5ac480",
+      "environments/docker/docker.py": "8757d3fbc19e58c7ccd14c9b613a0d00dccd1b514375fa0e546ff41ca963a15e",
+      "environments/docker/docker_unix.py": "56f1655b29ad222c315b2ea3c6d4172d6fdcd4a3788697eb9d3f80d1264b3152"
+    }
+  },
+  "evocode": {
+    "github_commit": "f8fcfaa1c9ad1c5b0bbc433323b587e4ddea2f32",
+    "archive": "https://huggingface.co/datasets/UnipatAI/EvoCodeBench/resolve/main/archives/evocodebench_wotraj.tar.zst",
+    "archive_sha256": "a13d0cb47574282372c59366217ac68d895ff49d1387c81098b058f739906184"
+  }
+}

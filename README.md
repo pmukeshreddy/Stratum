@@ -214,6 +214,11 @@ and usage. LongBench v2 and Factorio integrations remain paused.
 
 See [evaluation setup and reproducibility](docs/evaluation.md).
 
+[EvoCode-Bench integration](docs/evocode-evaluation.md) runs one resident Buffalo
+root through an entire evolving project, with isolated host verification and
+Prime-style feedback. It reports an explicitly adapted protocol, separate from
+official leaderboard scores, and retains RLM/refinement evidence across rounds.
+
 ## Long-horizon sessions
 
 run --mode autonomous continues until completion, a configured end-condition or
