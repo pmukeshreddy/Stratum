@@ -192,7 +192,9 @@ class Daemon:
                 body = json.dumps(config.model_dump(mode="json"), sort_keys=True)
                 config_id = hashlib.sha256(body.encode()).hexdigest()
                 with store.transaction():
-                    store.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (config_id, body))
+                    store.records.insert(
+                        "configs", {"id": config_id, "body": json.loads(body)}, on_conflict="ignore"
+                    )
                     store.update(sid, config_id=config_id)
                     store.event(
                         sid,
@@ -226,20 +228,14 @@ class Daemon:
         if method == "schedules":
             return [
                 dict(row)
-                for row in store.db.execute(
-                    "SELECT * FROM schedules WHERE session_id=?", (args["session_id"],)
-                )
+                for row in store.records.select("schedules", session_id=args["session_id"])
             ]
         if method == "unschedule":
             with store.transaction():
-                row = store.db.execute(
-                    "SELECT * FROM schedules WHERE id=?", (args["schedule_id"],)
-                ).fetchone()
+                row = store.records.first("schedules", id=args["schedule_id"])
                 if not row:
                     raise KeyError("Unknown schedule")
-                store.db.execute(
-                    "UPDATE schedules SET enabled=0 WHERE id=?", (args["schedule_id"],)
-                )
+                store.records.update("schedules", {"enabled": 0}, id=args["schedule_id"])
                 store.event(row["session_id"], "schedule_disabled", args)
             return {"disabled": args["schedule_id"]}
         if method == "states":

@@ -1,7 +1,5 @@
 """Committed conversation and runtime history, independent of the live context window."""
 
-import json
-
 
 class TrajectoryHistory:
     def trajectory(
@@ -16,11 +14,15 @@ class TrajectoryHistory:
         pending = session.pending_turn
         if pending and not pending.get("context_committed"):
             cutoff = self.event_by_id(pending["event_id"])["seq"]
-        running = self.db.execute(
-            "SELECT MIN(e.seq) FROM model_attempts a JOIN events e ON e.id=a.event_id "
-            "JOIN model_requests r ON r.id=a.request_id WHERE r.session_id=? AND r.purpose='agent' AND a.status='running'",
-            (sid,),
-        ).fetchone()[0]
+        running = min(
+            (
+                self.event_by_id(attempt["event_id"])["seq"]
+                for attempt in self.running_attempts(sid)
+                if self.records.first("model_requests", id=attempt["request_id"])["purpose"]
+                == "agent"
+            ),
+            default=None,
+        )
         if running:
             cutoff = min(cutoff, running) if cutoff else running
         ignored = {
@@ -62,12 +64,20 @@ class TrajectoryHistory:
                 }
             )
         records = []
-        rows = self.db.execute(
-            "SELECT e.*,b.messages AS committed_messages FROM events e LEFT JOIN conversation_blocks b "
-            "ON b.event_id=e.id AND b.session_id=e.session_id WHERE e.session_id=? "
-            "AND (? IS NULL OR e.seq<? OR b.messages IS NOT NULL) ORDER BY e.seq DESC LIMIT 4000",
-            (sid, cutoff, cutoff),
-        )
+        committed = {
+            row["event_id"]: row["messages"]
+            for row in self.records.select("conversation_blocks", session_id=sid)
+        }
+        rows = [
+            {**row, "committed_messages": committed.get(row["id"])}
+            for row in self.records.select(
+                "events",
+                session_id=sid,
+                order=(("seq", True),),
+                where=lambda row: cutoff is None or row["seq"] < cutoff or row["id"] in committed,
+                limit=4000,
+            )
+        ]
         # Build complete records first, then select a chronological bounded suffix.
         for row in rows:
             event = self._event_row(row)
@@ -76,7 +86,7 @@ class TrajectoryHistory:
             if row["committed_messages"] is not None:
                 from .refinement_context import convert_to_llm
 
-                for message in convert_to_llm(json.loads(row["committed_messages"])):
+                for message in convert_to_llm(row["committed_messages"]):
                     role = message["role"]
                     if message.get("content"):
                         block.append(

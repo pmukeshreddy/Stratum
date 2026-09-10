@@ -3,7 +3,7 @@
 Audit before editing covered production source, tests, documentation and configs.
 The unchanged baseline passed 70 tests.
 
-Preserved: SQLite sessions/events/messages/versions, pending-action recovery,
+Preserved: JSON sessions/messages and authoritative JSONL events, pending-action recovery,
 Python workers/receipts, asynchronous daemon scheduling, recursive accounting,
 provider transport, context boundaries and client detachment.
 

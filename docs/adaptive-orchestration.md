@@ -57,9 +57,12 @@ Other generic preloads are `Path`, `pathlib`, `os`, `asyncio`, `json`, `session`
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is stored as session audit events, separate from model conversation.
-Retired SQLite reinforcement tables and import adapters have been removed.
+Global refinement history appends to `DATA/harness/refinements.jsonl`; local
+history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
+`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
+advances. Interrupted writes recover under a process lock. Runtime persistence uses
+JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
+once, with their original database left untouched.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
@@ -93,7 +96,7 @@ This review inspected a fresh upstream checkout at commit `71766abb2c1e427382871
 | RLM and admission | Python `rlm.run` bridge; `agent-session.ts` admits a run and detaches child startup/execution | `Recursive.run → dispatch → spawn_async` | A. Both return stable handles after admission, never child answers. |
 | Child creation/inheritance | `agent-session.ts::_createRlmSubagentRuntimeOptions`, `agent-session-runtime.ts::createRlmSubagentRuntime` | `Runtime.spawn`, environment child policies, `Store.create` | A. Own model context/kernel with effective model/thinking/tools/workspace/ancestry; explicit overrides retain validation. |
 | Scheduling/concurrency | Detached child task calls `child.promptAndWait`, tracked publication/settlement/usage | Independent scheduler tasks and durable runnable/wake state | A. Parent continues complementary work while children run. Shared budget and concurrency admission remain host-owned. |
-| Persistent children | Retained child sessions and runtime rehydration | `_continue_completed_child`, kernel checkpoint/reload, stable SQLite session/history | A. Same child accepts later parent follow-ups. |
+| Persistent children | Retained child sessions and runtime rehydration | `_continue_completed_child`, kernel checkpoint/reload, stable JSON sessions and JSONL history | A. Same child accepts later parent follow-ups. |
 | Messaging/observation | Session message queues, terminal notices; daemon `createAgentObserveRecentMessages` | `Runtime.message/receive`, `Store.send/receive/trajectory`, host family authorization | A/B. Equivalent delivery/inspection; Buffalo preserves committed history and source receipts through compaction/restart. |
 | Recursive children | Child session reuses the same runtime options with incremented depth | Same `rlm` object and scheduler with depth/shared resource checks | A. Capability available, never required. |
 | Context/compaction | Agent context transforms, session `_performCompaction/_runAutoCompaction`, namespace snapshots and continuation | `Context.assemble/compact`, `AuxiliaryServices.semantic_compact`, retained kernel and durable history | A/B. Different budgeting/reduction; durable compaction review checkpoints and complete original contract are retained. |

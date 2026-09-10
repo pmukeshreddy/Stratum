@@ -34,7 +34,7 @@ async def test_live_programmable_session(tmp_path, monkeypatch):
     )
     output.mkdir(parents=True, exist_ok=True)
     data = output / "state"
-    assert not (data / "history.sqlite3").exists(), "Use a fresh acceptance directory"
+    assert not (data / "store.json").exists(), "Use a fresh acceptance directory"
     config = RunConfig.model_validate_json((PROJECT / "configs/session.json").read_text())
     config.provider.parameters["reasoning_effort"] = "low"
     config.limits.python_timeout_seconds = 180

@@ -87,12 +87,19 @@ async def test_output_budget_reserves_all_buffalo_descendant_calls(tmp_path, con
     root = runtime.create("Shared output budget", tmp_path, config=config)
     child = runtime.spawn(root.id, "Child", isolate=False)
     try:
-        runtime.store.db.execute(
-            "INSERT INTO reservations VALUES(?,?,?,?,?)", ("call", child.id, 10, 128, 0)
+        runtime.store.records.insert(
+            "reservations",
+            {
+                "id": "call",
+                "session_id": child.id,
+                "input_tokens": 10,
+                "output_tokens": 128,
+                "cost": 0,
+            },
         )
         with pytest.raises(BudgetBusy):
             runtime._check_limits(root.id, resource="model_calls")
-        runtime.store.db.execute("DELETE FROM reservations")
+        runtime.store.records.delete("reservations")
         runtime.store.charge(child.id, Usage(output_tokens=100))
         with pytest.raises(LimitReached, match="output tokens"):
             runtime._check_limits(root.id, resource="model_calls")

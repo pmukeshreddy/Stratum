@@ -32,9 +32,14 @@ def test_subscription_estimate_uses_native_representation_once(tmp_path, config)
             "role": "assistant",
             "content": [{"type": "output_text", "text": "Native evidence."}],
         }
-        store.db.execute(
-            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
-            (event, "codex_subscription", "gpt-6-astra", encode([item])),
+        store.records.insert(
+            "provider_continuations",
+            {
+                "event_id": event,
+                "provider": "codex_subscription",
+                "model": "gpt-6-astra",
+                "items": [item],
+            },
         )
         store.add_context(
             root.id,
@@ -180,9 +185,14 @@ def test_reported_occupancy_anchor_restores_and_preserves_opaque_state(tmp_path,
             usage=Usage(input_tokens=1000, output_tokens=500),
         )
         event = store.event(root.id, "model_response", {})
-        store.db.execute(
-            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
-            (event, config.provider.name, config.provider.model, encode(response.provider_items)),
+        store.records.insert(
+            "provider_continuations",
+            {
+                "event_id": event,
+                "provider": config.provider.name,
+                "model": config.provider.model,
+                "items": response.provider_items,
+            },
         )
         record_usage(store, root.id, request, response, event)
         store.add_context(
@@ -372,9 +382,14 @@ def test_usage_anchor_counts_messages_inserted_before_committed_response(tmp_pat
             usage=Usage(input_tokens=1000, output_tokens=500),
         )
         event = store.event(root.id, "model_response", {})
-        store.db.execute(
-            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
-            (event, config.provider.name, config.provider.model, encode(response.provider_items)),
+        store.records.insert(
+            "provider_continuations",
+            {
+                "event_id": event,
+                "provider": config.provider.name,
+                "model": config.provider.model,
+                "items": response.provider_items,
+            },
         )
         record_usage(store, root.id, request, response, event)
         add_block(store, root.id, "Child found a boundary failure while the action was executing.")

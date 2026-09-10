@@ -18,7 +18,7 @@ External reference investigation evidence is kept outside the repository.
 | SKILL.md discovery and src-layout Python modules, callable if run exists | `skills.discover/load_module`, bootstrap and explicit skills API |
 | Immediate local/global durable CRUD, compact supplemental menu | `Harness`, validated versioned state, explicit content selection |
 | Lazy stdio/streamable HTTP discovery/calls/lifecycle; structured content preferred | Official Python MCP SDK in `mcp_client`, kernel normalization |
-| Normal final answer ends work; conversation log accessible by path | Normal-text completion/yield, readable history projection |
+| Normal final answer ends work; conversation log accessible by path | Normal-text completion/yield, authoritative JSONL history |
 
 The production `_invoke` interface exposes only `ipython`, with one required string
 argument `code`. The [runtime schema fixture](../tests/fixtures/ipython-schema.json)
@@ -47,8 +47,8 @@ goes to the private `session.console_log`, never the worker RPC channel.
 
 `context['task']` contains the complete original instruction. The model prompt
 contains a bounded excerpt, not the entire input. `context['messages_path']`
-points to JSONL events materialized from authoritative SQLite at invocation/cell
-boundaries. Read, filter and aggregate it in Python. `history.read(after=-1,
+points directly to the authoritative per-session JSONL log, appended at each commit. Read, filter and aggregate it in Python.
+`history.read(after=-1,
 limit=100)` starts forward pagination; pass the last `seq` for the next page.
 `history.search`, `history.get`, `history.messages`, `artifacts.load/read/search`
 provide scoped retrieval. `Store.iter_events` exports complete trajectories in
@@ -116,9 +116,12 @@ rlm.get_harness_state()
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is stored as session audit events, separate from model conversation.
-Retired SQLite reinforcement tables and import adapters have been removed.
+Global refinement history appends to `DATA/harness/refinements.jsonl`; local
+history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
+`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
+advances. Interrupted writes recover under a process lock. Runtime persistence uses
+JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
+once, with their original database left untouched.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
@@ -210,7 +213,7 @@ destroying the recurring session. Waiting for all children is an explicit
 ## Deliberate boundaries and remaining differences
 
 The completed-child follow-up and interactive `/refine` fixes are behavioral bugs,
-not reasons to change other policies. Model-controlled SQLite FTS5 history search,
+not reasons to change other policies. Model-controlled BM25 history search,
 ripgrep/Python repository search and arbitrary Python processing are retained.
 Refinement defaults, global-state write permissions, context sizing, checkpoint
 limits and run budgets are Threadweave implementation choices and are unchanged.

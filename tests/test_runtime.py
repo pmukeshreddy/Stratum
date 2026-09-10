@@ -169,13 +169,14 @@ async def test_budget_reservations_wait_without_false_tree_termination(runtime, 
     runtime.providers["mock"] = ScriptedProvider({})
     root = runtime.create("Root", tmp_path, config=config)
     eid = runtime.store.event(root.id, "model_invocation_started", {})
-    runtime.store.db.execute(
-        "INSERT INTO reservations VALUES(?,?,?,?,?)", (eid, root.id, 800, 100, 0)
+    runtime.store.records.insert(
+        "reservations",
+        {"id": eid, "session_id": root.id, "input_tokens": 800, "output_tokens": 100, "cost": 0},
     )
     with pytest.raises(BudgetBusy):
         runtime._check_limits(root.id, resource="model_calls", input_bound=100)
     runtime._check_limits(root.id)  # Reserved tokens are not spent tokens.
-    runtime.store.db.execute("DELETE FROM reservations")
+    runtime.store.records.delete("reservations")
     runtime._check_limits(root.id, resource="model_calls", input_bound=100)
     with pytest.raises(LimitReached):
         runtime._check_limits(root.id, resource="model_calls", input_bound=1000)
@@ -285,7 +286,7 @@ async def test_heartbeat_persistence_and_missed_ticks_coalesce(tmp_path, config)
         lambda: runtime.store.session(root.id).turns == 1 and root.id not in runtime.tasks
     )
     assert not runtime.store.session(root.id).runnable
-    runtime.store.db.execute("UPDATE schedules SET next_at=0")
+    runtime.store.records.update("schedules", {"next_at": 0})
     await runtime.shutdown()
     restored = Runtime(directory, providers={"mock": ScriptedProvider({})})
     try:
@@ -388,9 +389,18 @@ async def test_recovery_of_action_receipt_crash_window(tmp_path, config):
     runtime = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     root = runtime.create("Receipt", tmp_path, config=config)
     action_id, event = "action_receipt_test", runtime.store.event(root.id, "tool_call", {})
-    runtime.store.db.execute(
-        "INSERT INTO actions VALUES(?,?,?,?,?,?,?,?)",
-        (action_id, root.id, "python", "{}", "running", None, event, None),
+    runtime.store.records.insert(
+        "actions",
+        {
+            "id": action_id,
+            "session_id": root.id,
+            "name": "python",
+            "arguments": {},
+            "status": "running",
+            "result": None,
+            "source_event": event,
+            "result_event": None,
+        },
     )
     kernel = runtime._kernel(root.id)
     await kernel.execute(action_id, "marker = workspace / 'once'\nmarker.write_text('once')", 5)
@@ -398,11 +408,9 @@ async def test_recovery_of_action_receipt_crash_window(tmp_path, config):
     recovered = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     try:
         await recovered.recover()
-        row = recovered.store.db.execute(
-            "SELECT * FROM actions WHERE id=?", (action_id,)
-        ).fetchone()
+        row = recovered.store.records.first("actions", id=action_id)
         assert row["status"] == "done"
-        assert "error" not in json.loads(row["result"])
+        assert "error" not in row["result"]
         assert recovered.store.events(root.id, kind="tool_result")[-1]["payload"]["recovered"]
         assert (tmp_path / "once").read_text() == "once"
     finally:
@@ -415,23 +423,31 @@ async def test_recovery_marks_external_actions_uncertain_and_accounts_unfinished
     runtime = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     root = runtime.create("Recovery", tmp_path, config=config)
     event = runtime.store.event(root.id, "tool_call", {})
-    runtime.store.db.execute(
-        "INSERT INTO actions VALUES(?,?,?,?,?,?,?,?)",
-        ("external", root.id, "workspace_write", "{}", "running", None, event, None),
+    runtime.store.records.insert(
+        "actions",
+        {
+            "id": "external",
+            "session_id": root.id,
+            "name": "workspace_write",
+            "arguments": {},
+            "status": "running",
+            "result": None,
+            "source_event": event,
+            "result_event": None,
+        },
     )
     call = runtime.store.event(root.id, "model_invocation_started", {})
-    runtime.store.db.execute(
-        "INSERT INTO reservations VALUES(?,?,?,?,?)", (call, root.id, 123, 45, 0.02)
+    runtime.store.records.insert(
+        "reservations",
+        {"id": call, "session_id": root.id, "input_tokens": 123, "output_tokens": 45, "cost": 0.02},
     )
     await runtime.shutdown()
     recovered = Runtime(tmp_path / "data", providers={"mock": ScriptedProvider({})})
     try:
         await recovered.recover()
-        result = json.loads(
-            recovered.store.db.execute("SELECT result FROM actions WHERE id='external'").fetchone()[
-                0
-            ]
-        )
+        result = recovered.store.records.first("actions", id="external", fields=("result",))[
+            "result"
+        ]
         assert result["error"]["uncertain"]
         assert result["error"]["category"] == "runtime"
         assert recovered.store.usage(root.id).input_tokens == 123

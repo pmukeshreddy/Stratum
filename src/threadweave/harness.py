@@ -13,6 +13,9 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import uuid4
 
+from .file_store import atomic_write as write_document
+from .file_store import directory_lock, ensure_directory, read_jsonl, sync_directory
+
 KINDS = ("prompt", "memory", "skill", "subagent")
 
 
@@ -32,7 +35,7 @@ def empty_harness_state():
 
 def atomic_json(path, value, *, python=False):
     path = Path(path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path.parent)
     data = (
         json.dumps(value, ensure_ascii=False, indent=2)
         if python
@@ -47,26 +50,82 @@ def atomic_json(path, value, *, python=False):
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
         if not python or existing_mode is not None:
             os.chmod(temporary, mode)
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
     return str(path)
 
 
+def append_jsonl(path, value, *, python=False):
+    path = Path(path)
+    ensure_directory(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as stream:
+        stream.write((json.dumps(value, ensure_ascii=False) if python else js_json(value)) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync_directory(path.parent)
+
+
+def recover_harness(directory):
+    directory = Path(directory)
+    with directory_lock(directory):
+        pending = directory / ".commit.json"
+        if not pending.exists():
+            return
+        commit = json.loads(pending.read_text())
+        journal = directory / "state_changes.jsonl"
+        entries = read_jsonl(journal, repair_tail=True)
+        if not entries or entries[-1]["id"] != commit["id"]:
+            append_jsonl(journal, commit, python=True)
+        if commit.get("refinement") is not None:
+            append_refinement_history_unlocked(directory, commit["refinement"])
+        atomic_json(directory / "harness_state.json", commit["state"], python=commit["python"])
+        pending.unlink()
+        sync_directory(directory)
+
+
+def append_refinement_history_unlocked(directory, result):
+    path = Path(directory) / "refinements.jsonl"
+    records = read_jsonl(path, repair_tail=True)
+    if not records or records[-1] != result:
+        append_jsonl(path, result)
+
+
+def commit_harness_state(directory, state, *, refinement=None, python=False):
+    directory = Path(directory)
+    recover_harness(directory)
+    state = json.loads(json.dumps(state) if python else js_json(state))
+    commit = {"id": uuid4().hex, "state": state, "refinement": refinement, "python": python}
+    write_document(directory / ".commit.json", json.dumps(commit, ensure_ascii=False).encode())
+    recover_harness(directory)
+    return str(directory / "harness_state.json")
+
+
 def load_harness_state(directory, scope="global", *, python=False):
+    recover_harness(directory)
     path = Path(directory) / "harness_state.json"
     state = empty_harness_state()
     try:
         raw = json.loads(path.read_text())
         if not isinstance(raw, dict):
             raise ValueError("harness state must be an object")
-    except FileNotFoundError:
-        return state
     except (OSError, ValueError):
-        return state
+        with directory_lock(directory):
+            journal = read_jsonl(Path(directory) / "state_changes.jsonl", repair_tail=True)
+            if not journal:
+                return state
+            raw = journal[-1]["state"]
+            if not isinstance(raw, dict):
+                return state
+            atomic_json(path, raw, python=python)
     state["schema"] = raw.get("schema", 1) if type(raw.get("schema", 1)) in (int, float) else 1
     entries = raw.get("entries")
     for kind in KINDS:
@@ -92,9 +151,8 @@ def load_harness_state(directory, scope="global", *, python=False):
 
 
 def save_harness_state(directory, state, *, python=False):
-    path = Path(directory) / "harness_state.json"
-    atomic_json(path, state, python=python)
-    return str(path)
+    with directory_lock(directory):
+        return commit_harness_state(directory, state, python=python)
 
 
 def python_harness_state(directory, scope="local"):
@@ -182,36 +240,22 @@ def infer_scope(result, default="local"):
 
 
 def load_refinement_history(directory, scope="global"):
-    path = Path(directory) / "refinements.jsonl"
-    try:
-        lines = path.read_text().splitlines()
-    except FileNotFoundError:
-        return []
-    records = []
-    for line in lines:
-        try:
-            record = json.loads(line)
-            if (
-                isinstance(record, dict)
-                and "id" in record
-                and isinstance(record.get("appliedEdits"), list)
-            ):
-                record["scope"] = infer_scope(record, scope)
-                records.append(record)
-        except ValueError:
-            continue
-    return records
+    with directory_lock(directory):
+        recover_harness(directory)
+        records = []
+        for record in read_jsonl(Path(directory) / "refinements.jsonl", repair_tail=True):
+            if "id" in record and isinstance(record.get("appliedEdits"), list):
+                records.append({**record, "scope": infer_scope(record, scope)})
+        return records
 
 
 def append_refinement_history(directory, result):
-    path = Path(directory) / "refinements.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = js_json(result) + "\n"
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    return str(path)
+    with directory_lock(directory):
+        path = Path(directory) / "refinements.jsonl"
+        records = read_jsonl(path, repair_tail=True)
+        if not records or records[-1] != result:
+            append_jsonl(path, result)
+        return str(path)
 
 
 def merge_refinement_history(global_history, local_history):
@@ -525,58 +569,59 @@ class HarnessStore:
         return self.python_state(None if global_ else sid)["entries"][kind].get(id)
 
     def mutate(self, sid, action, kind=None, *, id=None, global_=False, source="agent", **fields):
-        id, global_ = scope_target(id, global_)
-        target = None if global_ else sid
-        state = self.python_state(target)  # Reload host/kernel writes before mutating.
-        if action == "record_refinement":
-            changes = fields["changes"]
-            result = {
-                "id": id or f"refine_{len(state['refinements']) + 1:04d}",
-                "trigger": fields["trigger"],
-                "changes": [changes] if isinstance(changes, str) else list(changes),
-                "evidence": fields.get("evidence", ""),
-                "outcome": fields.get("outcome", ""),
-                "created_at": datetime.now(UTC).isoformat(),
-            }
-            state["refinements"].append(result)
-        else:
-            if kind not in KINDS:
-                raise ValueError(f"Unknown harness kind: {kind}")
-            if action not in ("create", "update", "delete", "upsert"):
-                raise ValueError(f"Unknown harness operation: {action}")
-            identifier = id or "_".join(
-                "".join(
-                    c.lower() if c.isalnum() else "_" for c in fields.get("title", "").strip()
-                ).split()
-            )
-            identifier = id or ("_".join(p for p in identifier.split("_") if p) or kind)[:80]
-            before = state["entries"][kind].get(identifier)
-            if action == "delete":
-                if before is None:
-                    return False
-                del state["entries"][kind][identifier]
-                result = True
+        with directory_lock(self.path(None if scope_target(id, global_)[1] else sid)):
+            id, global_ = scope_target(id, global_)
+            target = None if global_ else sid
+            state = self.python_state(target)  # Reload host/kernel writes before mutating.
+            if action == "record_refinement":
+                changes = fields["changes"]
+                result = {
+                    "id": id or f"refine_{len(state['refinements']) + 1:04d}",
+                    "trigger": fields["trigger"],
+                    "changes": [changes] if isinstance(changes, str) else list(changes),
+                    "evidence": fields.get("evidence", ""),
+                    "outcome": fields.get("outcome", ""),
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+                state["refinements"].append(result)
             else:
-                if action == "create" and before is not None:
-                    raise ValueError(f"{kind} entry {identifier!r} already exists")
-                if action == "update" and before is None:
-                    raise ValueError(f"{kind} entry {identifier!r} does not exist")
-                fields = {k: v for k, v in fields.items() if v is not None}
-                for key in ("reference", "arguments", "metadata"):
-                    if key in fields:
-                        fields[key] = dict(fields[key] if before else fields[key] or {})
-                result = updated_entry(
-                    kind,
-                    identifier,
-                    fields,
-                    before,
-                    scope="global" if global_ else "local",
-                    source=source,
-                    python=True,
+                if kind not in KINDS:
+                    raise ValueError(f"Unknown harness kind: {kind}")
+                if action not in ("create", "update", "delete", "upsert"):
+                    raise ValueError(f"Unknown harness operation: {action}")
+                identifier = id or "_".join(
+                    "".join(
+                        c.lower() if c.isalnum() else "_" for c in fields.get("title", "").strip()
+                    ).split()
                 )
-                state["entries"][kind][identifier] = result
-        save_harness_state(self.path(target), state, python=True)
-        return copy.deepcopy(result)
+                identifier = id or ("_".join(p for p in identifier.split("_") if p) or kind)[:80]
+                before = state["entries"][kind].get(identifier)
+                if action == "delete":
+                    if before is None:
+                        return False
+                    del state["entries"][kind][identifier]
+                    result = True
+                else:
+                    if action == "create" and before is not None:
+                        raise ValueError(f"{kind} entry {identifier!r} already exists")
+                    if action == "update" and before is None:
+                        raise ValueError(f"{kind} entry {identifier!r} does not exist")
+                    fields = {k: v for k, v in fields.items() if v is not None}
+                    for key in ("reference", "arguments", "metadata"):
+                        if key in fields:
+                            fields[key] = dict(fields[key] if before else fields[key] or {})
+                    result = updated_entry(
+                        kind,
+                        identifier,
+                        fields,
+                        before,
+                        scope="global" if global_ else "local",
+                        source=source,
+                        python=True,
+                    )
+                    state["entries"][kind][identifier] = result
+            save_harness_state(self.path(target), state, python=True)
+            return copy.deepcopy(result)
 
     def overview(self, sid, *, global_=False, max_entries_per_kind=20):
         state = self.python_state(None if global_ else sid)
@@ -634,28 +679,34 @@ class HarnessStore:
         rollback_of=None,
         target_directory=None,
     ):
-        target = None if global_ else sid
-        directory = Path(target_directory) if target_directory else self.path(target)
-        if rollback_of and not global_ and not (directory / "harness_state.json").exists():
-            raise ValueError(f"Refinement state file not found: {directory / 'harness_state.json'}")
-        proposal = copy.deepcopy(proposal)
-        for edit in proposal.get("edits", []):
-            if isinstance(edit.get("id"), str):
-                edit["id"] = re.sub(r"^(local|global):", "", edit["id"])
-        state = load_harness_state(directory, "global" if global_ else "local")
-        result = apply_refinement_proposal(
-            state,
-            proposal,
-            id=id,
-            scope="global" if global_ else "local",
-            baseline_state=baseline_state,
-            rollback_of=rollback_of,
-        )
-        result["harnessStatePath"] = save_harness_state(directory, state)
-        if global_:
-            append_refinement_history(self.path(), result)
-        try:
-            self.session_history.record_harness_refinement(sid, result)
-        except Exception as exc:
-            raise HarnessAuditError(result, exc) from exc
-        return result
+        with directory_lock(
+            Path(target_directory) if target_directory else self.path(None if global_ else sid)
+        ):
+            target = None if global_ else sid
+            directory = Path(target_directory) if target_directory else self.path(target)
+            if rollback_of and not global_ and not (directory / "harness_state.json").exists():
+                raise ValueError(
+                    f"Refinement state file not found: {directory / 'harness_state.json'}"
+                )
+            proposal = copy.deepcopy(proposal)
+            for edit in proposal.get("edits", []):
+                if isinstance(edit.get("id"), str):
+                    edit["id"] = re.sub(r"^(local|global):", "", edit["id"])
+            state = load_harness_state(directory, "global" if global_ else "local")
+            result = apply_refinement_proposal(
+                state,
+                proposal,
+                id=id,
+                scope="global" if global_ else "local",
+                baseline_state=baseline_state,
+                rollback_of=rollback_of,
+            )
+            result["harnessStatePath"] = str(directory / "harness_state.json")
+            commit_harness_state(directory, state, refinement=result)
+            if global_ or directory.resolve() != self.path(sid).resolve():
+                # A session receipt links this global change to the requesting session.
+                try:
+                    self.session_history.record_harness_refinement(sid, result)
+                except Exception as exc:
+                    raise HarnessAuditError(result, exc) from exc
+            return result

@@ -221,9 +221,7 @@ async def test_root_rlm_messages_layers_refinement_detach_recovery(tmp_path, con
             == "Queued while detached/inactive"
         )
         assert runtime.store.harness.get(root.id, "memory", entry["id"])["version"] == 2
-        assert runtime.store.db.execute(
-            "SELECT enabled FROM schedules WHERE id=?", (schedule,)
-        ).fetchone()[0]
+        assert runtime.store.records.first("schedules", id=schedule, fields=("enabled",))["enabled"]
         assert runtime.store.usage(root.id, tree=True).model_calls == usage.model_calls
         await say("Reattach and inspect x", [response("python", code="assert x == 123")])
         assert runtime.store.events(root.id, kind="kernel_recovery")[-1]["payload"]["restored"]

@@ -213,9 +213,7 @@ async def test_recursive_admission_and_restored_namespaces(
         )
         assert runtime.store.config(child.id).task.adapter == adapter
         if adapter == "workspace":
-            assert not runtime.store.db.execute(
-                "SELECT 1 FROM candidates WHERE child_id=?", (child.id,)
-            ).fetchone()
+            assert not runtime.store.records.first("candidates", child_id=child.id)
     finally:
         await runtime.shutdown()
 
@@ -277,9 +275,7 @@ async def test_legacy_persisted_config_recovers_admission_and_options(
         old["task"].update(old["task"].pop("options")["coding"])
         for key in ["capabilities", "effective_capabilities", "disabled_capabilities"]:
             old.pop(key)
-        runtime.store.db.execute(
-            "UPDATE configs SET body=? WHERE id=?", (json.dumps(old), root.config_id)
-        )
+        runtime.store.records.update("configs", {"body": old}, id=root.config_id)
         await runtime.shutdown()
         runtime = Runtime(tmp_path / "state", providers={"mock": ScriptedProvider({})})
         await runtime.recover()

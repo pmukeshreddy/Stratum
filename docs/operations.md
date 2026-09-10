@@ -98,9 +98,12 @@ resource limits still apply.
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is stored as session audit events, separate from model conversation.
-Retired SQLite reinforcement tables and import adapters have been removed.
+Global refinement history appends to `DATA/harness/refinements.jsonl`; local
+history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
+`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
+advances. Interrupted writes recover under a process lock. Runtime persistence uses
+JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
+once, with their original database left untouched.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
@@ -173,8 +176,13 @@ This is not a distributed container lease service.
 
 ```text
 DATA/
-  history.sqlite3    durable sessions, history, queues, state versions, indexes,
+  store.json         storage format marker
+  records/           JSON records: sessions, queues, goals, accounting, indexes,
                      checkpoints, experiments, routing and verification
+  sessions/ID/messages.jsonl   authoritative append-only runtime/conversation events
+  sessions/ID/harness/         local learned state and refinement journal
+  harness/                    global learned state and refinement journal
+  .commit.json       temporary durable write intent, removed after commit
   artifacts/         exact private values, patches, files, logs and measurements
   kernels/           per-session snapshots, receipts and logs
   workspaces/        isolated candidates and verification copies
@@ -183,8 +191,14 @@ DATA/
 ```
 
 Stop the daemon and back up the whole data directory plus associated workspaces.
-Online backups need SQLite backup APIs coordinated with file snapshots; copying
-only the main database during WAL activity is insufficient.
+Copy the JSON documents, JSONL logs, and any pending commit file together. Restart
+replays a committed write intent before serving reads. Do not take an uncoordinated
+live copy while the daemon or a kernel is writing.
+
+Older `history.sqlite3` stores are imported automatically on first startup. The
+original database is retained as a backup; `.legacy-imported.json` records completion.
+Subsequent runtime reads and writes use only JSON/JSONL. Search uses a rebuildable
+in-memory BM25 index rather than a second durable transcript copy.
 
 Storage is not encrypted and has no pruning/quota service. Monitor disk use for
 large logs, snapshots and candidate copies. Checkpoint files above 64 MiB fail
@@ -192,4 +206,4 @@ explicitly. The source reference PDF is not installed with the package.
 
 doctor reports provider/model and credential presence (not values), Git/ripgrep,
 requested container health, available compilers and optional CUDA/profilers,
-data-directory writability and SQLite quick_check. It does not make a paid model call.
+data-directory writability and JSON/JSONL storage validation. It does not make a paid model call.

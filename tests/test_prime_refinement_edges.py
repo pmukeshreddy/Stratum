@@ -12,6 +12,7 @@ from threadweave.harness import (
     KINDS,
     append_refinement_history,
     apply_refinement_proposal,
+    atomic_json,
     empty_harness_state,
     format_harness_state,
     infer_scope,
@@ -193,7 +194,7 @@ def test_atomic_failure_preserves_destination_and_temp_permissions(tmp_path, mon
 
     monkeypatch.setattr("threadweave.harness.os.replace", fail)
     with pytest.raises(OSError):
-        save_harness_state(tmp_path, empty_harness_state(), python=python)
+        atomic_json(path, empty_harness_state(), python=python)
     assert path.read_text() == "previous" and list(tmp_path.iterdir()) == [path]
 
 
@@ -246,7 +247,7 @@ async def test_refine_command_fifo_and_recovery_without_synthetic_user_input(har
     later = rt.message(None, sid, "later legitimate input")
     assert rt.refinement_state(sid).command_task is None
     assert [m["id"] for m in rt.receive(sid)] == [earlier]
-    # A new in-memory checkpoint (restart) still finds the command in SQLite.
+    # A new in-memory checkpoint (restart) still finds the command in the durable message records.
     rt._refinement_states.pop(sid, None)
     task = rt.start_queued_refine_command(sid)
     assert task is not None

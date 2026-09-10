@@ -59,9 +59,7 @@ class MutationObserver:
         return self.runtime.artifacts.load(owner, artifact)
 
     def previous(self, root):
-        row = self.store.db.execute(
-            "SELECT * FROM mutation_workspaces WHERE path=?", (root,)
-        ).fetchone()
+        row = self.store.records.first("mutation_workspaces", path=root)
         if not row:
             return None, None
         if root not in self.cache:
@@ -227,9 +225,15 @@ class MutationObserver:
             artifact = self.runtime.artifacts.put(
                 context.session_id, manifest, source_event=context.source_event
             )
-            self.store.db.execute(
-                "INSERT OR REPLACE INTO mutation_workspaces VALUES(?,?,?,?)",
-                (root, context.session_id, artifact, identity),
+            self.store.records.insert(
+                "mutation_workspaces",
+                {
+                    "path": root,
+                    "session_id": context.session_id,
+                    "manifest_artifact": artifact,
+                    "state_id": identity,
+                },
+                on_conflict="replace",
             )
             self.cache[root] = manifest
         else:
@@ -342,18 +346,18 @@ class MutationObserver:
         self.report(context, previous, manifest, reason="between_actions")
         identifier = new_id()
         owner = context.session_id if previous != manifest else row["session_id"]
-        self.store.db.execute(
-            "INSERT INTO mutation_windows VALUES(?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                root,
-                context.session_id,
-                context.action_id,
-                context.source_event,
-                artifact,
-                owner,
-                "open",
-            ),
+        self.store.records.insert(
+            "mutation_windows",
+            {
+                "id": identifier,
+                "workspace": root,
+                "session_id": context.session_id,
+                "action_id": context.action_id,
+                "source_event": context.source_event,
+                "before_artifact": artifact,
+                "before_owner": owner,
+                "status": "open",
+            },
         )
         self.active[context.session_id] = identifier
         self.baselines[identifier] = manifest
@@ -380,9 +384,7 @@ class MutationObserver:
             self.active.pop(context.session_id, None)
 
     def _end(self, context, identifier, *, recovered=False):
-        row = self.store.db.execute(
-            "SELECT * FROM mutation_windows WHERE id=?", (identifier,)
-        ).fetchone()
+        row = self.store.records.first("mutation_windows", id=identifier)
         try:
             _, after, _, _, _ = self.scan(context)
             before = self.baselines.get(identifier)
@@ -396,9 +398,7 @@ class MutationObserver:
                 window_id=identifier,
                 recovered=recovered,
             )
-            self.store.db.execute(
-                "UPDATE mutation_windows SET status='observed' WHERE id=?", (identifier,)
-            )
+            self.store.records.update("mutation_windows", {"status": "observed"}, id=identifier)
             self.store.event(
                 context.session_id,
                 "mutation_observation_finished",
@@ -427,7 +427,7 @@ class MutationObserver:
             return
         self.last_poll = time.monotonic()
         busy = {self.store.session(sid).workspace.path for sid in self.active}
-        for row in self.store.db.execute("SELECT * FROM mutation_workspaces").fetchall():
+        for row in self.store.records.select("mutation_workspaces"):
             if row["path"] in busy:
                 continue
             context = ToolContext(
@@ -451,9 +451,7 @@ class MutationObserver:
         self.store.update(context.session_id, paused=True, runnable=False)
 
     def recover(self):
-        for row in self.store.db.execute(
-            "SELECT * FROM mutation_windows WHERE status='open'"
-        ).fetchall():
+        for row in self.store.records.select("mutation_windows", status="open"):
             context = ToolContext(
                 self.runtime, row["session_id"], row["action_id"], row["source_event"]
             )

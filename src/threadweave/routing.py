@@ -1,7 +1,6 @@
 """Explicit fixed/role routing; every choice has inspectable inputs and reasons."""
 
 from .models import new_id, now
-from .storage import encode
 
 
 def route(store, sid, role="agent", *, context_size=0, expected_tools=True, latency="normal"):
@@ -30,8 +29,9 @@ def route(store, sid, role="agent", *, context_size=0, expected_tools=True, late
         "policy": config.routing.policy,
     }
     identifier = new_id()
-    store.db.execute(
-        "INSERT INTO routing_decisions VALUES(?,?,?,?)", (identifier, sid, now(), encode(decision))
+    store.records.insert(
+        "routing_decisions",
+        {"id": identifier, "session_id": sid, "created_at": now(), "body": decision},
     )
     store.event(sid, "model_routing", {"decision_id": identifier, **decision})
     return provider

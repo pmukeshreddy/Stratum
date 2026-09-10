@@ -286,7 +286,7 @@ def test_index_preserved_mtime_and_corrupt_metadata(tmp_path, repository):
         path.write_text(path.read_text().replace("add", "sum"))
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         assert index.definition("sum")["matches"]
-        store.db.execute("UPDATE repository_files SET body='broken' WHERE path='mathops.py'")
+        store.records.update("repository_files", {"body": "broken"}, path="mathops.py")
         index.refresh()
         assert index.outline("mathops.py")["symbols"]
     finally:

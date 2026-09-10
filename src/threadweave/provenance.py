@@ -1,46 +1,45 @@
 """Durable logical requests and transport attempts on the Store's transaction boundary."""
 
 import hashlib
-import json
 
 from .models import Usage, now
 
 
 class RequestHistory:
     def last_request(self, sid, *, purpose=None, trajectory=False):
-        clause = " AND purpose=?" if purpose else ""
-        args = (sid, purpose) if purpose else (sid,)
+        match = {"session_id": sid, "status": "completed"}
+        if purpose:
+            match["purpose"] = purpose
         if trajectory:
-            clause += " AND request_kind='trajectory'"
-        row = self.db.execute(
-            "SELECT id FROM model_requests WHERE session_id=? AND status='completed'"
-            + clause
-            + " ORDER BY ended_at DESC,rowid DESC LIMIT 1",
-            args,
-        ).fetchone()
-        return row[0] if row else None
+            match["request_kind"] = "trajectory"
+        row = self.records.first(
+            "model_requests", order=(("ended_at", True), ("_order", True)), **match
+        )
+        return row["id"] if row else None
 
     def queue_request_edge(self, sid, source, kind):
         if source:
-            self.db.execute(
-                "INSERT OR IGNORE INTO pending_request_edges VALUES(?,?,?)", (sid, source, kind)
+            self.records.insert(
+                "pending_request_edges",
+                {"session_id": sid, "source": source, "kind": kind},
+                on_conflict="ignore",
             )
 
     def commit_compaction(self, sid, request_id):
         if self.last_request(sid, trajectory=True) != request_id:
             return
-        for edge in self.db.execute(
-            "SELECT source,kind FROM pending_request_edges WHERE session_id=?", (sid,)
-        ).fetchall():
-            self.db.execute(
-                "DELETE FROM request_edges WHERE source=? AND target=? AND kind='continuation'",
-                (edge["source"], request_id),
+        for edge in self.records.select(
+            "pending_request_edges", session_id=sid, fields=("source", "kind")
+        ):
+            self.records.delete(
+                "request_edges", source=edge["source"], target=request_id, kind="continuation"
             )
-            self.db.execute(
-                "INSERT OR IGNORE INTO request_edges VALUES(?,?,?)",
-                (edge["source"], request_id, edge["kind"]),
+            self.records.insert(
+                "request_edges",
+                {"source": edge["source"], "target": request_id, "kind": edge["kind"]},
+                on_conflict="ignore",
             )
-        self.db.execute("DELETE FROM pending_request_edges WHERE session_id=?", (sid,))
+        self.records.delete("pending_request_edges", session_id=sid)
         self.queue_request_edge(sid, request_id, "compaction")
 
     def begin_request(self, request, artifact):
@@ -51,8 +50,8 @@ class RequestHistory:
         if request.request_kind == "trajectory" and purpose == "agent":
             inbound = [
                 dict(r)
-                for r in self.db.execute(
-                    "SELECT source,kind FROM pending_request_edges WHERE session_id=?", (sid,)
+                for r in self.records.select(
+                    "pending_request_edges", session_id=sid, fields=("source", "kind")
                 )
             ]
             parent = self.session(sid).spawned_by_request_id
@@ -73,113 +72,105 @@ class RequestHistory:
             **projection(request.messages, request.tools, request.config),
         }
         fingerprint = hashlib.sha256(encode(body).encode()).hexdigest()
-        self.db.execute(
-            "INSERT INTO model_requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                request.request_id,
-                sid,
-                purpose,
-                fingerprint,
-                artifact,
-                request.config.name,
-                request.config.model,
-                "running",
-                now(),
-                None,
-                None,
-                encode(inbound),
-                request.request_kind,
-            ),
+        self.records.insert(
+            "model_requests",
+            {
+                "id": request.request_id,
+                "session_id": sid,
+                "purpose": purpose,
+                "body_hash": fingerprint,
+                "body_artifact": artifact,
+                "provider": request.config.name,
+                "model": request.config.model,
+                "status": "running",
+                "started_at": now(),
+                "ended_at": None,
+                "response_event": None,
+                "inbound": inbound,
+                "request_kind": request.request_kind,
+            },
         )
 
     def finish_request_attempt(
         self, request_id, event_id, usage, *, response_event=None, failure=None, retry=False
     ):
-        from .storage import encode
 
         status = "completed" if response_event else "failed"
-        self.db.execute(
-            "UPDATE model_attempts SET status=?,usage=?,failure=?,ended_at=? WHERE event_id=?",
-            (
-                status,
-                encode(usage.model_dump()),
-                encode(failure) if failure else None,
-                now(),
-                event_id,
-            ),
+        self.records.update(
+            "model_attempts",
+            {
+                "status": status,
+                "usage": usage.model_dump(),
+                "failure": (failure if failure else None),
+                "ended_at": now(),
+            },
+            event_id=event_id,
         )
-        self.db.execute(
-            "UPDATE model_requests SET status=?,ended_at=?,response_event=? WHERE id=?",
-            ("retrying" if retry else status, None if retry else now(), response_event, request_id),
+        self.records.update(
+            "model_requests",
+            {
+                "status": "retrying" if retry else status,
+                "ended_at": None if retry else now(),
+                "response_event": response_event,
+            },
+            id=request_id,
         )
         if response_event:
-            row = self.db.execute(
-                "SELECT * FROM model_requests WHERE id=?", (request_id,)
-            ).fetchone()
-            for edge in json.loads(row["inbound"]):
-                self.db.execute(
-                    "INSERT OR IGNORE INTO request_edges VALUES(?,?,?)",
-                    (edge["source"], request_id, edge["kind"]),
+            row = self.records.first("model_requests", id=request_id)
+            for edge in row["inbound"]:
+                self.records.insert(
+                    "request_edges",
+                    {"source": edge["source"], "target": request_id, "kind": edge["kind"]},
+                    on_conflict="ignore",
                 )
                 if row["purpose"] == "agent":
-                    self.db.execute(
-                        "DELETE FROM pending_request_edges WHERE session_id=? AND source=? AND kind=?",
-                        (row["session_id"], edge["source"], edge["kind"]),
+                    self.records.delete(
+                        "pending_request_edges",
+                        session_id=row["session_id"],
+                        source=edge["source"],
+                        kind=edge["kind"],
                     )
 
     def request_history(self, sid, *, kind=None):
         """All durable model calls, including auxiliary inference and transport attempts."""
-        root = self.session(sid).root_id
-        clause = " AND r.request_kind=?" if kind else ""
-        requests = [
-            dict(r)
-            for r in self.db.execute(
-                "SELECT r.* FROM model_requests r JOIN sessions s ON s.id=r.session_id WHERE s.root_id=?"
-                + clause
-                + " ORDER BY r.started_at,r.rowid",
-                (root, kind) if kind else (root,),
-            )
-        ]
+        sessions = {s.id for s in self.sessions(root_id=self.session(sid).root_id)}
+        requests = self.records.select(
+            "model_requests",
+            where=lambda row: (
+                row["session_id"] in sessions and (kind is None or row["request_kind"] == kind)
+            ),
+            order=(("started_at", False), ("_order", False)),
+        )
         for request in requests:
-            request["inbound"] = json.loads(request["inbound"])
-            request["attempts"] = [
-                dict(r)
-                for r in self.db.execute(
-                    "SELECT * FROM model_attempts WHERE request_id=? ORDER BY attempt",
-                    (request["id"],),
-                )
-            ]
-            for attempt in request["attempts"]:
-                attempt["usage"] = json.loads(attempt["usage"])
-                attempt["failure"] = json.loads(attempt["failure"]) if attempt["failure"] else None
+            request["attempts"] = self.records.select(
+                "model_attempts", request_id=request["id"], order=(("attempt", False),)
+            )
         return requests
 
     def request_graph(self, sid):
-        """The primary agent/compaction trajectory; auxiliary accounting is in request_history."""
-        root = self.session(sid).root_id
+        """Primary agent/compaction trajectory; auxiliary accounting is in request_history."""
         requests = self.request_history(sid, kind="trajectory")
-        edges = [
-            dict(r)
-            for r in self.db.execute(
-                "SELECT e.* FROM request_edges e JOIN model_requests r ON r.id=e.target "
-                "JOIN model_requests source ON source.id=e.source JOIN sessions s ON s.id=r.session_id "
-                "WHERE s.root_id=? AND r.request_kind='trajectory' AND source.request_kind='trajectory' "
-                "ORDER BY r.started_at,e.source,e.kind",
-                (root,),
+        by_id = {row["id"]: row for row in requests}
+        sources = {
+            row["id"]
+            for row in self.records.select(
+                "model_requests", request_kind="trajectory", fields=("id",)
             )
-        ]
+        }
+        edges = self.records.select(
+            "request_edges", where=lambda row: row["source"] in sources and row["target"] in by_id
+        )
+        edges.sort(key=lambda row: (by_id[row["target"]]["started_at"], row["source"], row["kind"]))
         return {"requests": requests, "edges": edges}
 
     def request_usage(self, request_id, *, delegated=False):
-        row = self.db.execute(
-            "SELECT session_id FROM model_requests WHERE id=?", (request_id,)
-        ).fetchone()
+        row = self.records.first("model_requests", id=request_id, fields=("session_id",))
         if not row:
             raise KeyError(request_id)
         ids = {request_id}
         if delegated:
             # Attribute entire descendant lifetimes to the exact spawning request, not siblings.
-            sessions = self.sessions(root_id=self.session(row[0]).root_id)
+            sessions = self.sessions(root_id=self.session(row["session_id"]).root_id)
             selected = set()
             while True:
                 more = {
@@ -191,15 +182,13 @@ class RequestHistory:
                     break
                 selected |= more
                 ids |= {
-                    r[0]
+                    r["id"]
                     for s in selected
-                    for r in self.db.execute(
-                        "SELECT id FROM model_requests WHERE session_id=?", (s,)
-                    )
+                    for r in self.records.select("model_requests", session_id=s, fields=("id",))
                 }
         total = Usage().model_dump()
         for rid in ids:
-            for r in self.db.execute("SELECT usage FROM model_attempts WHERE request_id=?", (rid,)):
-                for key, value in json.loads(r[0]).items():
+            for r in self.records.select("model_attempts", request_id=rid, fields=("usage",)):
+                for key, value in r["usage"].items():
                     total[key] = None if value is None or total[key] is None else total[key] + value
         return Usage(**total)

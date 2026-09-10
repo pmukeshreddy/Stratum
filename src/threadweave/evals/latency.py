@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 from collections import Counter, defaultdict
+from contextlib import closing
 from pathlib import Path
+
+from threadweave.file_store import FileStore
 
 
 def covered(intervals):
@@ -20,15 +22,14 @@ def covered(intervals):
 
 def profile(directory):
     directory = Path(directory)
-    with sqlite3.connect(f"file:{directory / 'state/history.sqlite3'}?mode=ro", uri=True) as db:
-        db.row_factory = sqlite3.Row
-        sessions = {r["id"]: json.loads(r["body"]) for r in db.execute("SELECT * FROM sessions")}
+    with closing(FileStore(directory / "state")) as records:
+        sessions = {r["id"]: r["body"] for r in records.select("sessions")}
         root = next(s for s in sessions.values() if not s["parent_id"])
-        events = {r["id"]: dict(r) for r in db.execute("SELECT * FROM events ORDER BY seq")}
+        events = {r["id"]: dict(r) for r in records.select("events", order=(("seq", False),))}
         start = min(e["timestamp"] for e in events.values())
         stop = max(e["timestamp"] for e in events.values())
         intervals, calls = defaultdict(list), []
-        for r in db.execute("SELECT * FROM model_requests ORDER BY started_at"):
+        for r in records.select("model_requests", order=(("started_at", False),)):
             end = r["ended_at"] or stop
             session = sessions[r["session_id"]]
             kind = (
@@ -39,12 +40,10 @@ def profile(directory):
                 else "root_model"
             )
             intervals[kind].append((r["started_at"], end))
-            artifact = db.execute(
-                "SELECT path FROM artifacts WHERE id=?", (r["body_artifact"],)
-            ).fetchone()
-            body = json.loads((directory / "state" / artifact[0]).read_text())
+            artifact = records.first("artifacts", id=r["body_artifact"])
+            body = json.loads((directory / "state" / artifact["path"]).read_text())
             event = events.get(r["response_event"])
-            response = json.loads(event["payload"]) if event else {}
+            response = event["payload"] if event else {}
             calls.append(
                 {
                     "request_id": r["id"],
@@ -60,7 +59,7 @@ def profile(directory):
                     "output_characters": len(response.get("text", "")),
                 }
             )
-        for a in db.execute("SELECT * FROM actions"):
+        for a in records.select("actions"):
             if a["source_event"] in events and a["result_event"] in events:
                 kind = "root_actions" if a["session_id"] == root["id"] else "child_actions"
                 intervals[kind].append(
@@ -90,7 +89,7 @@ def profile(directory):
                 "context_compaction",
                 "child_evidence_used",
             }:
-                payload = json.loads(e["payload"])
+                payload = e["payload"]
                 boundaries.append(
                     {
                         "seconds": round(e["timestamp"] - start, 3),

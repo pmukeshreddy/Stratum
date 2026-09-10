@@ -129,19 +129,29 @@ class AuxiliaryServices:
             # still fits. Near a wall deadline it can cost the final useful
             # action and synthesis, then require rereading retired evidence.
             root = self.store.session(session.root_id)
-            agent_durations = self.store.db.execute(
-                "SELECT ended_at-started_at FROM model_requests WHERE session_id=? "
-                "AND purpose='agent' AND status='completed' ORDER BY started_at DESC LIMIT 8",
-                (root.id,),
-            ).fetchall()
-            continuation = max(1, 2.5 * max((r[0] for r in agent_durations), default=30))
+            agent_durations = self.store.records.select(
+                "model_requests",
+                session_id=root.id,
+                purpose="agent",
+                status="completed",
+                order=(("started_at", True),),
+                limit=8,
+            )
+            continuation = max(
+                1, 2.5 * max((r["ended_at"] - r["started_at"] for r in agent_durations), default=30)
+            )
             remaining = self.store.config(root.id).limits.wall_seconds - self._elapsed(root.id)
-            durations = self.store.db.execute(
-                "SELECT ended_at-started_at FROM model_requests WHERE session_id=? "
-                "AND purpose='compaction' AND status='completed' ORDER BY started_at DESC LIMIT 8",
-                (sid,),
-            ).fetchall()
-            estimate = max((r[0] for r in durations), default=continuation)
+            durations = self.store.records.select(
+                "model_requests",
+                session_id=sid,
+                purpose="compaction",
+                status="completed",
+                order=(("started_at", True),),
+                limit=8,
+            )
+            estimate = max(
+                (r["ended_at"] - r["started_at"] for r in durations), default=continuation
+            )
             if remaining < estimate + continuation + 5:
                 self.store.event(
                     sid,

@@ -258,10 +258,19 @@ async def test_followup_cannot_revive_ineligible_or_reset_budget(tmp_path, pytho
             runtime.store.finish(root.id, Outcome(blocked.removeprefix("root_")))
         elif blocked in {"goal", "ancestor_goal"}:
             sid = child.id if blocked == "goal" else root.id
-            runtime.store.db.execute(
-                "INSERT INTO goals VALUES(?,?,?,?,?)", (sid, "goal", "completed", 0, 0)
+            runtime.store.records.insert(
+                "goals",
+                {
+                    "session_id": sid,
+                    "objective": "goal",
+                    "status": "completed",
+                    "created_at": 0,
+                    "updated_at": 0,
+                },
             )
-            runtime.store.db.execute("INSERT INTO goal_budgets VALUES(?,?,?)", (sid, 25, 0))
+            runtime.store.records.insert(
+                "goal_budgets", {"session_id": sid, "token_budget": 25, "starting_tokens": 0}
+            )
         elif blocked == "turns":
             runtime.store.charge(root.id, Usage(turns=python_config.limits.max_turns))
         elif blocked == "tokens":

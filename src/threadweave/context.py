@@ -213,7 +213,6 @@ class Context:
     def __init__(self, store: Store, environment=None):
         self.store = store
         self.environment = environment
-        self._export_cursors = {}
         self._harness_context_ready = set()
         self._pending_harness_digest = {}
         self.unpersisted_refinement_messages = {}
@@ -248,9 +247,11 @@ class Context:
         children = {s.id for s in self.store.sessions() if s.parent_id == sid}
         visible = encode(messages)
         evidence = {}
-        for row in self.store.db.execute(
-            "SELECT sender_id,source_event FROM messages WHERE recipient_id=? AND received_at IS NOT NULL",
-            (sid,),
+        for row in self.store.records.select(
+            "messages",
+            where=lambda row: row["received_at"] is not None,
+            recipient_id=sid,
+            fields=("sender_id", "source_event"),
         ):
             if row["sender_id"] in children and row["source_event"] in visible:
                 evidence.setdefault(row["sender_id"], []).append(row["source_event"])
@@ -270,28 +271,9 @@ class Context:
         }
 
     def history_file(self, sid):
-        """Materialized, readable conversation/event log; SQLite remains authoritative.
-
-        Append only newly committed events between turns. A runtime restart rebuilds
-        this disposable projection, never the original trajectory.
-        """
-        from .artifacts import atomic_write
-
-        directory = self.store.directory / "session_logs" / sid
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path = directory / "messages.jsonl"
-        if sid not in self._export_cursors:
-            atomic_write(path, b"")
-            self._export_cursors[sid] = 0
-        rows = self.store.db.execute(
-            "SELECT seq,payload,type,id,timestamp FROM events WHERE session_id=? AND seq>? ORDER BY seq",
-            (sid, self._export_cursors[sid]),
-        )
-        with path.open("a", encoding="utf-8") as stream:
-            for row in rows:
-                stream.write(encode({**dict(row), "payload": json.loads(row["payload"])}) + "\n")
-                self._export_cursors[sid] = row["seq"]
-        return path
+        """The authoritative event log, written at commit time and read directly by tools."""
+        self.store.session(sid)
+        return self.store.records.history_path(sid)
 
     def system_prompt(self, sid):
         from .skills import refine_skill
@@ -568,15 +550,13 @@ class Context:
                 message = dict(source)
                 event = message.get("provider_response_event")
                 if event:
-                    row = self.store.db.execute(
-                        "SELECT * FROM provider_continuations WHERE event_id=?", (event,)
-                    ).fetchone()
+                    row = self.store.records.first("provider_continuations", event_id=event)
                     config = self.store.config(sid)
                     if row and any(
                         p.name == row["provider"] and p.model == row["model"]
                         for p in [config.provider, *config.models.values()]
                     ):
-                        message["provider_items"] = json.loads(row["items"])
+                        message["provider_items"] = row["items"]
                         message["provider_identity"] = [row["provider"], row["model"]]
                 messages.append(message)
         if self.environment:
@@ -721,15 +701,15 @@ class Context:
                     - estimate(summary, self.store.config(sid).provider.model),
                 },
             )
-            self.store.db.execute(
-                "INSERT INTO compactions VALUES(?,?,?,?,?)",
-                (
-                    eid,
-                    sid,
-                    encode(source_events),
-                    summary,
-                    self.store.event_by_id(eid)["timestamp"],
-                ),
+            self.store.records.insert(
+                "compactions",
+                {
+                    "id": eid,
+                    "session_id": sid,
+                    "source_events": source_events,
+                    "summary": summary,
+                    "created_at": self.store.event_by_id(eid)["timestamp"],
+                },
             )
             self.store.update(
                 sid,
@@ -739,11 +719,11 @@ class Context:
                 summary_timestamp=now(),
             )
             if provenance:
-                request = self.store.db.execute(
-                    "SELECT id FROM model_requests WHERE response_event=?", (provenance,)
-                ).fetchone()
+                request = self.store.records.first(
+                    "model_requests", response_event=provenance, fields=("id",)
+                )
                 if request:
-                    self.store.commit_compaction(sid, request[0])
+                    self.store.commit_compaction(sid, request["id"])
             if review_checkpoint and self.on_compact:
                 self.on_compact(sid)
             return eid

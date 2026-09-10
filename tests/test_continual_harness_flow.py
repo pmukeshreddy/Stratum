@@ -80,7 +80,7 @@ async def test_root_schedules_learns_continues_resumes_and_auto_reviews(tmp_path
         state_path = runtime.store.harness.path(root.id) / "harness_state.json"
         history_path = state_path.with_name("refinements.jsonl")
         assert json.loads(state_path.read_text())["entries"]["memory"]["lesson"]
-        assert not history_path.exists()
+        assert history_path.exists()
         assert len(runtime.store.refinement_history(root.id)) == 1
         assert provider.peak == 1
         events = runtime.store.events(root.id, limit=100)

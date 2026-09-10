@@ -17,9 +17,11 @@ def related(context, files=(), symbols=(), tier="related", limit=20):
     files = sorted(set(files) | {m["path"] for m in symbol_definitions})
     entries = [
         dict(r)
-        for r in context.runtime.store.db.execute(
-            "SELECT path,language FROM repository_files WHERE workspace=? AND (path LIKE '%test%' OR path LIKE '%spec%')",
-            (str(index.root),),
+        for r in context.runtime.store.records.select(
+            "repository_files",
+            workspace=str(index.root),
+            where=lambda row: "test" in row["path"].lower() or "spec" in row["path"].lower(),
+            fields=("path", "language"),
         )
     ]
     names = {Path(p).stem for p in files} | {s.split(".")[-1] for s in symbols}
@@ -37,9 +39,11 @@ def related(context, files=(), symbols=(), tier="related", limit=20):
             for m in symbol_definitions
             if m["path"] == path
         ]
-        for row in context.runtime.store.db.execute(
-            "SELECT test_id,line,source FROM test_coverage WHERE workspace=? AND path=?",
-            (str(index.root), path),
+        for row in context.runtime.store.records.select(
+            "test_coverage",
+            workspace=str(index.root),
+            path=path,
+            fields=("test_id", "line", "source"),
         ):
             if ranges and not any(start <= row["line"] <= end for start, end in ranges):
                 continue
@@ -72,12 +76,12 @@ def related(context, files=(), symbols=(), tier="related", limit=20):
             path = row["path"]
             if not is_test(path):
                 continue
-            if (
-                row["language"] == "python"
-                and not context.runtime.store.db.execute(
-                    "SELECT 1 FROM code_evidence WHERE workspace=? AND path=? AND kind='symbols' AND short_name GLOB 'test*' LIMIT 1",
-                    (str(index.root), path),
-                ).fetchone()
+            if row["language"] == "python" and not context.runtime.store.records.first(
+                "code_evidence",
+                workspace=str(index.root),
+                path=path,
+                kind="symbols",
+                where=lambda row: row["short_name"].startswith("test"),
             ):
                 # Fixtures/helpers are dependency evidence, not executable test
                 # selectors. Explicit prior failures/coverage remain eligible.
@@ -145,16 +149,19 @@ def import_coverage(context, path):
     store = context.runtime.store
     with store.transaction():
         for filename in {r[0] for r in records}:
-            store.db.execute(
-                "DELETE FROM test_coverage WHERE workspace=? AND path=?",
-                (context.session.workspace.path, filename),
+            store.records.delete(
+                "test_coverage", workspace=context.session.workspace.path, path=filename
             )
-        store.db.executemany(
-            "INSERT OR REPLACE INTO test_coverage VALUES(?,?,?,?,?)",
+        store.records.insert_many(
+            "test_coverage",
             [
-                (context.session.workspace.path, test, file, line, artifact)
-                for file, line, test in records
+                dict(zip(("workspace", "test_id", "path", "line", "source"), values, strict=True))
+                for values in [
+                    (context.session.workspace.path, test, file, line, artifact)
+                    for file, line, test in records
+                ]
             ],
+            on_conflict="replace",
         )
         store.event(
             context.session_id,

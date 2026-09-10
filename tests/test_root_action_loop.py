@@ -2,12 +2,14 @@
 
 import asyncio
 import json
-import sqlite3
+from collections import Counter
+from contextlib import closing
 
 import pytest
 
 from threadweave.evals.harness import run_buffalo
 from threadweave.evals.root_loop_validation import validation_config
+from threadweave.file_store import FileStore
 from threadweave.gitops import git
 from threadweave.models import Action, ModelResponse, Usage
 
@@ -165,8 +167,8 @@ async def test_root_actions_run_without_feature_completion_requirements(
         "Action patterns:",
     ]
     assert [foundation.index(m) for m in markers] == sorted(foundation.index(m) for m in markers)
-    with sqlite3.connect(directory / "state/history.sqlite3") as db:
-        counts = dict(db.execute("SELECT type,count(*) FROM events GROUP BY type"))
+    with closing(FileStore(directory / "state")) as records:
+        counts = Counter(row["type"] for row in records.select("events"))
         if scenario == "trivial":
             assert counts.get("python_execution", 0) == counts.get("rlm_admitted", 0) == 0
         if scenario == "inspect":

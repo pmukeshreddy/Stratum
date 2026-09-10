@@ -3,7 +3,6 @@
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -103,12 +102,23 @@ def doctor(directory, config=None, *, subscription_status=None):
     else:
         issues.append("No provider configuration supplied; use doctor --config PATH")
     health = "not_created"
-    database = directory / "history.sqlite3"
-    if database.exists():
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as db:
-            health = db.execute("PRAGMA quick_check").fetchone()[0]
-        if health != "ok":
-            issues.append("Database quick_check failed")
+    manifest = directory / "store.json"
+    if manifest.exists():
+        try:
+            from .file_store import FileStore
+
+            store = FileStore(directory)
+            try:
+                for collection in (directory / "records").iterdir():
+                    if collection.is_dir():
+                        store.select(collection.name)
+                store.select("events")
+                health = "ok"
+            finally:
+                store.close()
+        except (ValueError, OSError) as exc:
+            health = "invalid"
+            issues.append(f"File-store validation failed: {exc}")
     if not capabilities["git"] and config and config.task.adapter == "coding":
         issues.append("Git is required for coding tasks")
     if directory.exists() and not os.access(directory, os.W_OK):
@@ -118,7 +128,7 @@ def doctor(directory, config=None, *, subscription_status=None):
         "providers": providers,
         "capabilities": capabilities,
         "data": str(directory),
-        "database_health": health,
+        "storage_health": health,
         "issues": issues,
         "local_execution": "trusted-host execution, not a sandbox",
     }

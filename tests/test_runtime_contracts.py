@@ -1,4 +1,4 @@
-"""Runtime contracts exercised through real turns, tools and durable SQLite state."""
+"""Runtime contracts exercised through real turns, tools and durable JSON/JSONL state."""
 
 import asyncio
 import json
@@ -192,9 +192,9 @@ async def test_request_graph_spawn_return_retries_usage_and_restart(tmp_path, co
     async def retry(request):
         attempts.append(request.request_id)
         assert (
-            runtime.store.db.execute(
-                "SELECT status FROM model_requests WHERE id=?", (request.request_id,)
-            ).fetchone()[0]
+            runtime.store.records.first(
+                "model_requests", id=request.request_id, fields=("status",)
+            )["status"]
             == "running"
         )
         if len(attempts) == 1:
@@ -464,9 +464,9 @@ async def test_chat_wire_retry_identity_is_durable_before_transmission(tmp_path,
         identifier = request.headers["Idempotency-Key"]
         assert request.headers["X-Client-Request-Id"] == identifier
         assert (
-            runtime.store.db.execute(
-                "SELECT status FROM model_requests WHERE id=?", (identifier,)
-            ).fetchone()[0]
+            runtime.store.records.first("model_requests", id=identifier, fields=("status",))[
+                "status"
+            ]
             == "running"
         )
         wire.append((identifier, request.content))
@@ -510,17 +510,17 @@ async def test_shared_coding_child_preserves_original_baseline_after_parent_edit
     try:
         parent = runtime.create("fix arithmetic", repository, config=coding_config)
         await runtime.environment.prepare(parent.id)
-        original = runtime.store.db.execute(
-            "SELECT body FROM coding_baselines WHERE session_id=?", (parent.id,)
-        ).fetchone()[0]
+        original = runtime.store.records.first(
+            "coding_baselines", session_id=parent.id, fields=("body",)
+        )["body"]
         (repository / "mathops.py").write_text(
             "def add(a, b):\n    return a + b\n\ndef twice(value):\n    return add(value, value)\n"
         )
         child = runtime.spawn(parent.id, "inspect and verify current fix", isolate=False)
         await runtime.environment.prepare(child.id)
-        inherited = runtime.store.db.execute(
-            "SELECT body FROM coding_baselines WHERE session_id=?", (child.id,)
-        ).fetchone()[0]
+        inherited = runtime.store.records.first(
+            "coding_baselines", session_id=child.id, fields=("body",)
+        )["body"]
         assert inherited == original
         assert runtime.store.config(child.id).task.require_verifier
         assert coding_options(runtime.store.config(child.id).task).protect_tests

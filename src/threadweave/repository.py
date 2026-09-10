@@ -13,7 +13,6 @@ import subprocess
 from pathlib import Path
 
 from .change_tracking import ChangeTracker, expand_paths
-from .storage import encode
 from .syntax_index import parse as parse_syntax
 
 EXCLUDED = {
@@ -207,25 +206,20 @@ class RepositoryIndex:
             if set(Path(relative).parts) & EXCLUDED:
                 continue
             path = confined(self.root, relative, allowed=self.allowed, forbidden=self.forbidden)
-            old = self.store.db.execute(
-                "SELECT * FROM repository_files WHERE workspace=? AND path=?",
-                (str(self.root), relative),
-            ).fetchone()
+            old = self.store.records.first(
+                "repository_files", workspace=str(self.root), path=relative
+            )
             if not path.is_file() or path.is_symlink() or path.stat().st_size > 2_000_000:
                 if old:
                     changed.append(relative)
-                self.store.db.execute(
-                    "DELETE FROM code_evidence WHERE workspace=? AND path=?",
-                    (str(self.root), relative),
-                )
-                self.store.db.execute(
-                    "DELETE FROM repository_files WHERE workspace=? AND path=?",
-                    (str(self.root), relative),
+                self.store.records.delete("code_evidence", workspace=str(self.root), path=relative)
+                self.store.records.delete(
+                    "repository_files", workspace=str(self.root), path=relative
                 )
                 continue
             stat = path.stat()
             try:
-                old_body = json.loads(old["body"]) if old else {}
+                old_body = old["body"] if old else {}
                 indexed = old and "quality" in old_body
             except (ValueError, TypeError):
                 indexed = False  # Disposable corrupt index row is rebuilt, not trajectory data.
@@ -239,22 +233,20 @@ class RepositoryIndex:
                 continue
             raw = path.read_bytes()
             if b"\0" in raw:
-                self.store.db.execute(
-                    "DELETE FROM repository_files WHERE workspace=? AND path=?",
-                    (str(self.root), relative),
+                self.store.records.delete(
+                    "repository_files", workspace=str(self.root), path=relative
                 )
-                self.store.db.execute(
-                    "DELETE FROM code_evidence WHERE workspace=? AND path=?",
-                    (str(self.root), relative),
-                )
+                self.store.records.delete("code_evidence", workspace=str(self.root), path=relative)
                 continue
             text = raw.decode(errors="replace")
             language = LANGUAGES.get(path.suffix, "text")
             if old and indexed and old["sha256"] == digest(raw) and old["language"] == language:
                 old_body["stat_identity"] = [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
-                self.store.db.execute(
-                    "UPDATE repository_files SET mtime_ns=?,size=?,body=? WHERE workspace=? AND path=?",
-                    (stat.st_mtime_ns, stat.st_size, encode(old_body), str(self.root), relative),
+                self.store.records.update(
+                    "repository_files",
+                    {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "body": old_body},
+                    workspace=str(self.root),
+                    path=relative,
                 )
                 continue
             body = (
@@ -264,54 +256,73 @@ class RepositoryIndex:
             )
             body.setdefault("quality", "lexical" if self.enhanced else "disabled")
             body["stat_identity"] = [stat.st_dev, stat.st_ino, stat.st_ctime_ns]
-            self.store.db.execute(
-                "INSERT OR REPLACE INTO repository_files VALUES(?,?,?,?,?,?,?)",
-                (
-                    str(self.root),
-                    relative,
-                    stat.st_mtime_ns,
-                    stat.st_size,
-                    digest(raw),
-                    language,
-                    encode(body),
-                ),
+            self.store.records.insert(
+                "repository_files",
+                {
+                    "workspace": str(self.root),
+                    "path": relative,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "sha256": digest(raw),
+                    "language": language,
+                    "body": body,
+                },
+                on_conflict="replace",
             )
             changed.append(relative)
-            self.store.db.execute(
-                "DELETE FROM code_evidence WHERE workspace=? AND path=?", (str(self.root), relative)
-            )
+            self.store.records.delete("code_evidence", workspace=str(self.root), path=relative)
             for kind in ("symbols", "references", "calls", "imports", "inheritance"):
-                self.store.db.executemany(
-                    "INSERT INTO code_evidence VALUES(?,?,?,?,?,?,?)",
+                self.store.records.insert_many(
+                    "code_evidence",
                     [
-                        (
-                            str(self.root),
-                            relative,
-                            kind,
-                            item.get("name") or item.get("module") or item.get("text", ""),
-                            item.get("enclosing"),
-                            encode(item),
-                            (item.get("short_name") or item.get("name") or item.get("module") or "")
-                            .split(".")[-1]
-                            .split("::")[-1],
+                        dict(
+                            zip(
+                                (
+                                    "workspace",
+                                    "path",
+                                    "kind",
+                                    "name",
+                                    "enclosing",
+                                    "body",
+                                    "short_name",
+                                ),
+                                values,
+                                strict=True,
+                            )
                         )
-                        for item in body.get(kind, [])
+                        for values in [
+                            (
+                                str(self.root),
+                                relative,
+                                kind,
+                                item.get("name") or item.get("module") or item.get("text", ""),
+                                item.get("enclosing"),
+                                item,
+                                (
+                                    item.get("short_name")
+                                    or item.get("name")
+                                    or item.get("module")
+                                    or ""
+                                )
+                                .split(".")[-1]
+                                .split("::")[-1],
+                            )
+                            for item in body.get(kind, [])
+                        ]
                     ],
                 )
         if full:
             keep = set(paths)
-            for row in self.store.db.execute(
-                "SELECT path FROM repository_files WHERE workspace=?", (str(self.root),)
-            ).fetchall():
-                if row[0] not in keep:
-                    changed.append(row[0])
-                    self.store.db.execute(
-                        "DELETE FROM code_evidence WHERE workspace=? AND path=?",
-                        (str(self.root), row[0]),
+            for row in self.store.records.select(
+                "repository_files", workspace=str(self.root), fields=("path",)
+            ):
+                if row["path"] not in keep:
+                    changed.append(row["path"])
+                    self.store.records.delete(
+                        "code_evidence", workspace=str(self.root), path=row["path"]
                     )
-                    self.store.db.execute(
-                        "DELETE FROM repository_files WHERE workspace=? AND path=?",
-                        (str(self.root), row[0]),
+                    self.store.records.delete(
+                        "repository_files", workspace=str(self.root), path=row["path"]
                     )
         if full and not self.initialized:
             self.resolver.configure()
@@ -327,8 +338,8 @@ class RepositoryIndex:
         self.ensure_current()
         return [
             dict(row)
-            for row in self.store.db.execute(
-                "SELECT * FROM repository_files WHERE workspace=? ORDER BY path", (str(self.root),)
+            for row in self.store.records.select(
+                "repository_files", workspace=str(self.root), order=(("path", False),)
             )
         ]
 
@@ -351,12 +362,12 @@ class RepositoryIndex:
             .as_posix()
         )
         self.refresh([path])
-        row = self.store.db.execute(
-            "SELECT body FROM repository_files WHERE workspace=? AND path=?", (str(self.root), path)
-        ).fetchone()
+        row = self.store.records.first(
+            "repository_files", workspace=str(self.root), path=path, fields=("body",)
+        )
         if not row:
             raise ValueError("File is absent, binary, or exceeds the 2 MB indexing limit")
-        return {"path": path, **json.loads(row[0])}
+        return {"path": path, **row["body"]}
 
     def symbol_search(self, query, *, limit=100):
         return self.evidence("symbols", query, limit=limit)
@@ -364,25 +375,39 @@ class RepositoryIndex:
     def evidence(self, kind, query="", *, limit=20, owner=False):
         self.ensure_current()
         field = "enclosing" if owner else "name"
-        rows = self.store.db.execute(
-            f"SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND {field}=? ORDER BY path LIMIT ?",
-            (str(self.root), kind, query, min(200, limit)),
-        ).fetchall()
+        rows = self.store.records.select(
+            "code_evidence",
+            workspace=str(self.root),
+            kind=kind,
+            where=lambda row: row[field] == query,
+            order=(("path", False),),
+            limit=min(200, limit),
+            fields=("path", "body", "name"),
+        )
         if not rows and not owner:
-            rows = self.store.db.execute(
-                "SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND short_name=? ORDER BY path LIMIT ?",
-                (str(self.root), kind, query, min(200, limit)),
-            ).fetchall()
+            rows = self.store.records.select(
+                "code_evidence",
+                workspace=str(self.root),
+                kind=kind,
+                short_name=query,
+                order=(("path", False),),
+                limit=min(200, limit),
+                fields=("path", "body", "name"),
+            )
         if not rows:
-            rows = self.store.db.execute(
-                f"SELECT path,body,name FROM code_evidence WHERE workspace=? AND kind=? AND {field} LIKE ? LIMIT ?",
-                (str(self.root), kind, "%" + query + "%", min(200, limit)),
-            ).fetchall()
+            rows = self.store.records.select(
+                "code_evidence",
+                workspace=str(self.root),
+                kind=kind,
+                where=lambda row: query.casefold() in (row[field] or "").casefold(),
+                limit=min(200, limit),
+                fields=("path", "body", "name"),
+            )
         return {
             "matches": [
                 {
                     "path": r["path"],
-                    **json.loads(r["body"]),
+                    **r["body"],
                     "rank_reason": "exact" if r["name"] == query else "name overlap",
                 }
                 for r in rows
@@ -414,9 +439,8 @@ class RepositoryIndex:
         resolved = []
         for definition in definitions:
             short = definition.get("short_name", definition["name"].split(".")[-1])
-            for binding in self.store.db.execute(
-                "SELECT * FROM module_bindings WHERE workspace=? AND target=?",
-                (str(self.root), definition["path"]),
+            for binding in self.store.records.select(
+                "module_bindings", workspace=str(self.root), target=definition["path"]
             ):
                 if binding["symbol"] not in {"", "*", short}:
                     continue
@@ -426,13 +450,18 @@ class RepositoryIndex:
                     else (binding["alias"] + "." + short if binding["alias"] else short)
                 )
                 names = (name, name.replace(".", "::"))
-                for row in self.store.db.execute(
-                    "SELECT body FROM code_evidence WHERE workspace=? AND path=? AND kind=? AND name IN (?,?) LIMIT ?",
-                    (str(self.root), binding["path"], kind, *names, limit),
+                for row in self.store.records.select(
+                    "code_evidence",
+                    workspace=str(self.root),
+                    path=binding["path"],
+                    kind=kind,
+                    where=lambda row, names=names: row["name"] in names,
+                    limit=limit,
+                    fields=("body",),
                 ):
                     resolved.append(
                         {
-                            **json.loads(row[0]),
+                            **row["body"],
                             "path": binding["path"],
                             "symbol_id": definition["symbol_id"],
                             "relationship": "calls" if kind == "calls" else "references",
@@ -580,11 +609,16 @@ class RepositoryIndex:
                     normalized = name.strip("\"'<>").replace("::", "/").replace(".", "/")
                     stem = normalized.split("/")[-1]
                     related.extend(
-                        r[0]
-                        for r in self.store.db.execute(
-                            "SELECT path FROM repository_files WHERE workspace=? AND "
-                            "(path LIKE ? OR path LIKE ? OR path=?) LIMIT 30",
-                            (str(self.root), "%/" + stem + ".%", stem + ".%", name),
+                        r["path"]
+                        for r in self.store.records.select(
+                            "repository_files",
+                            workspace=str(self.root),
+                            where=lambda row, stem=stem, name=name: (
+                                Path(row["path"]).stem.casefold() == stem.casefold()
+                                or row["path"].casefold() == name.casefold()
+                            ),
+                            limit=30,
+                            fields=("path",),
                         )
                     )
         return {
@@ -597,20 +631,18 @@ class RepositoryIndex:
     def dependents(self, path, *, current=True):
         if current:
             self.ensure_current()
+        parent = str(Path(path).parent)
+        targets = {path, "package:" + ("" if parent == "." else parent)}
+        matches = self.store.records.select(
+            "module_bindings",
+            workspace=str(self.root),
+            where=lambda row: row["target"] in targets,
+            fields=("path", "quality"),
+        )
+        unique = {(row["path"], row["quality"]): row for row in matches}
         return {
             "path": path,
-            "matches": [
-                dict(r)
-                for r in self.store.db.execute(
-                    "SELECT DISTINCT path,quality FROM module_bindings WHERE workspace=? AND target IN (?,?) LIMIT 100",
-                    (
-                        str(self.root),
-                        path,
-                        "package:"
-                        + ("" if str(Path(path).parent) == "." else str(Path(path).parent)),
-                    ),
-                )
-            ],
+            "matches": list(unique.values())[:100],
             "quality": "resolved structural module binding",
         }
 

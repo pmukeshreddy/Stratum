@@ -75,7 +75,7 @@ the optional coding capability; candidate patches require explicit acceptance.
 
 `agent_message.send/receive/list_agents` and `agent_observe.get_agent/recent_messages`
 expose programmatic persistent communication/inspection. Parent/child and permitted sibling messages
-are queued in SQLite, timestamped, referenced by events and delivered at boundaries.
+are persisted as JSON records, timestamped, referenced by events and delivered at boundaries.
 Paused or terminated recipients retain messages; terminated sessions need explicit
 resumption. Completed children preserve identity/history/recoverable state.
 Failure reports reach parents without automatically terminating them.
@@ -97,9 +97,12 @@ work; a service manager or opening the CLI restarts the daemon after reboot.
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is stored as session audit events, separate from model conversation.
-Retired SQLite reinforcement tables and import adapters have been removed.
+Global refinement history appends to `DATA/harness/refinements.jsonl`; local
+history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
+`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
+advances. Interrupted writes recover under a process lock. Runtime persistence uses
+JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
+once, with their original database left untouched.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
@@ -132,9 +135,9 @@ MCP, skills, durable state, workspace, forget and remember_recipe are preloaded.
 Full programmatic results can stay in Python. Printing/returning them is explicit
 selection, with bounded capture and full retained artifacts.
 
-SQLite WAL/full synchronization, private artifacts and kernel checkpoints implement
+Synchronized JSON/JSONL commits, private artifacts and kernel checkpoints implement
 L3: events, messages, metadata/tree, contexts, compactions, versions, goals,
-schedules, process handles, action receipts and usage. FTS/history/artifact retrieval is scoped to
+schedules, process handles, action receipts and usage. Lexical history/artifact retrieval is scoped to
 the tree and explicit branch ancestry.
 
 Model compaction works in every environment, with recorded extractive fallback.

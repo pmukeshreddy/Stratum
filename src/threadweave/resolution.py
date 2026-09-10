@@ -31,15 +31,15 @@ def imports(text, language, path):
 
 class Resolver:
     def __init__(self, index):
-        self.index, self.root, self.db = index, index.root, index.store.db
+        self.index, self.root, self.records = index, index.root, index.store.records
         self.paths = set()
         self.settings = {}
 
     def configure(self):
         self.paths = {
-            r[0]
-            for r in self.db.execute(
-                "SELECT path FROM repository_files WHERE workspace=?", (str(self.root),)
+            r["path"]
+            for r in self.records.select(
+                "repository_files", workspace=str(self.root), fields=("path",)
             )
         }
         for file in ("tsconfig.json", "go.mod", "compile_commands.json"):
@@ -134,59 +134,60 @@ class Resolver:
             self.configure()
         topology = settings_changed
         for path in changed:
-            exists = self.db.execute(
-                "SELECT language,body FROM repository_files WHERE workspace=? AND path=?",
-                (str(self.root), path),
-            ).fetchone()
+            exists = self.records.first(
+                "repository_files", workspace=str(self.root), path=path, fields=("language", "body")
+            )
             topology |= bool(exists) != (path in self.paths)
             self.paths.discard(path)
-            self.db.execute(
-                "DELETE FROM module_bindings WHERE workspace=? AND path=?", (str(self.root), path)
-            )
+            self.records.delete("module_bindings", workspace=str(self.root), path=path)
             if exists:
                 self.paths.add(path)
                 for module, alias, symbol in imports(
-                    (self.root / path).read_text(errors="replace"), exists[0], path
+                    (self.root / path).read_text(errors="replace"), exists["language"], path
                 ):
-                    target = self.target(path, exists[0], module, symbol)
-                    self.db.execute(
-                        "INSERT OR REPLACE INTO module_bindings VALUES(?,?,?,?,?,?,?)",
-                        (
-                            str(self.root),
-                            path,
-                            module,
-                            target,
-                            alias,
-                            symbol,
-                            "resolved structural" if target else "syntax-derived",
-                        ),
+                    target = self.target(path, exists["language"], module, symbol)
+                    self.records.insert(
+                        "module_bindings",
+                        {
+                            "workspace": str(self.root),
+                            "path": path,
+                            "module": module,
+                            "target": target,
+                            "alias": alias,
+                            "symbol": symbol,
+                            "quality": "resolved structural" if target else "syntax-derived",
+                        },
+                        on_conflict="replace",
                     )
         if topology:
             # No reparsing on module addition/deletion; only existing import rows.
-            for r in self.db.execute(
-                "SELECT b.*,f.language FROM module_bindings b JOIN repository_files f ON b.workspace=f.workspace AND b.path=f.path WHERE b.workspace=?",
-                (str(self.root),),
-            ).fetchall():
+            files = {
+                row["path"]: row
+                for row in self.records.select("repository_files", workspace=str(self.root))
+            }
+            for r in [
+                {**row, "language": files[row["path"]]["language"]}
+                for row in self.records.select("module_bindings", workspace=str(self.root))
+                if row["path"] in files
+            ]:
                 target = self.target(r["path"], r["language"], r["module"], r["symbol"])
-                self.db.execute(
-                    "UPDATE module_bindings SET target=?,quality=? WHERE workspace=? AND path=? AND module=? AND alias=? AND symbol=?",
-                    (
-                        target,
-                        "resolved structural" if target else "syntax-derived",
-                        str(self.root),
-                        r["path"],
-                        r["module"],
-                        r["alias"],
-                        r["symbol"],
-                    ),
+                self.records.update(
+                    "module_bindings",
+                    {
+                        "target": target,
+                        "quality": "resolved structural" if target else "syntax-derived",
+                    },
+                    workspace=str(self.root),
+                    path=r["path"],
+                    module=r["module"],
+                    alias=r["alias"],
+                    symbol=r["symbol"],
                 )
 
     def bindings(self, path):
         return [
             dict(r)
-            for r in self.db.execute(
-                "SELECT * FROM module_bindings WHERE workspace=? AND path=?", (str(self.root), path)
-            )
+            for r in self.records.select("module_bindings", workspace=str(self.root), path=path)
         ]
 
     def infer(self, path, line, column):

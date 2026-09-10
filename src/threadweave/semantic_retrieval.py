@@ -1,8 +1,8 @@
 """Local embedding evidence retrieval. No network requests in the agent hot path.
 
 Install the semantic extra and explicitly cache a FastEmbed model to enable this.
-History FTS remains available when the local model cannot be loaded. Vectors are
-versioned by encoder ID; a bounded recent semantic window complements full FTS.
+Lexical history search remains available when the local model cannot be loaded. Vectors are
+versioned by encoder ID; a bounded recent semantic window complements full lexical search.
 """
 
 from functools import lru_cache
@@ -21,6 +21,8 @@ def query_vector(model, cache, query):
 
 
 def search(store, sid, query, *, kind=None, session_id=None, limit=10):
+    import json
+
     import numpy as np
 
     config = store.config(sid).context
@@ -41,54 +43,58 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=10):
         "context_compaction",
     )
     for root in roots:
-        cursor = store.db.execute(
-            "SELECT seq FROM semantic_cursors WHERE root_id=? AND model=?",
-            (root, config.embedding_model),
-        ).fetchone()
-        rows = store.db.execute(
-            "SELECT id,session_id,type,seq,substr(payload,1,2000) AS excerpt FROM events WHERE root_id=? AND seq>? AND type IN ("
-            + ",".join("?" for _ in kinds)
-            + ") ORDER BY seq LIMIT 64",
-            (root, cursor[0] if cursor else 0, *kinds),
-        ).fetchall()
+        cursor = store.records.first(
+            "semantic_cursors", root_id=root, model=config.embedding_model, fields=("seq",)
+        )
+        after = cursor["seq"] if cursor else 0
+        rows = [
+            {**row, "excerpt": json.dumps(row["payload"], ensure_ascii=False)[:2000]}
+            for row in store.records.select(
+                "events",
+                root_id=root,
+                where=lambda row, after=after: row["seq"] > after and row["type"] in kinds,
+                order=(("seq", False),),
+                limit=64,
+            )
+        ]
         if rows:
             vectors = model.embed([r["excerpt"] for r in rows])
             with store.transaction():
                 for row, vector in zip(rows, vectors, strict=True):
-                    store.db.execute(
-                        "INSERT OR REPLACE INTO semantic_evidence VALUES(?,?,?,?,?,?,?,?)",
-                        (
-                            row["id"],
-                            config.embedding_model,
-                            root,
-                            row["session_id"],
-                            row["type"],
-                            row["seq"],
-                            row["excerpt"],
-                            np.asarray(vector, dtype=np.float32).tobytes(),
-                        ),
+                    store.records.insert(
+                        "semantic_evidence",
+                        {
+                            "id": row["id"],
+                            "model": config.embedding_model,
+                            "root_id": root,
+                            "session_id": row["session_id"],
+                            "kind": row["type"],
+                            "seq": row["seq"],
+                            "excerpt": row["excerpt"],
+                            "vector": np.asarray(vector, dtype=np.float32).tolist(),
+                        },
+                        on_conflict="replace",
                     )
-                store.db.execute(
-                    "INSERT OR REPLACE INTO semantic_cursors VALUES(?,?,?)",
-                    (root, config.embedding_model, rows[-1]["seq"]),
+                store.records.insert(
+                    "semantic_cursors",
+                    {"root_id": root, "model": config.embedding_model, "seq": rows[-1]["seq"]},
+                    on_conflict="replace",
                 )
-    sql = (
-        "SELECT * FROM semantic_evidence WHERE model=? AND root_id IN ("
-        + ",".join("?" for _ in roots)
-        + ")"
+    rows = store.records.select(
+        "semantic_evidence",
+        model=config.embedding_model,
+        where=lambda row: (
+            row["root_id"] in roots
+            and (kind is None or row["kind"] == kind)
+            and (session_id is None or row["session_id"] == session_id)
+        ),
+        order=(("seq", True),),
+        limit=2048,
     )
-    args = [config.embedding_model, *roots]
-    if kind:
-        sql += " AND kind=?"
-        args.append(kind)
-    if session_id:
-        sql += " AND session_id=?"
-        args.append(session_id)
-    rows = store.db.execute(sql + " ORDER BY seq DESC LIMIT 2048", args).fetchall()
     if not rows:
         return []
     vector = query_vector(config.embedding_model, config.embedding_cache, query)
-    matrix = np.stack([np.frombuffer(r["vector"], dtype=np.float32) for r in rows])
+    matrix = np.stack([np.asarray(r["vector"], dtype=np.float32) for r in rows])
     scores = matrix @ vector / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(vector) + 1e-12)
     return [
         {

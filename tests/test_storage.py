@@ -1,4 +1,4 @@
-import sqlite3
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -34,17 +34,17 @@ def test_lifecycle_events_identity_and_restart(tmp_path):
     event = restored.event_by_id(eid)
     assert event["payload"] == {"value": 42}
     assert event["timestamp"] > 0 and event["parent_event_id"]
-    assert restored.db.execute("SELECT version FROM schema_migrations").fetchone()[0] == 1
+    assert json.loads((restored.directory / "store.json").read_text())["format"] == 1
     restored.close()
 
 
 def test_append_only_and_atomic_event_transaction(tmp_path):
     store = Store(tmp_path / "db")
     root = make(store, tmp_path)
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        store.db.execute("DELETE FROM events")
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        store.db.execute("UPDATE events SET type='fake'")
+    with pytest.raises(ValueError, match="append-only"):
+        store.records.delete("events")
+    with pytest.raises(ValueError, match="append-only"):
+        store.records.update("events", {"type": "fake"})
     before = len(store.events(root.id))
     with pytest.raises(ValueError), store.transaction():
         store.event(root.id, "rolled_back", {})

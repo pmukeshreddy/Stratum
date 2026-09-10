@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 import signal
 import time
@@ -21,17 +20,15 @@ class BackgroundProcesses:
         self.waiters = Counter()
 
     def save(self, id, sid, body):
-        self.runtime.store.db.execute(
-            "INSERT OR REPLACE INTO process_jobs VALUES(?,?,?)", (id, sid, encode(body))
+        self.runtime.store.records.insert(
+            "process_jobs", {"id": id, "session_id": sid, "body": body}, on_conflict="replace"
         )
 
     def status(self, context, id):
-        row = self.runtime.store.db.execute(
-            "SELECT * FROM process_jobs WHERE id=?", (id,)
-        ).fetchone()
+        row = self.runtime.store.records.first("process_jobs", id=id)
         if not row or row["session_id"] != context.session_id:
             raise PermissionError("Process handle is not owned by this session")
-        result = json.loads(row["body"])
+        result = row["body"]
         result.pop("completion_message_id", None)
         if result["running"] and id not in self.tasks:
             # An orphan worker kills its group after daemon loss. Never replay a command.
@@ -107,15 +104,16 @@ class BackgroundProcesses:
             # A very short process can finish before its handle is awaited.
             # Consume only its still-pending notification: this call returns
             # the same complete result. Keep the message/event in the ledger.
-            row = self.runtime.store.db.execute(
-                "SELECT body FROM process_jobs WHERE id=?", (p["id"],)
-            ).fetchone()
-            notification = json.loads(row[0]).get("completion_message_id")
+            row = self.runtime.store.records.first("process_jobs", id=p["id"], fields=("body",))
+            notification = row["body"].get("completion_message_id")
             if notification:
-                consumed = self.runtime.store.db.execute(
-                    "UPDATE messages SET received_at=? WHERE id=? AND recipient_id=? AND received_at IS NULL",
-                    (time.time(), notification, context.session_id),
-                ).rowcount
+                consumed = self.runtime.store.records.update(
+                    "messages",
+                    {"received_at": time.time()},
+                    id=notification,
+                    recipient_id=context.session_id,
+                    received_at=None,
+                )
                 if consumed:
                     self.runtime.store.event(
                         context.session_id,
@@ -300,8 +298,8 @@ class BackgroundProcesses:
     def recover(self):
         from .tools import ToolContext
 
-        for row in self.runtime.store.db.execute("SELECT * FROM process_jobs").fetchall():
-            if json.loads(row["body"]).get("running"):
+        for row in self.runtime.store.records.select("process_jobs"):
+            if row["body"].get("running"):
                 event = self.runtime.store.event(
                     row["session_id"], "process_recovery", {"id": row["id"], "state": "lost"}
                 )
@@ -311,9 +309,9 @@ class BackgroundProcesses:
 
     async def close_session(self, sid):
         ids = [
-            r[0]
-            for r in self.runtime.store.db.execute(
-                "SELECT id FROM process_jobs WHERE session_id=?", (sid,)
+            r["id"]
+            for r in self.runtime.store.records.select(
+                "process_jobs", session_id=sid, fields=("id",)
             )
         ]
         tasks = [self.tasks[id] for id in ids if id in self.tasks]

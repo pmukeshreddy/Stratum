@@ -19,7 +19,7 @@ from threadweave.models import new_id
 from threadweave.repository import RepositoryIndex, confined, symbols
 from threadweave.retrieval import search
 from threadweave.runtime import Runtime
-from threadweave.storage import Store, encode
+from threadweave.storage import Store
 from threadweave.tools import ToolContext
 
 from .conftest import eventually, response
@@ -132,9 +132,7 @@ async def test_edits_hashes_checkpoints_rollback_and_prepared_recovery(
         pending = Editor(context).apply_patch(FIX)
         body = {k: v for k, v in pending.items() if k != "edit_id"}
         body["status"] = "prepared"
-        runtime.store.db.execute(
-            "UPDATE edits SET body=? WHERE id=?", (encode(body), pending["edit_id"])
-        )
+        runtime.store.records.update("edits", {"body": body}, id=pending["edit_id"])
         recover_edits(runtime)
         assert "return a - b" in (repository / "mathops.py").read_text()
         assert runtime.store.events(session.id, kind="edit_recovery")
@@ -204,11 +202,7 @@ async def test_isolated_candidate_patch_transfer_and_accounting(
         assert "+    return a + b" in result["patch"]
         candidate_result(context, child.id, accept=True)
         assert (await CodingTask().verify(context, coding_config.task)).passed
-        row = json.loads(
-            runtime.store.db.execute(
-                "SELECT body FROM candidates WHERE child_id=?", (child.id,)
-            ).fetchone()[0]
-        )
+        row = runtime.store.records.first("candidates", child_id=child.id, fields=("body",))["body"]
         assert row["accepted"] and row["consumed"] and row["useful"]
         assert runtime.store.usage(root.id, tree=True).subagent_count == 1
     finally:
@@ -280,7 +274,7 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
             s.id: (s.parent_id, s.kernel_id, s.workspace.path)
             for s in runtime.store.sessions(root_id=root.id)
         }
-        count = runtime.store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        count = runtime.store.records.count("events")
         await runtime.shutdown()
         runtime = Runtime(directory, providers={"test": provider})
         runtime.resume(root.id)
@@ -291,7 +285,7 @@ async def test_full_coding_model_loop_recursive_parallel_recovery(
             s.id: (s.parent_id, s.kernel_id, s.workspace.path)
             for s in runtime.store.sessions(root_id=root.id)
         }
-        assert runtime.store.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] > count
+        assert runtime.store.records.count("events") > count
         assert runtime.store.events(root.id, kind="context_compaction")
         assert runtime.store.events(root.id, kind="verifier_result")[-1]["payload"]["passed"]
         assert search(runtime.store, root.id, "arithmetic")
@@ -354,10 +348,7 @@ async def test_real_benchmark_and_durable_experiments(tmp_path, repository, codi
         assert measured["passed"] and measured["metrics"]["count"] == 3
         assert experiments.get(experiment["experiment_id"])["status"] == "concluded"
         assert len(experiments.list()) == 1
-        assert (
-            runtime.store.db.execute("SELECT COUNT(*) FROM benchmark_measurements").fetchone()[0]
-            == 2
-        )
+        assert runtime.store.records.count("benchmark_measurements") == 2
         assert search(runtime.store, session.id, "Documented")
     finally:
         await runtime.shutdown()
@@ -441,17 +432,24 @@ async def test_fts_scope_refinement_validation_and_loop_guard(tmp_path, reposito
         await runtime.shutdown()
 
 
-def test_migration_preserves_v1_history(tmp_path):
-    from threadweave.storage import SCHEMA
-
+def test_import_preserves_legacy_history(tmp_path):
     directory = tmp_path / "old"
     directory.mkdir()
-    connection = sqlite3.connect(directory / "history.sqlite3")
-    connection.executescript(SCHEMA + "PRAGMA user_version=1;")
-    connection.close()
+    database = directory / "history.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE events(seq INTEGER PRIMARY KEY, id TEXT, session_id TEXT, root_id TEXT, timestamp REAL, type TEXT, payload TEXT, parent_event_id TEXT, usage TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?)",
+            (7, "event", "session", "session", 1, "note", json.dumps({"proof": 42}), None, "{}"),
+        )
+    before = database.read_bytes()
     store = Store(directory)
-    from threadweave.migrations import VERSION
-
-    assert store.db.execute("PRAGMA user_version").fetchone()[0] == VERSION
-    assert store.db.execute("SELECT name FROM sqlite_master WHERE name='history_fts'").fetchone()
+    assert store.event_by_id("event")["payload"] == {"proof": 42}
+    assert store.event_by_id("event")["seq"] == 7
+    store.close()
+    store = Store(directory)
+    assert store.records.count("events") == 1
+    assert database.read_bytes() == before
     store.close()

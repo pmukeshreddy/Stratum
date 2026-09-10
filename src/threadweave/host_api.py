@@ -481,14 +481,24 @@ async def dispatch(context, request):
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("Goal objective must be nonempty")
         with store.transaction():
-            store.db.execute("DELETE FROM goal_budgets WHERE session_id=?", (sid,))
-            store.db.execute(
-                "INSERT OR REPLACE INTO goals VALUES(?,?,?,?,?)",
-                (sid, objective, "active", now(), now()),
+            store.records.delete("goal_budgets", session_id=sid)
+            store.records.insert(
+                "goals",
+                {
+                    "session_id": sid,
+                    "objective": objective,
+                    "status": "active",
+                    "created_at": now(),
+                    "updated_at": now(),
+                },
+                on_conflict="replace",
             )
             if budget is not None:
                 used, _ = store.subtree_tokens(sid)
-                store.db.execute("INSERT INTO goal_budgets VALUES(?,?,?)", (sid, budget, used))
+                store.records.insert(
+                    "goal_budgets",
+                    {"session_id": sid, "token_budget": budget, "starting_tokens": used},
+                )
         store.update(sid, mode="goal")
         store.event(sid, "goal_created", {"objective": objective}, parent=context.source_event)
         return store.goal(sid)

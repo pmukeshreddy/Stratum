@@ -17,10 +17,10 @@ def state_fingerprint(runtime, sid):
     state["messages"] = [m["id"] for m in store.messages(sid, limit=20)]
     state["entries"] = [(e["id"], e["version"]) for e in store.harness.entries(sid)]
     if store.config(sid).task.adapter == "coding":
-        row = store.db.execute(
-            "SELECT state_id FROM mutation_workspaces WHERE path=?", (session.workspace.path,)
-        ).fetchone()
-        state["files"] = row[0] if row else "not-yet-observed"
+        row = store.records.first(
+            "mutation_workspaces", path=session.workspace.path, fields=("state_id",)
+        )
+        state["files"] = row["state_id"] if row else "not-yet-observed"
         state["edits"] = [e["id"] for e in store.events(sid, kind="code_edit", limit=1)]
     return hashlib.sha256(encode(state).encode()).hexdigest()
 
@@ -42,13 +42,16 @@ def observe(runtime, sid, name, arguments):
     }
     if read_action:
         session = runtime.store.session(sid)
-        row = runtime.store.db.execute(
-            "SELECT state_id FROM mutation_workspaces WHERE path=?", (session.workspace.path,)
-        ).fetchone()
+        row = runtime.store.records.first(
+            "mutation_workspaces", path=session.workspace.path, fields=("state_id",)
+        )
         # Assigning a Python result variable does not make an unchanged query new.
         edited = runtime.store.events(sid, kind="code_edit", limit=1)
         fingerprint = encode(
-            [row[0] if row else "unobserved-workspace", edited[0]["id"] if edited else None]
+            [
+                row["state_id"] if row else "unobserved-workspace",
+                edited[0]["id"] if edited else None,
+            ]
         )
     else:
         fingerprint = state_fingerprint(runtime, sid)

@@ -1,7 +1,6 @@
 """Actual kernel/bootstrap, process lifecycle, durable goals and SDK transport tests."""
 
 import asyncio
-import json
 import socket
 import sys
 from pathlib import Path
@@ -178,8 +177,8 @@ async def test_real_mcp_http_transport_and_unconfigured_server(tmp_path, python_
                 ToolContext(runtime, root.id, new_id(), "test"), "tools", {"server": "absent"}
             )
         assert all(
-            not json.loads(row[0]).get("access_token")
-            for row in runtime.store.db.execute("SELECT body FROM configs")
+            not row["body"].get("access_token")
+            for row in runtime.store.records.select("configs", fields=("body",))
         )
     finally:
         if runtime:

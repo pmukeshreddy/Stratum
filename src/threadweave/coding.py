@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-import json
 from pathlib import Path
 
 from .coding_config import coding_options
@@ -11,7 +10,6 @@ from .execution import executor
 from .gitops import GitWorkspace
 from .models import Verification, new_id, now
 from .repository import confined, detect, is_test, symbols
-from .storage import encode
 from .test_evidence import machine_command, resolve_locations, structured
 
 KINDS = {
@@ -67,12 +65,12 @@ async def run_command(context, command, *, kind="command", timeout_seconds=None)
 
 
 def baseline(context):
-    row = context.runtime.store.db.execute(
-        "SELECT body FROM coding_baselines WHERE session_id=?", (context.session_id,)
-    ).fetchone()
+    row = context.runtime.store.records.first(
+        "coding_baselines", session_id=context.session_id, fields=("body",)
+    )
     if not row:
         raise ValueError("Coding baseline is not prepared")
-    return json.loads(row[0])
+    return row["body"]
 
 
 async def run_checks(context, kind, *, targets=None):
@@ -105,11 +103,11 @@ class CodingTask:
     async def prepare(self, context, task):
         options = coding_options(task)
         store = context.runtime.store
-        row = store.db.execute(
-            "SELECT body FROM coding_baselines WHERE session_id=?", (context.session_id,)
-        ).fetchone()
+        row = store.records.first(
+            "coding_baselines", session_id=context.session_id, fields=("body",)
+        )
         if row:
-            return json.loads(row[0])
+            return row["body"]
         git = GitWorkspace(context)
         status = git.status()
         if options.repository and Path(options.repository).resolve() != git.root.resolve():  # noqa: ASYNC240 - bounded local admission metadata
@@ -175,9 +173,7 @@ class CodingTask:
                     if correctness
                     else None,
                 )
-        store.db.execute(
-            "INSERT INTO coding_baselines VALUES(?,?)", (context.session_id, encode(result))
-        )
+        store.records.insert("coding_baselines", {"session_id": context.session_id, "body": result})
         _, manifest, artifact, _, _ = context.runtime.environment.adapter(
             context.session_id
         ).mutations.scan(context)
@@ -186,10 +182,7 @@ class CodingTask:
             "owner": context.session_id,
             "state_id": manifest["state_id"],
         }
-        store.db.execute(
-            "UPDATE coding_baselines SET body=? WHERE session_id=?",
-            (encode(result), context.session_id),
-        )
+        store.records.update("coding_baselines", {"body": result}, session_id=context.session_id)
         context.runtime.environment.adapter(context.session_id).index(context.session_id).refresh()
         store.event(context.session_id, "coding_baseline", result, parent=context.source_event)
         return result
@@ -381,15 +374,15 @@ class CodingTask:
             },
         )
         store = context.runtime.store
-        store.db.execute(
-            "INSERT INTO final_verifications VALUES(?,?,?,?,?)",
-            (
-                new_id(),
-                context.session_id,
-                now(),
-                verification.passed,
-                verification.model_dump_json(),
-            ),
+        store.records.insert(
+            "final_verifications",
+            {
+                "id": new_id(),
+                "session_id": context.session_id,
+                "created_at": now(),
+                "passed": verification.passed,
+                "body": verification.model_dump(mode="json"),
+            },
         )
         return verification
 

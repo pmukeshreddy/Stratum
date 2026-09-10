@@ -382,9 +382,8 @@ class RefinementServices(AuxiliaryServices):
                 await self._wait_refinement_quiescence(sid)
                 with self.store.transaction():
                     record(command["text"])
-                    self.store.db.execute(
-                        "UPDATE messages SET received_at=? WHERE id=?",
-                        (time.time(), message_id),
+                    self.store.records.update(
+                        "messages", {"received_at": time.time()}, id=message_id
                     )
                 try:
                     result = await self.refine(sid, **refine_command_options(command["args"]))
@@ -432,14 +431,9 @@ class RefinementServices(AuxiliaryServices):
             return False  # Prime gives already-owned/preparing user input its turn.
         if sid in self._transitioning:
             return False
-        if self.store.db.execute(
-            "SELECT 1 FROM actions WHERE session_id=? AND status='running' LIMIT 1", (sid,)
-        ).fetchone():
+        if self.store.records.first("actions", session_id=sid, status="running", limit=1):
             return False
-        return not self.store.db.execute(
-            "SELECT 1 FROM model_attempts a JOIN model_requests r ON r.id=a.request_id WHERE r.session_id=? AND a.status='running' AND (?=0 OR r.purpose NOT IN ('refinement','refinement_review')) LIMIT 1",
-            (sid, int(ignore_planning)),
-        ).fetchone()
+        return not self.store.running_attempts(sid, ignore_planning=ignore_planning)
 
     def refinement_input(self, sid, *, review=False, reason=None, instructions=None, global_=False):
         session = self.store.session(sid)
@@ -640,14 +634,7 @@ class RefinementServices(AuxiliaryServices):
         if state.background or state.claim or state.in_progress:
             return
         # The primary response must have finished. Planning may overlap its tools only.
-        if (
-            not session.pending_turn
-            or self.store.db.execute(
-                "SELECT 1 FROM model_attempts a JOIN model_requests r ON r.id=a.request_id "
-                "WHERE r.session_id=? AND a.status='running' LIMIT 1",
-                (sid,),
-            ).fetchone()
-        ):
+        if not session.pending_turn or self.store.running_attempts(sid):
             return
         options = state.pending_request
         if options is None:

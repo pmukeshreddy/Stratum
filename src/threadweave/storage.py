@@ -1,16 +1,14 @@
-"""Inspectable SQLite persistence. Mutations and their audit events share transactions."""
+"""File-backed sessions, history, queues, and recoverable runtime transactions."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import sqlite3
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .migrations import VERSION, migrate
+from .file_store import FileStore
 from .models import (
     HarnessError,
     Lifecycle,
@@ -32,172 +30,82 @@ def encode(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS configs(id TEXT PRIMARY KEY, body TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions(
- id TEXT PRIMARY KEY, parent_id TEXT REFERENCES sessions(id), root_id TEXT NOT NULL,
- lifecycle TEXT NOT NULL, outcome TEXT NOT NULL, runnable INTEGER NOT NULL, body TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS sessions_root ON sessions(root_id);
-CREATE TABLE IF NOT EXISTS events(
- seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
- session_id TEXT NOT NULL REFERENCES sessions(id), root_id TEXT NOT NULL,
- timestamp REAL NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL,
- parent_event_id TEXT, usage TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS events_session ON events(session_id, seq);
-CREATE INDEX IF NOT EXISTS events_root ON events(root_id, seq);
-CREATE TRIGGER IF NOT EXISTS events_immutable_update BEFORE UPDATE ON events
-BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
-CREATE TRIGGER IF NOT EXISTS events_immutable_delete BEFORE DELETE ON events
-BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
-CREATE TABLE IF NOT EXISTS usage(session_id TEXT PRIMARY KEY REFERENCES sessions(id), body TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS reservations(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, cost REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages(
- id TEXT PRIMARY KEY, sender_id TEXT REFERENCES sessions(id),
- recipient_id TEXT NOT NULL REFERENCES sessions(id), body TEXT NOT NULL,
- created_at REAL NOT NULL, received_at REAL, source_event TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS messages_pending ON messages(recipient_id, received_at);
-CREATE TABLE IF NOT EXISTS actions(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), name TEXT NOT NULL,
- arguments TEXT NOT NULL, status TEXT NOT NULL, result TEXT,
- source_event TEXT NOT NULL, result_event TEXT
-);
-CREATE TABLE IF NOT EXISTS artifacts(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- path TEXT NOT NULL, media_type TEXT NOT NULL, size INTEGER NOT NULL,
- sha256 TEXT NOT NULL, created_at REAL NOT NULL, source_event TEXT
-);
-CREATE INDEX IF NOT EXISTS artifacts_content ON artifacts(session_id,sha256,media_type,size);
-CREATE TABLE IF NOT EXISTS compactions(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- source_events TEXT NOT NULL, summary TEXT NOT NULL, created_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS provider_continuations(
- event_id TEXT PRIMARY KEY REFERENCES events(id), provider TEXT NOT NULL, model TEXT NOT NULL,
- items TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS goals(
- session_id TEXT PRIMARY KEY REFERENCES sessions(id), objective TEXT NOT NULL,
- status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS schedules(
- id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
- interval_seconds REAL, cron TEXT, next_at REAL NOT NULL, enabled INTEGER NOT NULL,
- instruction TEXT NOT NULL
-);
-"""
-
-
 class Store(RequestHistory, TrajectoryHistory):
     def __init__(self, directory: str | Path):
         self.directory = Path(directory).resolve()
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.db = sqlite3.connect(self.directory / "history.sqlite3", isolation_level=None)
-        (self.directory / "history.sqlite3").chmod(0o600)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.execute("PRAGMA busy_timeout=5000")
-        version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > VERSION:
-            raise RuntimeError(
-                f"Database schema {version} is newer than supported schema {VERSION}"
-            )
-        self.db.executescript(SCHEMA)
-        self.db.execute("INSERT OR IGNORE INTO schema_migrations VALUES(1, ?)", (now(),))
-        migrate(self.db, version, now())
-        self._depth = 0
+        if (self.directory / "history.sqlite3").exists() and not (
+            self.directory / ".legacy-imported.json"
+        ).exists():
+            from .legacy_import import import_if_needed
+
+            import_if_needed(self.directory)
+        self.records = FileStore(self.directory)
         from .harness import HarnessStore
+        from .history_search import HistorySearch
 
         self.harness = HarnessStore(self.directory, session_history=self)
+        self.search_index = HistorySearch(self)
 
     def refinement_history(self, sid):
-        return [
-            json.loads(row[0])
-            for row in self.db.execute(
-                "SELECT payload FROM events WHERE session_id=? AND type='harness_refinement' ORDER BY seq",
-                (sid,),
-            )
-        ]
+        from .harness import load_refinement_history
+
+        return load_refinement_history(self.harness.path(sid), scope="local")
 
     def record_harness_refinement(self, sid, result):
-        self.event(sid, "harness_refinement", result)
+        from .harness import append_refinement_history
 
-    @contextmanager
+        append_refinement_history(self.harness.path(sid), result)
+
     def transaction(self):
-        # No await is allowed inside this synchronous transaction.
-        name = f"tx_{self._depth}"
-        self.db.execute(f"SAVEPOINT {name}")
-        self._depth += 1
-        try:
-            yield
-        except BaseException:
-            self.db.execute(f"ROLLBACK TO {name}")
-            raise
-        finally:
-            self._depth -= 1
-            self.db.execute(f"RELEASE {name}")
+        return self.records.transaction()
 
     def close(self):
-        self.db.close()
+        self.records.close()
 
     def config(self, session_or_config_id: str) -> RunConfig:
-        row = self.db.execute(
-            "SELECT body FROM configs WHERE id=?", (session_or_config_id,)
-        ).fetchone()
+        row = self.records.first("configs", id=session_or_config_id, fields=("body",))
         if row is None:
             session = self.session(session_or_config_id)
-            row = self.db.execute(
-                "SELECT body FROM configs WHERE id=?", (session.config_id,)
-            ).fetchone()
-        return RunConfig.model_validate_json(row[0])
+            row = self.records.first("configs", id=session.config_id, fields=("body",))
+        return RunConfig.model_validate(row["body"])
 
     def reconfigure(self, sid, config):
         """Persist a new immutable config identity at an explicit host boundary."""
         body = encode(config.model_dump(mode="json"))
         identifier = hashlib.sha256(body.encode()).hexdigest()
         with self.transaction():
-            self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (identifier, body))
+            self.records.insert(
+                "configs", {"id": identifier, "body": json.loads(body)}, on_conflict="ignore"
+            )
             self.update(sid, config_id=identifier)
             self.event(sid, "session_configured", {"config_id": identifier})
         return identifier
 
     def session(self, session_id: str) -> Session:
-        row = self.db.execute("SELECT body FROM sessions WHERE id=?", (session_id,)).fetchone()
+        row = self.records.first("sessions", id=session_id, fields=("body",))
         if row is None:
             raise KeyError(f"Unknown session: {session_id}")
-        return Session.model_validate_json(row[0])
+        return Session.model_validate(row["body"])
 
     def sessions(self, *, root_id: str | None = None, roots_only=False) -> list[Session]:
-        query, args = "SELECT body FROM sessions", ()
-        if root_id:
-            query += " WHERE root_id=?"
-            args = (root_id,)
-        elif roots_only:
-            query += " WHERE parent_id IS NULL"
-        return [Session.model_validate_json(r[0]) for r in self.db.execute(query, args)]
+        match = {"root_id": root_id} if root_id else {"parent_id": None} if roots_only else {}
+        return [
+            Session.model_validate(row["body"]) for row in self.records.select("sessions", **match)
+        ]
 
     def _save(self, session: Session):
-        self.db.execute(
-            "INSERT INTO sessions VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-            "lifecycle=excluded.lifecycle,outcome=excluded.outcome,runnable=excluded.runnable,"
-            "body=excluded.body",
-            (
-                session.id,
-                session.parent_id,
-                session.root_id,
-                session.lifecycle,
-                session.outcome,
-                session.runnable,
-                session.model_dump_json(),
-            ),
+        self.records.insert(
+            "sessions",
+            {
+                "id": session.id,
+                "parent_id": session.parent_id,
+                "root_id": session.root_id,
+                "lifecycle": session.lifecycle,
+                "outcome": session.outcome,
+                "runnable": session.runnable,
+                "body": session.model_dump(mode="json"),
+            },
+            on_conflict="replace",
         )
 
     def update(self, session_id: str, **changes) -> Session:
@@ -246,7 +154,9 @@ class Store(RequestHistory, TrajectoryHistory):
             branch_event=branch_event,
         )
         with self.transaction():
-            self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (config_id, body))
+            self.records.insert(
+                "configs", {"id": config_id, "body": json.loads(body)}, on_conflict="ignore"
+            )
             self._save(session)
             subscription = any(
                 p.name == "codex_subscription"
@@ -255,15 +165,24 @@ class Store(RequestHistory, TrajectoryHistory):
                     *([config.provider] if not config.routing.default else []),
                 ]
             )
-            self.db.execute(
-                "INSERT INTO usage VALUES(?,?)",
-                (sid, Usage(cost=None if subscription else 0).model_dump_json()),
+            self.records.insert(
+                "usage",
+                {
+                    "session_id": sid,
+                    "body": Usage(cost=None if subscription else 0).model_dump(mode="json"),
+                },
             )
             self.event(sid, "session_transition", {"from": None, "to": Lifecycle.ADMITTED})
             if mode == "goal":
-                self.db.execute(
-                    "INSERT INTO goals VALUES(?,?,?,?,?)",
-                    (sid, instruction, "active", now(), now()),
+                self.records.insert(
+                    "goals",
+                    {
+                        "session_id": sid,
+                        "objective": instruction,
+                        "status": "active",
+                        "created_at": now(),
+                        "updated_at": now(),
+                    },
                 )
             if parent_id:
                 self.event(parent_id, "subagent_created", {"child_id": sid, "name": name})
@@ -297,19 +216,18 @@ class Store(RequestHistory, TrajectoryHistory):
             payload, [p.api_key_env for p in [config.provider, *config.models.values()]]
         )
         eid, timestamp = new_id(), now()
-        self.db.execute(
-            "INSERT INTO events(id,session_id,root_id,timestamp,type,payload,"
-            "parent_event_id,usage) VALUES(?,?,?,?,?,?,?,?)",
-            (
-                eid,
-                sid,
-                session.root_id,
-                timestamp,
-                kind,
-                encode(payload),
-                parent,
-                encode(usage or {}),
-            ),
+        self.records.insert(
+            "events",
+            {
+                "id": eid,
+                "session_id": sid,
+                "root_id": session.root_id,
+                "timestamp": timestamp,
+                "type": kind,
+                "payload": payload,
+                "parent_event_id": parent,
+                "usage": usage or {},
+            },
         )
         log.info(
             encode(
@@ -327,28 +245,21 @@ class Store(RequestHistory, TrajectoryHistory):
 
     @staticmethod
     def _event_row(row) -> dict:
-        result = dict(row)
-        result["payload"] = json.loads(result["payload"])
-        result["usage"] = json.loads(result["usage"])
-        return result
+        return dict(row)
 
     def events(self, sid: str, *, limit=30, after=0, kind=None, tree=False) -> list[dict]:
         session = self.session(sid)
-        column = "root_id" if tree else "session_id"
-        args: list = [session.root_id if tree else sid, after]
-        condition = f"{column}=? AND seq>?"
+        match = {"root_id": session.root_id} if tree else {"session_id": sid}
         if kind:
-            condition += " AND type=?"
-            args.append(kind)
-        # Tail on initial inspection; forward cursor pagination for attaching.
-        direction = "ASC" if after else "DESC"
-        args.append(min(max(limit, 1), 500))
-        rows = self.db.execute(
-            f"SELECT * FROM events WHERE {condition} ORDER BY seq {direction} LIMIT ?", args
-        ).fetchall()
-        if not after:
-            rows.reverse()
-        return [self._event_row(r) for r in rows]
+            match["type"] = kind
+        rows = self.records.select(
+            "events",
+            where=lambda row: row["seq"] > after,
+            order=(("seq", not bool(after)),),
+            limit=min(max(limit, 1), 500),
+            **match,
+        )
+        return rows if after else list(reversed(rows))
 
     def iter_events(self, sid: str, *, tree=False, kind=None, after=-1):
         """Forward pagination over the complete trajectory, unlike bounded tail inspection."""
@@ -373,7 +284,7 @@ class Store(RequestHistory, TrajectoryHistory):
         return roots
 
     def event_by_id(self, event_id: str) -> dict:
-        row = self.db.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        row = self.records.first("events", id=event_id)
         if row is None:
             raise KeyError(f"Unknown event: {event_id}")
         return self._event_row(row)
@@ -382,9 +293,10 @@ class Store(RequestHistory, TrajectoryHistory):
         with self.transaction():
             session = self.session(sid)
             session.context.append({"event_id": event_id, "messages": messages})
-            self.db.execute(
-                "INSERT OR IGNORE INTO conversation_blocks VALUES(?,?,?)",
-                (sid, event_id, encode(messages)),
+            self.records.insert(
+                "conversation_blocks",
+                {"session_id": sid, "event_id": event_id, "messages": messages},
+                on_conflict="ignore",
             )
             self.update(sid, context=session.context)
 
@@ -395,9 +307,8 @@ class Store(RequestHistory, TrajectoryHistory):
                 k: None if getattr(old, k) is None or v is None else getattr(old, k) + v
                 for k, v in usage.model_dump().items()
             }
-            self.db.execute(
-                "UPDATE usage SET body=? WHERE session_id=?",
-                (Usage(**values).model_dump_json(), sid),
+            self.records.update(
+                "usage", {"body": Usage(**values).model_dump(mode="json")}, session_id=sid
             )
             self.event(
                 sid, "resource_usage", usage.model_dump(), parent=parent, usage=usage.model_dump()
@@ -417,7 +328,9 @@ class Store(RequestHistory, TrajectoryHistory):
         identifier = hashlib.sha256(body.encode()).hexdigest()
         with self.transaction():
             old = self.session(sid).config_id
-            self.db.execute("INSERT OR IGNORE INTO configs VALUES(?,?)", (identifier, body))
+            self.records.insert(
+                "configs", {"id": identifier, "body": json.loads(body)}, on_conflict="ignore"
+            )
             self.update(sid, config_id=identifier)
             self.event(
                 sid,
@@ -433,10 +346,10 @@ class Store(RequestHistory, TrajectoryHistory):
 
     def usage(self, sid: str, *, tree=False) -> Usage:
         if not tree:
-            row = self.db.execute("SELECT body FROM usage WHERE session_id=?", (sid,)).fetchone()
+            row = self.records.first("usage", session_id=sid, fields=("body",))
             if row is None:
                 raise KeyError(sid)
-            return Usage.model_validate_json(row[0])
+            return Usage.model_validate(row["body"])
         sessions = self.sessions(root_id=self.session(sid).root_id)
         total = Usage().model_dump()
         for session in sessions:
@@ -444,13 +357,15 @@ class Store(RequestHistory, TrajectoryHistory):
                 total[key] = None if total[key] is None or value is None else total[key] + value
         return Usage(**total)
 
+    def reservations(self, root_id):
+        sessions = {session.id for session in self.sessions(root_id=root_id)}
+        return self.records.select("reservations", where=lambda row: row["session_id"] in sessions)
+
     def reserved(self, root_id: str) -> tuple[int, float]:
-        row = self.db.execute(
-            "SELECT COALESCE(SUM(r.input_tokens+r.output_tokens),0),COALESCE(SUM(r.cost),0) "
-            "FROM reservations r JOIN sessions s ON s.id=r.session_id WHERE s.root_id=?",
-            (root_id,),
-        ).fetchone()
-        return row[0], row[1]
+        rows = self.reservations(root_id)
+        return sum(row["input_tokens"] + row["output_tokens"] for row in rows), sum(
+            row["cost"] for row in rows
+        )
 
     def send(
         self,
@@ -481,9 +396,19 @@ class Store(RequestHistory, TrajectoryHistory):
                     "body": body,
                 },
             )
-            self.db.execute(
-                "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)",
-                (mid, sender_id, recipient_id, body, now(), None, eid, delivery, causal_request_id),
+            self.records.insert(
+                "messages",
+                {
+                    "id": mid,
+                    "sender_id": sender_id,
+                    "recipient_id": recipient_id,
+                    "body": body,
+                    "created_at": now(),
+                    "received_at": None,
+                    "source_event": eid,
+                    "delivery": delivery,
+                    "causal_request_id": causal_request_id,
+                },
             )
         return mid
 
@@ -491,16 +416,17 @@ class Store(RequestHistory, TrajectoryHistory):
         self.session(sid)
         if type(limit) is not int or limit < 1:
             raise ValueError("Message limit must be a positive integer; at most 100 are returned")
-        condition = " AND received_at IS NULL" if pending else ""
+        match = {"recipient_id": sid}
+        if pending:
+            match["received_at"] = None
         if not include_followups:
-            condition += " AND delivery='boundary'"
-        order = "ASC" if pending else "DESC"
-        rows = self.db.execute(
-            f"SELECT * FROM messages WHERE recipient_id=?{condition} "
-            f"ORDER BY created_at {order}, rowid {order} LIMIT ?",
-            (sid, min(limit, 100)),
+            match["delivery"] = "boundary"
+        return self.records.select(
+            "messages",
+            order=(("created_at", not pending), ("_order", not pending)),
+            limit=min(limit, 100),
+            **match,
         )
-        return [dict(r) for r in rows]
 
     def receive(self, sid: str, render, *, limit=30, include_followups=True) -> list[dict]:
         with self.transaction():
@@ -515,18 +441,17 @@ class Store(RequestHistory, TrajectoryHistory):
                 self.add_context(sid, eid, [{"role": "user", "content": render(message)}])
                 if message.get("causal_request_id"):
                     self.queue_request_edge(sid, message["causal_request_id"], "subagent_return")
-                self.db.execute(
-                    "UPDATE messages SET received_at=? WHERE id=?",
-                    (message["received_at"], message["id"]),
+                self.records.update(
+                    "messages", {"received_at": message["received_at"]}, id=message["id"]
                 )
             return messages
 
     def goal(self, sid: str) -> dict | None:
-        row = self.db.execute("SELECT * FROM goals WHERE session_id=?", (sid,)).fetchone()
+        row = self.records.first("goals", session_id=sid)
         if not row:
             return None
         result = dict(row)
-        budget = self.db.execute("SELECT * FROM goal_budgets WHERE session_id=?", (sid,)).fetchone()
+        budget = self.records.first("goal_budgets", session_id=sid)
         if budget:
             used, reserved = self.subtree_tokens(sid)
             result.update(
@@ -537,33 +462,36 @@ class Store(RequestHistory, TrajectoryHistory):
         return result
 
     def subtree_tokens(self, sid):
-        ids = [
-            r[0]
-            for r in self.db.execute(
-                "WITH RECURSIVE descendants(id) AS (SELECT ? UNION ALL "
-                "SELECT s.id FROM sessions s JOIN descendants d ON s.parent_id=d.id) "
-                "SELECT id FROM descendants",
-                (sid,),
-            )
-        ]
+        sessions = self.sessions(root_id=self.session(sid).root_id)
+        ids = {sid}
+        while more := {s.id for s in sessions if s.parent_id in ids} - ids:
+            ids.update(more)
         used = sum(self.usage(id).input_tokens + self.usage(id).output_tokens for id in ids)
         reserved = sum(
-            self.db.execute(
-                "SELECT COALESCE(SUM(input_tokens+output_tokens),0) FROM reservations WHERE session_id=?",
-                (id,),
-            ).fetchone()[0]
-            for id in ids
+            row["input_tokens"] + row["output_tokens"]
+            for row in self.records.select(
+                "reservations", where=lambda row: row["session_id"] in ids
+            )
         )
         return used, reserved
+
+    def running_attempts(self, sid, *, ignore_planning=False):
+        requests = {
+            row["id"]
+            for row in self.records.select("model_requests", session_id=sid)
+            if not ignore_planning or row["purpose"] not in {"refinement", "refinement_review"}
+        }
+        return self.records.select(
+            "model_attempts", status="running", where=lambda row: row["request_id"] in requests
+        )
 
     def finish(self, sid: str, outcome: Outcome, result: str | None = None):
         with self.transaction():
             self.update(sid, outcome=outcome, runnable=False, result=result)
-            self.db.execute(
-                "UPDATE goals SET status=?,updated_at=? WHERE session_id=?",
-                (outcome.value, now(), sid),
+            self.records.update(
+                "goals", {"status": outcome.value, "updated_at": now()}, session_id=sid
             )
-            self.db.execute("UPDATE schedules SET enabled=0 WHERE session_id=?", (sid,))
+            self.records.update("schedules", {"enabled": 0}, session_id=sid)
             self.event(
                 sid,
                 "completion" if outcome == Outcome.COMPLETED else "termination",

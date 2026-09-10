@@ -5,7 +5,6 @@ import re
 import statistics
 
 from .models import new_id, now
-from .storage import encode
 
 
 def summarize(values):
@@ -122,9 +121,9 @@ async def run_benchmark(
     )
     result["raw_artifact"] = aid
     identifier = new_id()
-    context.runtime.store.db.execute(
-        "INSERT INTO benchmark_measurements VALUES(?,?,?,?)",
-        (identifier, context.session_id, now(), encode(result)),
+    context.runtime.store.records.insert(
+        "benchmark_measurements",
+        {"id": identifier, "session_id": context.session_id, "created_at": now(), "body": result},
     )
     context.runtime.store.event(
         context.session_id,

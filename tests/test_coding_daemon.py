@@ -41,7 +41,7 @@ async def test_hard_kill_and_recover_real_repository_child_patch_history_and_rep
         )
         before = Store(data)
         assert before.events(sid, kind="context_compaction")
-        count = before.db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        count = before.records.count("events")
         before.close()
         process.send_signal(signal.SIGKILL)
         await process.wait()
@@ -57,14 +57,14 @@ async def test_hard_kill_and_recover_real_repository_child_patch_history_and_rep
                 s.id: (s.parent_id, s.kernel_id, s.workspace.path)
                 for s in after.sessions(root_id=sid)
             }
-            assert after.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] > count
+            assert after.records.count("events") > count
             assert after.events(sid, kind="candidate_consumed")[-1]["payload"]["accepted"]
             assert after.events(sid, kind="verifier_result")[-1]["payload"]["passed"]
             assert after.events(sid, kind="kernel_recovery")[-1]["payload"]["restored"]
             assert any(
                 m["id"] == queued["message_id"] and m["received_at"] for m in after.messages(sid)
             )
-            assert after.db.execute("SELECT COUNT(*) FROM repository_files").fetchone()[0] > 0
+            assert after.records.count("repository_files") > 0
         finally:
             after.close()
         assert "return a + b" in (repository / "mathops.py").read_text()

@@ -2,24 +2,22 @@
 
 from __future__ import annotations
 
-import json
-import sqlite3
+from contextlib import closing
 from pathlib import Path
+
+from threadweave.file_store import FileStore
 
 
 def activity(directory, record=None):
     directory, record = Path(directory), record or {}
-    with sqlite3.connect(f"file:{directory / 'state/history.sqlite3'}?mode=ro", uri=True) as db:
-        db.row_factory = sqlite3.Row
+    with closing(FileStore(directory / "state")) as records:
         events = [
-            {**dict(r), "payload": json.loads(r["payload"])}
-            for r in db.execute("SELECT * FROM events ORDER BY seq")
+            {**dict(r), "payload": r["payload"]}
+            for r in records.select("events", order=(("seq", False),))
         ]
-        sessions = [json.loads(r[0]) for r in db.execute("SELECT body FROM sessions")]
-        requests = [dict(r) for r in db.execute("SELECT * FROM model_requests")]
-        actions = [
-            dict(r) for r in db.execute("SELECT name,arguments,session_id,status FROM actions")
-        ]
+        sessions = [r["body"] for r in records.select("sessions")]
+        requests = [dict(r) for r in records.select("model_requests")]
+        actions = [dict(r) for r in records.select("actions")]
     root = next(s for s in sessions if s["parent_id"] is None)
     sid = root["id"]
 
@@ -63,7 +61,7 @@ def activity(directory, record=None):
         "rlm_calls": sum(
             a["name"] in {"rlm", "agent_spawn"}
             or a["name"] == "host_request"
-            and json.loads(a["arguments"]).get("operation") == "rlm.run"
+            and a["arguments"].get("operation") == "rlm.run"
             for a in actions
         ),
         "rlm_admissions": len(of("rlm_admitted")),

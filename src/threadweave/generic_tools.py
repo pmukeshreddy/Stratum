@@ -65,7 +65,7 @@ def register(registry):
             Tool(
                 name,
                 {
-                    "history_search": "Search durable trajectory events and observations with FTS.",
+                    "history_search": "Search durable trajectory events and observations with lexical search.",
                     "artifact_search": "Search indexed artifact excerpts in this trajectory.",
                     "artifact_import": "Retain an exact workspace file or binary as an artifact.",
                     "skill_search": "Search versioned executable skills and retained procedures.",

@@ -236,14 +236,22 @@ class ContainerExecutor(LocalExecutor):
 
 
 async def recover_containers(runtime):
-    import json
 
-    rows = runtime.store.db.execute(
-        "SELECT session_id,type,payload FROM events WHERE type IN ('container_lease_started','container_lease_closed') ORDER BY seq"
-    ).fetchall()
+    rows = runtime.store.records.select(
+        "events",
+        where=lambda row: (
+            row["type"]
+            in (
+                "container_lease_started",
+                "container_lease_closed",
+            )
+        ),
+        order=(("seq", False),),
+        fields=("session_id", "type", "payload"),
+    )
     pending = {}
     for row in rows:
-        body = json.loads(row["payload"])
+        body = row["payload"]
         if row["type"] == "container_lease_started":
             pending[body["name"]] = (row["session_id"], body)
         else:

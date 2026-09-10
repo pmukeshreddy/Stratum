@@ -49,7 +49,7 @@ def test_compaction_preserves_full_history_and_complete_tool_pairs(tmp_path):
     store.close()
     store = Store(tmp_path / "db")
     assert Context(store).messages(root.id) == messages
-    assert store.db.execute("SELECT COUNT(*) FROM compactions").fetchone()[0] > 0
+    assert store.records.count("compactions") > 0
     store.close()
 
 

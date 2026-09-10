@@ -96,10 +96,10 @@ async def test_real_daemon_kill_restart_recovers_full_recursive_trajectory(tmp_p
                 await asyncio.sleep(0.03)
         identities = {s["id"]: (s["parent_id"], s["kernel_id"]) for s in tree}
         before = Store(data)
-        event_ids = [r[0] for r in before.db.execute("SELECT id FROM events")]
+        event_ids = [r["id"] for r in before.records.select("events", fields=("id",))]
         assert before.events(sid, kind="context_compaction")
         assert before.harness.entries(sid)[0]["kind"] == "memory"
-        assert before.db.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] >= 1
+        assert before.records.count("reservations") >= 1
         before.close()
         queued = await request(
             data, "input", session_id=sid, body="Durable input queued before process death"
@@ -122,7 +122,7 @@ async def test_real_daemon_kill_restart_recovers_full_recursive_trajectory(tmp_p
         assert result["tree_usage"]["subagent_count"] == 3
         assert result["tree_usage"]["estimated_calls"] >= 1
         persisted = Store(data)
-        after_ids = {r[0] for r in persisted.db.execute("SELECT id FROM events")}
+        after_ids = {r["id"] for r in persisted.records.select("events", fields=("id",))}
         assert set(event_ids) <= after_ids
         assert any(
             m["id"] == queued["message_id"] and m["received_at"] for m in persisted.messages(sid)

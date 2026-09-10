@@ -103,7 +103,7 @@ async def test_subscription_refinement_omits_effort_instead_of_selecting_a_tier(
     assert unchanged.parameters["reasoning_effort"] == "high"
 
 
-async def test_schema_11_migration_repairs_auxiliary_chains_without_losing_usage(tmp_path, config):
+async def test_file_restart_preserves_auxiliary_isolation_and_usage(tmp_path, config):
     from .fakes import ScriptedProvider
 
     provider = ScriptedProvider(
@@ -118,7 +118,7 @@ async def test_schema_11_migration_repairs_auxiliary_chains_without_losing_usage
         runtime.providers["mock"] = review_provider
         seed(runtime, root.id)
         await runtime.refine(root.id)
-        # Two auxiliary calls reproduce the buggy v11 chain, including an old reviewer.
+        # Auxiliary requests remain outside the primary continuation chain.
         await runtime.auxiliary(
             root.id,
             "refinement_review",
@@ -129,22 +129,9 @@ async def test_schema_11_migration_repairs_auxiliary_chains_without_losing_usage
         runtime.store.update(root.id, runnable=True)
         await runtime._run_turn(root.id)
         a, b = [r.request_id for r in provider.requests]
-        planner, review = [r.request_id for r in review_provider.requests]
         usage = runtime.store.usage(root.id)
-        db = runtime.store.db
-        db.execute("DELETE FROM request_edges")
-        for source, target in ((a, planner), (planner, review), (review, b)):
-            db.execute("INSERT INTO request_edges VALUES(?,?,?)", (source, target, "continuation"))
-            db.execute(
-                "UPDATE model_requests SET inbound=? WHERE id=?",
-                (encode([{"source": source, "kind": "continuation"}]), target),
-            )
-        db.execute("ALTER TABLE model_requests DROP COLUMN request_kind")
-        db.execute("DELETE FROM schema_migrations WHERE version>=12")
-        db.execute("PRAGMA user_version=11")
         await runtime.shutdown()
         runtime = Runtime(data, providers={"mock": provider})
-        assert runtime.store.db.execute("PRAGMA user_version").fetchone()[0] == 13
         graph = runtime.store.request_graph(root.id)
         assert {r["id"] for r in graph["requests"]} == {a, b}
         assert graph["edges"] == [{"source": a, "target": b, "kind": "continuation"}]

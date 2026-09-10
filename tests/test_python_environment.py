@@ -272,7 +272,9 @@ async def test_hook_and_rpc_failures_are_audited_without_claiming_rollback(
     if phase == "after":
         assert result["error"]["code"] == "after_action_failed"
         assert runtime.store.session(session.id).paused
-    assert all(r[0] == "done" for r in runtime.store.db.execute("SELECT status FROM actions"))
+    assert all(
+        r["status"] == "done" for r in runtime.store.records.select("actions", fields=("status",))
+    )
 
 
 @pytest.mark.parametrize("interruption", ["cancel", "kernel_exit"])
@@ -314,9 +316,7 @@ async def test_recovery_observes_open_window_without_replaying_python(coding_pyt
     assert evidence["recovered"] and not evidence["rollback_performed"]
     assert "after-crash" in evidence["files"]
     assert (
-        runtime.store.db.execute(
-            "SELECT status FROM mutation_windows WHERE id=?", (wid,)
-        ).fetchone()[0]
+        runtime.store.records.first("mutation_windows", id=wid, fields=("status",))["status"]
         == "observed"
     )
     assert not runtime.store.events(session.id, kind="model_started")
@@ -464,7 +464,6 @@ async def test_failed_observation_recovers_without_hiding_partial_write(
 
 
 async def test_actual_daemon_process_loss_recovers_mutation(tmp_path, repository, coding_config):
-    import json
 
     coding_config.control_plane = "python"
     update_coding_options(coding_config.task, capture_baseline=False)
@@ -504,10 +503,8 @@ asyncio.run(main())
         assert runtime.store.session(sid).id == sid
         assert effects(runtime, sid, reason="recovery")[-1]["files"]["survived-crash"]
         assert (repository / "survived-crash").read_text() == "retained"
-        assert not json.loads(
-            runtime.store.db.execute("SELECT result FROM actions WHERE name='ipython'").fetchone()[
-                0
-            ]
-        ).get("rollback_performed")
+        assert not runtime.store.records.first("actions", name="ipython", fields=("result",))[
+            "result"
+        ].get("rollback_performed")
     finally:
         await runtime.shutdown()

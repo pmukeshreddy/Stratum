@@ -1,4 +1,4 @@
-"""Bounded FTS retrieval across explicit trajectory ancestry."""
+"""Bounded lexical retrieval across explicit trajectory ancestry."""
 
 import re
 
@@ -7,27 +7,15 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20, priority_
     roots = store.history_roots(sid)
     if session_id and store.session(session_id).root_id not in roots:
         raise PermissionError("Search session is outside trajectory ancestry")
-    # Treat user query as terms, not executable FTS syntax. Avoid malformed MATCH expressions.
+    # Tokenize the query consistently with the rebuildable lexical index.
     terms = re.findall(r"\w+", query, re.UNICODE)
     if not terms:
         return []
-    expression = " OR ".join('"' + term + '"' for term in terms[:20])
-    sql = (
-        "SELECT id,session_id,kind,bm25(history_fts) AS lexical_score,rowid AS ordinal,"
-        "snippet(history_fts,4,'[',']','…',40) AS excerpt FROM history_fts WHERE history_fts MATCH ? AND root_id IN ("
-        + ",".join("?" for _ in roots)
-        + ")"
+    # Build the lexical candidates directly from authoritative history and artifact metadata.
+    # The in-memory inverted index is discarded on restart and can always be rebuilt.
+    candidates = store.search_index.search(
+        roots, terms[:20], kind=kind, session_id=session_id, limit=min(100, max(20, limit * 4))
     )
-    params = [expression, *roots]
-    if kind:
-        sql += " AND kind=?"
-        params.append(kind)
-    if session_id:
-        sql += " AND session_id=?"
-        params.append(session_id)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(min(100, max(20, limit * 4)))
-    candidates = [dict(row) for row in store.db.execute(sql, params)]
     newest = max((r["ordinal"] for r in candidates), default=1)
     important = {
         "verifier_result",
@@ -42,7 +30,7 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20, priority_
             overlap + (0.2 if row["kind"] in important else 0) + 0.1 * row["ordinal"] / newest
         )
         row["ranking"] = (
-            "FTS/BM25 candidates + term overlap + evidence type + relative recency; not semantic"
+            "BM25 candidates + term overlap + evidence type + relative recency; not semantic"
         )
     lexical = sorted(candidates, key=lambda r: (r["score"], -r["lexical_score"]), reverse=True)
     if store.config(sid).context.embedding_model:
@@ -56,7 +44,7 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20, priority_
             store.event(
                 sid,
                 "semantic_retrieval_unavailable",
-                {"reason": str(exc)[:500], "fallback": "FTS and structural/recency ranking"},
+                {"reason": str(exc)[:500], "fallback": "lexical and structural/recency ranking"},
             )
             semantic = []
         fused = {}
@@ -66,7 +54,7 @@ def search(store, sid, query, *, kind=None, session_id=None, limit=20, priority_
                 record["score"] += 1 / (60 + rank)
                 record["sources"].append(source)
                 record["ranking"] = (
-                    "reciprocal-rank fusion of local embeddings and FTS/type/recency"
+                    "reciprocal-rank fusion of local embeddings and lexical/type/recency"
                 )
         return sorted(fused.values(), key=lambda r: -r["score"])[:limit]
     return lexical[:limit]

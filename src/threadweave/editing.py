@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import difflib
-import json
 import os
 import re
 from pathlib import Path
@@ -11,7 +10,6 @@ from pathlib import Path
 from .artifacts import atomic_write
 from .models import new_id, now
 from .repository import digest
-from .storage import encode
 
 
 def unified_changes(patch, read):
@@ -190,8 +188,9 @@ class Editor:
             "patch_artifact": patch_id,
             "rollback_of": rollback_of,
         }
-        self.store.db.execute(
-            "INSERT INTO edits VALUES(?,?,?,?)", (eid, self.context.session_id, now(), encode(body))
+        self.store.records.insert(
+            "edits",
+            {"id": eid, "session_id": self.context.session_id, "created_at": now(), "body": body},
         )
         try:
             for relative, after in changes.items():
@@ -214,10 +213,10 @@ class Editor:
         except BaseException:
             self._restore(record, expected="after_hash")
             body["status"] = "rolled_back"
-            self.store.db.execute("UPDATE edits SET body=? WHERE id=?", (encode(body), eid))
+            self.store.records.update("edits", {"body": body}, id=eid)
             raise
         with self.store.transaction():
-            self.store.db.execute("UPDATE edits SET body=? WHERE id=?", (encode(body), eid))
+            self.store.records.update("edits", {"body": body}, id=eid)
             self.store.event(
                 self.context.session_id,
                 "code_edit",
@@ -246,12 +245,10 @@ class Editor:
                 os.chmod(path, metadata["mode"])
 
     def rollback(self, edit_id):
-        row = self.store.db.execute(
-            "SELECT * FROM edits WHERE id=? AND session_id=?", (edit_id, self.context.session_id)
-        ).fetchone()
+        row = self.store.records.first("edits", id=edit_id, session_id=self.context.session_id)
         if not row:
             raise KeyError("Unknown edit in this session")
-        body = json.loads(row["body"])
+        body = row["body"]
         changes = {}
         for path, metadata in body["files"].items():
             current = self.read(path)
@@ -274,8 +271,8 @@ class Editor:
 def recover_edits(runtime):
     from .tools import ToolContext
 
-    for row in runtime.store.db.execute("SELECT * FROM edits").fetchall():
-        body = json.loads(row["body"])
+    for row in runtime.store.records.select("edits"):
+        body = row["body"]
         if body["status"] != "prepared":
             continue
         eid = runtime.store.event(row["session_id"], "edit_recovery", {"edit_id": row["id"]})
@@ -286,4 +283,4 @@ def recover_edits(runtime):
         except (ValueError, OSError) as exc:
             body.update(status="conflict", recovery_error=str(exc))
             runtime.store.update(row["session_id"], paused=True, runnable=False)
-        runtime.store.db.execute("UPDATE edits SET body=? WHERE id=?", (encode(body), row["id"]))
+        runtime.store.records.update("edits", {"body": body}, id=row["id"])

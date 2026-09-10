@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from .capabilities import CapabilityProvider, ChildProfile
@@ -128,21 +127,19 @@ class CodingAdapter(CodingTask):
                 "candidate_ready",
                 {"workspace": session.workspace.model_dump(), "checkpoint": checkpoint},
             )
-            self.runtime.store.db.execute(
-                "INSERT INTO candidates VALUES(?,?,?,?)",
-                (
-                    session.id,
-                    parent.id,
-                    checkpoint,
-                    encode(
-                        {
-                            "instruction": session.instruction,
-                            "start_time": session.created_at,
-                            "consumed": False,
-                            "accepted": False,
-                        }
-                    ),
-                ),
+            self.runtime.store.records.insert(
+                "candidates",
+                {
+                    "child_id": session.id,
+                    "parent_id": parent.id,
+                    "checkpoint_id": checkpoint,
+                    "body": {
+                        "instruction": session.instruction,
+                        "start_time": session.created_at,
+                        "consumed": False,
+                        "accepted": False,
+                    },
+                },
             )
 
     def context_messages(self, sid):
@@ -173,14 +170,14 @@ class CodingAdapter(CodingTask):
             or store.config(child.id).task.adapter != "coding"
         ):
             return
-        row = store.db.execute(
-            "SELECT body FROM coding_baselines WHERE session_id=?", (parent.id,)
-        ).fetchone()
+        row = store.records.first("coding_baselines", session_id=parent.id, fields=("body",))
         if row:
             # A shared child observes the SAME workspace changes against the
             # original verified baseline; it must not establish a new dirty baseline.
             with store.transaction():
-                store.db.execute("INSERT INTO coding_baselines VALUES(?,?)", (child.id, row[0]))
+                store.records.insert(
+                    "coding_baselines", {"session_id": child.id, "body": row["body"]}
+                )
                 store.event(
                     child.id,
                     "coding_baseline_inherited",
@@ -314,13 +311,11 @@ class CodingAdapter(CodingTask):
             store.close()
 
     def completed(self, sid):
-        row = self.runtime.store.db.execute(
-            "SELECT body FROM candidates WHERE child_id=?", (sid,)
-        ).fetchone()
+        row = self.runtime.store.records.first("candidates", child_id=sid, fields=("body",))
         if not row:
             return
         session = self.runtime.store.session(sid)
-        body = json.loads(row[0])
+        body = row["body"]
         body.update(
             end_time=session.updated_at if session.outcome != Outcome.ACTIVE else None,
             usage=self.runtime.store.usage(sid).model_dump(),
@@ -348,9 +343,7 @@ class CodingAdapter(CodingTask):
             body["patch_produced"] = bool(patch)
         except (ValueError, OSError) as exc:
             body["patch_error"] = str(exc)
-        self.runtime.store.db.execute(
-            "UPDATE candidates SET body=? WHERE child_id=?", (encode(body), sid)
-        )
+        self.runtime.store.records.update("candidates", {"body": body}, child_id=sid)
 
     def admitted(self, sid):
         from .repository_instructions import discover_instructions
@@ -406,8 +399,9 @@ class CodingAdapter(CodingTask):
             "recommendation": "Retrieve this evidence before repeating the same approach.",
         }
         identifier = new_id()
-        self.runtime.store.db.execute(
-            "INSERT INTO failure_memories VALUES(?,?,?,?)", (identifier, sid, now(), encode(body))
+        self.runtime.store.records.insert(
+            "failure_memories",
+            {"id": identifier, "session_id": sid, "created_at": now(), "body": body},
         )
         self.runtime.store.event(
             sid, "failure_memory", {"memory_id": identifier, **body}, parent=event
@@ -439,8 +433,8 @@ class CodingAdapter(CodingTask):
                         "replayed": False,
                     },
                 )
-        self.runtime.store.db.execute(
-            "UPDATE experiments SET status='interrupted' WHERE status='running'"
+        self.runtime.store.records.update(
+            "experiments", {"status": "interrupted"}, status="running"
         )
 
 

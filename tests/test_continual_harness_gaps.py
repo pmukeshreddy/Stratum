@@ -32,7 +32,7 @@ async def test_local_history_is_session_history_global_is_jsonl_and_restart_merg
     local = rt.store.harness.apply(sid, proposal(edit()), id="local_pass")
     global_result = rt.store.harness.apply(sid, proposal(edit()), id="global_pass", global_=True)
     assert rt.store.refinement_history(sid) == [local, global_result]
-    assert not (rt.store.harness.path(sid) / "refinements.jsonl").exists()
+    assert (rt.store.harness.path(sid) / "refinements.jsonl").exists()
     global_path = rt.store.harness.path() / "refinements.jsonl"
     assert [json.loads(line) for line in global_path.read_text().splitlines()] == [global_result]
     assert {r["id"] for r in rt.store.harness.history(sid)} == {"local_pass", "global_pass"}

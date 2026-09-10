@@ -42,27 +42,32 @@ class Artifacts:
 
     def put_bytes(self, sid: str, data: bytes, media_type="text/plain", source_event=None) -> str:
         checksum = hashlib.sha256(data).hexdigest()
-        existing = self.store.db.execute(
-            "SELECT id FROM artifacts WHERE session_id=? AND sha256=? AND media_type=? AND size=? LIMIT 1",
-            (sid, checksum, media_type, len(data)),
-        ).fetchone()
+        existing = self.store.records.first(
+            "artifacts",
+            session_id=sid,
+            sha256=checksum,
+            media_type=media_type,
+            size=len(data),
+            limit=1,
+            fields=("id",),
+        )
         if existing:
-            return existing[0]
+            return existing["id"]
         aid = new_id()
         path = self.directory / aid
         atomic_write(path, data)
-        self.store.db.execute(
-            "INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)",
-            (
-                aid,
-                sid,
-                str(path.relative_to(self.store.directory)),
-                media_type,
-                len(data),
-                checksum,
-                now(),
-                source_event,
-            ),
+        self.store.records.insert(
+            "artifacts",
+            {
+                "id": aid,
+                "session_id": sid,
+                "path": str(path.relative_to(self.store.directory)),
+                "media_type": media_type,
+                "size": len(data),
+                "sha256": checksum,
+                "created_at": now(),
+                "source_event": source_event,
+            },
         )
         self.index(sid, aid, data[:16000])
         return aid
@@ -79,25 +84,30 @@ class Artifacts:
                 size += len(chunk)
             target.flush()
             os.fsync(target.fileno())
-        existing = self.store.db.execute(
-            "SELECT id FROM artifacts WHERE session_id=? AND sha256=? AND media_type=? AND size=? LIMIT 1",
-            (sid, digest.hexdigest(), media_type, size),
-        ).fetchone()
+        existing = self.store.records.first(
+            "artifacts",
+            session_id=sid,
+            sha256=digest.hexdigest(),
+            media_type=media_type,
+            size=size,
+            limit=1,
+            fields=("id",),
+        )
         if existing:
             path.unlink()  # Only this just-created duplicate blob; existing history is unchanged.
-            return existing[0]
-        self.store.db.execute(
-            "INSERT INTO artifacts VALUES(?,?,?,?,?,?,?,?)",
-            (
-                aid,
-                sid,
-                str(path.relative_to(self.store.directory)),
-                media_type,
-                size,
-                digest.hexdigest(),
-                now(),
-                source_event,
-            ),
+            return existing["id"]
+        self.store.records.insert(
+            "artifacts",
+            {
+                "id": aid,
+                "session_id": sid,
+                "path": str(path.relative_to(self.store.directory)),
+                "media_type": media_type,
+                "size": size,
+                "sha256": digest.hexdigest(),
+                "created_at": now(),
+                "source_event": source_event,
+            },
         )
         with path.open("rb") as stream:
             self.index(sid, aid, stream.read(16000))
@@ -105,19 +115,12 @@ class Artifacts:
 
     def index(self, sid, aid, data):
         if b"\0" not in data:
-            self.store.db.execute(
-                "INSERT INTO history_fts(id,session_id,root_id,kind,text) VALUES(?,?,?,?,?)",
-                (
-                    aid,
-                    sid,
-                    self.store.session(sid).root_id,
-                    "artifact",
-                    data.decode(errors="replace"),
-                ),
+            self.store.records.update(
+                "artifacts", {"search_text": data.decode(errors="replace")}, id=aid
             )
 
     def metadata(self, sid: str, aid: str) -> dict:
-        row = self.store.db.execute("SELECT * FROM artifacts WHERE id=?", (aid,)).fetchone()
+        row = self.store.records.first("artifacts", id=aid)
         if not row:
             raise KeyError(f"Unknown artifact: {aid}")
         # Tree members share artifacts. A fork can read its explicit ancestry.

@@ -1,13 +1,10 @@
 """Durable hypotheses and measured experiment runs bound to source checkpoints."""
 
-import json
-
 from .benchmarks import compare, run_benchmark
 from .coding import run_command
 from .coding_config import BenchmarkConfig
 from .gitops import GitWorkspace
 from .models import new_id, now
-from .storage import encode
 
 
 class Experiments:
@@ -26,9 +23,15 @@ class Experiments:
             "source_checkpoint": GitWorkspace(self.context).snapshot_tree("experiment-input"),
             "conclusion": None,
         }
-        self.store.db.execute(
-            "INSERT INTO experiments VALUES(?,?,?,?,?)",
-            (identifier, self.context.session_id, now(), "created", encode(body)),
+        self.store.records.insert(
+            "experiments",
+            {
+                "id": identifier,
+                "session_id": self.context.session_id,
+                "created_at": now(),
+                "status": "created",
+                "body": body,
+            },
         )
         self.store.event(
             self.context.session_id,
@@ -39,31 +42,33 @@ class Experiments:
         return {"experiment_id": identifier, **body}
 
     def get(self, identifier):
-        row = self.store.db.execute(
-            "SELECT * FROM experiments WHERE id=?", (identifier,)
-        ).fetchone()
+        row = self.store.records.first("experiments", id=identifier)
         if not row or self.store.session(row["session_id"]).root_id not in self.store.history_roots(
             self.context.session_id
         ):
             raise KeyError("Unknown experiment in this trajectory")
         return {
             **dict(row),
-            "body": json.loads(row["body"]),
+            "body": row["body"],
             "runs": [
-                json.loads(r[0])
-                for r in self.store.db.execute(
-                    "SELECT body FROM experiment_runs WHERE experiment_id=? ORDER BY created_at",
-                    (identifier,),
+                r["body"]
+                for r in self.store.records.select(
+                    "experiment_runs",
+                    experiment_id=identifier,
+                    order=(("created_at", False),),
+                    fields=("body",),
                 )
             ],
         }
 
     def list(self):
         return [
-            self.get(row[0])
-            for row in self.store.db.execute(
-                "SELECT id FROM experiments WHERE session_id=? ORDER BY created_at",
-                (self.context.session_id,),
+            self.get(row["id"])
+            for row in self.store.records.select(
+                "experiments",
+                session_id=self.context.session_id,
+                order=(("created_at", False),),
+                fields=("id",),
             )
         ]
 
@@ -72,7 +77,7 @@ class Experiments:
         if experiment["session_id"] != self.context.session_id:
             raise PermissionError("Only the owning session can execute an experiment")
         body = experiment["body"]
-        self.store.db.execute("UPDATE experiments SET status='running' WHERE id=?", (identifier,))
+        self.store.records.update("experiments", {"status": "running"}, id=identifier)
         run_id = new_id()
         self.store.event(
             self.context.session_id,
@@ -107,13 +112,11 @@ class Experiments:
                 "conclusion": conclusion,
                 "conclusion_source": "agent" if conclusion else None,
             }
-            self.store.db.execute(
-                "INSERT INTO experiment_runs VALUES(?,?,?,?)",
-                (run_id, identifier, now(), encode(result)),
+            self.store.records.insert(
+                "experiment_runs",
+                {"id": run_id, "experiment_id": identifier, "created_at": now(), "body": result},
             )
-            self.store.db.execute(
-                "UPDATE experiments SET status='concluded' WHERE id=?", (identifier,)
-            )
+            self.store.records.update("experiments", {"status": "concluded"}, id=identifier)
             self.store.event(
                 self.context.session_id,
                 "experiment_conclusion",
@@ -122,9 +125,7 @@ class Experiments:
             )
             return result
         except BaseException:
-            self.store.db.execute(
-                "UPDATE experiments SET status='interrupted' WHERE id=?", (identifier,)
-            )
+            self.store.records.update("experiments", {"status": "interrupted"}, id=identifier)
             raise
 
     def compare(self, first, second):

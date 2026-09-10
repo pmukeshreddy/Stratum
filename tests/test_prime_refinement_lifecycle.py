@@ -292,7 +292,7 @@ def test_partial_conflict_and_validation_failures_do_not_block_other_edits():
     assert len(normalize_proposal({"edits": [None, [], "invalid"]})["edits"]) == 1
 
 
-async def test_audit_failure_preserves_outcome_but_does_not_emit_notice(
+async def test_global_receipt_failure_preserves_outcome_but_does_not_emit_notice(
     harness_runtime, monkeypatch
 ):
     rt, sid, _ = harness_runtime
@@ -302,7 +302,7 @@ async def test_audit_failure_preserves_outcome_but_does_not_emit_notice(
 
     monkeypatch.setattr(rt.store, "record_harness_refinement", fail)
     with pytest.raises(OSError, match="audit failed"):
-        await rt.refine(sid)
+        await rt.refine(sid, global_=True)
     assert rt.store.harness.entries(sid)
     assert rt.store.events(sid, kind="refinement_outcome")
     assert not rt.store.events(sid, kind="refinement_notice")

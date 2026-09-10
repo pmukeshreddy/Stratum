@@ -43,7 +43,7 @@ def data_directory(workspace, explicit=None):
         return explicit.resolve()
     # Existing local stores remain usable; new chats don't dirty the repository.
     legacy = workspace / ".threadweave"
-    if (legacy / "history.sqlite3").is_file():
+    if (legacy / "store.json").is_file() or (legacy / "history.sqlite3").is_file():
         return legacy.resolve()
     return (
         Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "threadweave"

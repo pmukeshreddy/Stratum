@@ -16,22 +16,28 @@ def coding_focus(store, sid, *, index_provider=None):
     focus = store.events(sid, kind="working_focus", limit=1)
     if focus:
         state["investigation"] = focus[0]["payload"]
-    verifications = store.db.execute(
-        "SELECT passed,body FROM final_verifications WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
-        (sid,),
-    ).fetchone()
-    if verifications and not verifications[0]:
-        details = json.loads(verifications[1])["details"]
+    verifications = store.records.first(
+        "final_verifications",
+        session_id=sid,
+        order=(("created_at", True),),
+        limit=1,
+        fields=("passed", "body"),
+    )
+    if verifications and not verifications["passed"]:
+        details = verifications["body"]["details"]
         state["unresolved_verifier_failures"] = details["violations"][:10]
-    experiments = store.db.execute(
-        "SELECT id,status,body FROM experiments WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
-        (sid,),
-    ).fetchone()
+    experiments = store.records.first(
+        "experiments",
+        session_id=sid,
+        order=(("created_at", True),),
+        limit=1,
+        fields=("id", "status", "body"),
+    )
     if experiments:
         state["latest_experiment"] = {
-            "id": experiments[0],
-            "status": experiments[1],
-            "hypothesis": json.loads(experiments[2])["hypothesis"][:500],
+            "id": experiments["id"],
+            "status": experiments["status"],
+            "hypothesis": experiments["body"]["hypothesis"][:500],
         }
     edits = store.events(sid, kind="code_edit", limit=3) + store.events(
         sid, kind="workspace_effects", limit=3

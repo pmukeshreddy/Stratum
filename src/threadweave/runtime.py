@@ -425,10 +425,8 @@ class Runtime(RefinementServices):
             names = sorted(set(data.get("values", {})) | set(data.get("recipes", {})))
             missing = sorted(data.get("missing", {}))
 
-        def count(table, clause=""):
-            return self.store.db.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE session_id=?{clause}", (sid,)
-            ).fetchone()[0]
+        def count(collection, **match):
+            return self.store.records.count(collection, session_id=sid, **match)
 
         children = [s for s in self.store.sessions(root_id=session.root_id) if s.parent_id == sid]
         return {
@@ -454,11 +452,10 @@ class Runtime(RefinementServices):
                 "artifacts": count("artifacts"),
                 "compactions": count("compactions"),
                 "harness_entries": len(self.store.harness.entries(sid)),
-                "pending_messages": self.store.db.execute(
-                    "SELECT COUNT(*) FROM messages WHERE recipient_id=? AND received_at IS NULL",
-                    (sid,),
-                ).fetchone()[0],
-                "schedules": count("schedules", " AND enabled=1"),
+                "pending_messages": self.store.records.count(
+                    "messages", recipient_id=sid, received_at=None
+                ),
+                "schedules": count("schedules", enabled=1),
                 "goal": self.store.goal(sid),
                 "history_append_only": True,
             },
@@ -512,11 +509,15 @@ class Runtime(RefinementServices):
         session = self.store.session(sid)
         if not session.parent_id or session.outcome != Outcome.COMPLETED or session.paused:
             return False
-        message = self.store.db.execute(
-            "SELECT id FROM messages WHERE recipient_id=? AND received_at IS NULL "
-            "AND (sender_id=? OR sender_id IS NULL) ORDER BY created_at LIMIT 1",
-            (sid, session.parent_id),
-        ).fetchone()
+        message = self.store.records.first(
+            "messages",
+            where=lambda row: (row["sender_id"] == session.parent_id) or (row["sender_id"] is None),
+            recipient_id=sid,
+            received_at=None,
+            order=(("created_at", False),),
+            limit=1,
+            fields=("id",),
+        )
         if not message:
             return False
         ancestor = self.store.session(session.parent_id)
@@ -532,13 +533,16 @@ class Runtime(RefinementServices):
         except BudgetBusy:
             # Reservations are temporary; normal invocation admission will wait.
             pass
-        self.store.db.execute(
-            "UPDATE messages SET delivery='boundary' WHERE recipient_id=? AND received_at IS NULL AND delivery='idle'",
-            (sid,),
+        self.store.records.update(
+            "messages",
+            {"delivery": "boundary"},
+            recipient_id=sid,
+            received_at=None,
+            delivery="idle",
         )
         self.store.update(sid, outcome=Outcome.ACTIVE, runnable=True, wake_at=None, result=None)
-        self.store.db.execute(
-            "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
+        self.store.records.update(
+            "goals", {"status": "active", "updated_at": now()}, session_id=sid
         )
         self.store.event(
             sid,
@@ -624,8 +628,8 @@ class Runtime(RefinementServices):
                 wake_at=None,
                 last_error=None,
             )
-            self.store.db.execute(
-                "UPDATE goals SET status='active',updated_at=? WHERE session_id=?", (now(), sid)
+            self.store.records.update(
+                "goals", {"status": "active", "updated_at": now()}, session_id=sid
             )
             self.store.event(sid, "resumed", {})
         self._wake.set()
@@ -654,9 +658,17 @@ class Runtime(RefinementServices):
         next_at = self._next_schedule(interval_seconds, cron, now())
         schedule_id = new_id()
         with self.store.transaction():
-            self.store.db.execute(
-                "INSERT INTO schedules VALUES(?,?,?,?,?,?,?)",
-                (schedule_id, sid, interval_seconds, cron, next_at, 1, instruction),
+            self.store.records.insert(
+                "schedules",
+                {
+                    "id": schedule_id,
+                    "session_id": sid,
+                    "interval_seconds": interval_seconds,
+                    "cron": cron,
+                    "next_at": next_at,
+                    "enabled": 1,
+                    "instruction": instruction,
+                },
             )
             self.store.event(
                 sid,
@@ -681,9 +693,9 @@ class Runtime(RefinementServices):
 
     def _schedules_due(self):
         timestamp = now()
-        rows = self.store.db.execute(
-            "SELECT * FROM schedules WHERE enabled=1 AND next_at<=?", (timestamp,)
-        ).fetchall()
+        rows = self.store.records.select(
+            "schedules", where=lambda row: row["next_at"] <= timestamp, enabled=1
+        )
         for row in rows:
             with self.store.transaction():
                 if self.store.session(row["session_id"]).outcome != Outcome.ACTIVE:
@@ -691,9 +703,7 @@ class Runtime(RefinementServices):
                 self.message(None, row["session_id"], row["instruction"])
                 # Coalesce missed ticks: never unleash a backlog of overdue model calls.
                 next_at = self._next_schedule(row["interval_seconds"], row["cron"], timestamp)
-                self.store.db.execute(
-                    "UPDATE schedules SET next_at=? WHERE id=?", (next_at, row["id"])
-                )
+                self.store.records.update("schedules", {"next_at": next_at}, id=row["id"])
                 self.store.event(
                     row["session_id"],
                     "heartbeat",
@@ -754,11 +764,9 @@ class Runtime(RefinementServices):
             if usage.output_tokens >= limits.output_token_budget:
                 raise LimitReached("Root output token budget exhausted")
             if resource == "model_calls":
-                reserved_output = self.store.db.execute(
-                    "SELECT COALESCE(SUM(r.output_tokens),0) FROM reservations r "
-                    "JOIN sessions s ON s.id=r.session_id WHERE s.root_id=?",
-                    (root.id,),
-                ).fetchone()[0]
+                reserved_output = sum(
+                    row["output_tokens"] for row in self.store.reservations(root.id)
+                )
                 output = (provider or self.store.config(sid).provider).max_output_tokens
                 if usage.output_tokens + reserved_output + output > limits.output_token_budget:
                     if (
@@ -820,26 +828,29 @@ class Runtime(RefinementServices):
                 self.store.update(session.id, runnable=False)
                 self.store.event(session.id, "configuration_recovery_failed", {"reason": str(exc)})
         await self.environment.recover()
-        if (
-            not hasattr(self, "background")
-            and self.store.db.execute("SELECT 1 FROM process_jobs LIMIT 1").fetchone()
-        ):
+        if not hasattr(self, "background") and self.store.records.first("process_jobs", limit=1):
             from .background import BackgroundProcesses
 
             self.background = BackgroundProcesses(self)
         if hasattr(self, "background"):
             self.background.recover()
-        self.store.db.execute(
-            "UPDATE model_attempts SET status='interrupted',ended_at=? WHERE status='running'",
-            (now(),),
+        self.store.records.update(
+            "model_attempts", {"status": "interrupted", "ended_at": now()}, status="running"
         )
-        self.store.db.execute(
-            "UPDATE model_requests SET status='interrupted',ended_at=? WHERE status IN ('running','retrying')",
-            (now(),),
+        self.store.records.update(
+            "model_requests",
+            {"status": "interrupted", "ended_at": now()},
+            where=lambda row: (
+                row["status"]
+                in (
+                    "running",
+                    "retrying",
+                )
+            ),
         )
         # Reservations from an interrupted model request have unknown billing. Conservatively
         # charge the full reservation instead of silently resetting spend after a crash.
-        for row in self.store.db.execute("SELECT * FROM reservations").fetchall():
+        for row in self.store.records.select("reservations"):
             with self.store.transaction():
                 self.store.charge(
                     row["session_id"],
@@ -851,23 +862,21 @@ class Runtime(RefinementServices):
                     ),
                     parent=row["id"],
                 )
-                self.store.db.execute(
-                    "UPDATE model_attempts SET usage=?,failure=? WHERE event_id=?",
-                    (
-                        encode(
-                            Usage(
-                                input_tokens=row["input_tokens"],
-                                output_tokens=row["output_tokens"],
-                                cost=row["cost"],
-                                estimated_calls=1,
-                                model_calls=1,
-                            ).model_dump()
-                        ),
-                        encode({"code": "runtime_restart", "uncertain": True}),
-                        row["id"],
-                    ),
+                self.store.records.update(
+                    "model_attempts",
+                    {
+                        "usage": Usage(
+                            input_tokens=row["input_tokens"],
+                            output_tokens=row["output_tokens"],
+                            cost=row["cost"],
+                            estimated_calls=1,
+                            model_calls=1,
+                        ).model_dump(),
+                        "failure": {"code": "runtime_restart", "uncertain": True},
+                    },
+                    event_id=row["id"],
                 )
-                self.store.db.execute("DELETE FROM reservations WHERE id=?", (row["id"],))
+                self.store.records.delete("reservations", id=row["id"])
                 self.store.event(
                     row["session_id"],
                     "recovery",
@@ -903,9 +912,7 @@ class Runtime(RefinementServices):
                 self.store.event(session.id, "failure", failure.model_dump())
                 continue
             # A completed worker checkpoint can close the action receipt crash window.
-            rows = self.store.db.execute(
-                "SELECT * FROM actions WHERE session_id=? AND status='running'", (session.id,)
-            ).fetchall()
+            rows = self.store.records.select("actions", session_id=session.id, status="running")
             for row in rows:
                 raw = (
                     self._kernel(session.id).receipt(row["id"])
@@ -1522,9 +1529,17 @@ class Runtime(RefinementServices):
         except BaseException:
             # Admission failure or cancellation during retry backoff also closes
             # the logical request, even though no new transport attempt started.
-            self.store.db.execute(
-                "UPDATE model_requests SET status='failed',ended_at=? WHERE id=? AND status IN ('running','retrying')",
-                (now(), request.request_id),
+            self.store.records.update(
+                "model_requests",
+                {"status": "failed", "ended_at": now()},
+                where=lambda row: (
+                    row["status"]
+                    in (
+                        "running",
+                        "retrying",
+                    )
+                ),
+                id=request.request_id,
             )
             raise
 
@@ -1604,29 +1619,34 @@ class Runtime(RefinementServices):
                                 "purpose": request.metadata.get("purpose", "agent"),
                             },
                         )
-                        self.store.db.execute(
-                            "INSERT INTO model_attempts VALUES(?,?,?,?,?,?,?)",
-                            (
-                                eid,
-                                request.request_id,
-                                attempt + 1,
-                                "running",
-                                encode(Usage(model_calls=1).model_dump()),
-                                None,
-                                None,
-                            ),
+                        self.store.records.insert(
+                            "model_attempts",
+                            {
+                                "event_id": eid,
+                                "request_id": request.request_id,
+                                "attempt": attempt + 1,
+                                "status": "running",
+                                "usage": Usage(model_calls=1).model_dump(),
+                                "failure": None,
+                                "ended_at": None,
+                            },
                         )
-                        self.store.db.execute(
-                            "UPDATE model_requests SET status='running' WHERE id=?",
-                            (request.request_id,),
+                        self.store.records.update(
+                            "model_requests", {"status": "running"}, id=request.request_id
                         )
                         cost = (
                             size * (provider.input_cost_per_million or 0)
                             + provider.max_output_tokens * (provider.output_cost_per_million or 0)
                         ) / 1_000_000
-                        self.store.db.execute(
-                            "INSERT INTO reservations VALUES(?,?,?,?,?)",
-                            (eid, sid, size, provider.max_output_tokens, cost),
+                        self.store.records.insert(
+                            "reservations",
+                            {
+                                "id": eid,
+                                "session_id": sid,
+                                "input_tokens": size,
+                                "output_tokens": provider.max_output_tokens,
+                                "cost": cost,
+                            },
                         )
                         self.store.charge(sid, Usage(model_calls=1), parent=eid)
                     registered = True
@@ -1684,7 +1704,7 @@ class Runtime(RefinementServices):
                     response.usage.estimated_calls += 1
                 with self.store.transaction():
                     self.store.charge(sid, response.usage, parent=eid)
-                    self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
+                    self.store.records.delete("reservations", id=eid)
                     response_event = self.store.event(
                         sid, "model_response", response.model_dump(mode="json"), parent=eid
                     )
@@ -1695,14 +1715,14 @@ class Runtime(RefinementServices):
                         request.request_id, eid, measured, response_event=response_event
                     )
                     if response.provider_items:
-                        self.store.db.execute(
-                            "INSERT INTO provider_continuations VALUES(?,?,?,?)",
-                            (
-                                response_event,
-                                provider.name,
-                                provider.model,
-                                encode(response.provider_items),
-                            ),
+                        self.store.records.insert(
+                            "provider_continuations",
+                            {
+                                "event_id": response_event,
+                                "provider": provider.name,
+                                "model": provider.model,
+                                "items": response.provider_items,
+                            },
                         )
                     if persist_turn:
                         from .request_context import record_usage
@@ -1733,7 +1753,7 @@ class Runtime(RefinementServices):
                         ),
                         parent=eid,
                     )
-                    self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
+                    self.store.records.delete("reservations", id=eid)
                     self.store.finish_request_attempt(
                         request.request_id,
                         eid,
@@ -1772,7 +1792,7 @@ class Runtime(RefinementServices):
                         ),
                         parent=eid,
                     )
-                    self.store.db.execute("DELETE FROM reservations WHERE id=?", (eid,))
+                    self.store.records.delete("reservations", id=eid)
                     self.store.event(sid, "failure", failure.model_dump(), parent=eid)
                     self.store.finish_request_attempt(
                         request.request_id,
@@ -1818,9 +1838,9 @@ class Runtime(RefinementServices):
     async def _execute_action(self, sid, action_id, action: Action, parent, *, from_python=False):
         if self.store.session(sid).paused:
             raise asyncio.CancelledError("Session paused before action")
-        old = self.store.db.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+        old = self.store.records.first("actions", id=action_id)
         if old and old["status"] == "done":
-            return json.loads(old["result"])
+            return old["result"]
         if old:
             return self._action_result(
                 sid,
@@ -1852,9 +1872,18 @@ class Runtime(RefinementServices):
                 },
                 parent=parent,
             )
-            self.store.db.execute(
-                "INSERT INTO actions VALUES(?,?,?,?,?,?,?,?)",
-                (action_id, sid, action.name, encode(action.arguments), "running", None, eid, None),
+            self.store.records.insert(
+                "actions",
+                {
+                    "id": action_id,
+                    "session_id": sid,
+                    "name": action.name,
+                    "arguments": action.arguments,
+                    "status": "running",
+                    "result": None,
+                    "source_event": eid,
+                    "result_event": None,
+                },
             )
             self.store.charge(sid, Usage(tool_calls=1), parent=eid)
         config = self.store.config(sid)
@@ -1953,9 +1982,8 @@ class Runtime(RefinementServices):
                 {"action_id": action_id, "result": exposed, "recovered": recovered},
                 parent=parent,
             )
-            self.store.db.execute(
-                "UPDATE actions SET status='done',result=?,result_event=? WHERE id=?",
-                (encode(exposed), eid, action_id),
+            self.store.records.update(
+                "actions", {"status": "done", "result": exposed, "result_event": eid}, id=action_id
             )
             if isinstance(raw, dict) and (
                 raw.get("passed") is False

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import tempfile
@@ -12,7 +11,6 @@ from .artifacts import atomic_write
 from .editing import Editor, invalidate_bytecode, make_diff
 from .models import new_id, now
 from .repository import confined, digest
-from .storage import encode
 
 
 def git(root, *arguments, errors="replace", extra_env=None, input=None, binary=False):
@@ -93,9 +91,16 @@ class GitWorkspace:
                 "mode": path.stat().st_mode & 0o777,
             }
         cid, state = new_id(), self.status()
-        self.store.db.execute(
-            "INSERT INTO checkpoints VALUES(?,?,?,?,?,?)",
-            (cid, self.context.session_id, now(), label, encode(manifest), state["head"]),
+        self.store.records.insert(
+            "checkpoints",
+            {
+                "id": cid,
+                "session_id": self.context.session_id,
+                "created_at": now(),
+                "label": label,
+                "manifest": manifest,
+                "head": state["head"],
+            },
         )
         self.store.event(
             self.context.session_id,
@@ -146,9 +151,16 @@ class GitWorkspace:
                 manifest[path] = {"git_blob": oid, "mode": int(mode, 8) & 0o777}
         cid = new_id()
         git(self.root, "update-ref", "refs/threadweave/checkpoints/" + cid, commit)
-        self.store.db.execute(
-            "INSERT INTO checkpoints VALUES(?,?,?,?,?,?)",
-            (cid, self.context.session_id, now(), label, encode(manifest), commit),
+        self.store.records.insert(
+            "checkpoints",
+            {
+                "id": cid,
+                "session_id": self.context.session_id,
+                "created_at": now(),
+                "label": label,
+                "manifest": manifest,
+                "head": commit,
+            },
         )
         self.store.event(
             self.context.session_id,
@@ -196,14 +208,12 @@ class GitWorkspace:
         return body
 
     def checkpoint(self, checkpoint_id):
-        row = self.store.db.execute(
-            "SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,)
-        ).fetchone()
+        row = self.store.records.first("checkpoints", id=checkpoint_id)
         if not row or self.store.session(row["session_id"]).root_id not in self.store.history_roots(
             self.context.session_id
         ):
             raise KeyError("Unknown checkpoint in this trajectory")
-        return {**dict(row), "manifest": json.loads(row["manifest"])}
+        return {**dict(row), "manifest": row["manifest"]}
 
     def content(self, entry):
         if "git_blob" in entry:
@@ -331,9 +341,7 @@ class GitWorkspace:
 
 def candidate_result(context, child_id, *, accept=False):
     runtime = context.runtime
-    row = runtime.store.db.execute(
-        "SELECT * FROM candidates WHERE child_id=? AND parent_id=?", (child_id, context.session_id)
-    ).fetchone()
+    row = runtime.store.records.first("candidates", child_id=child_id, parent_id=context.session_id)
     if not row:
         raise PermissionError("Candidate must be a direct isolated child")
     child = runtime.store.session(child_id)
@@ -344,7 +352,7 @@ def candidate_result(context, child_id, *, accept=False):
     child_context = ToolContext(runtime, child_id, new_id(), context.source_event)
     patch = GitWorkspace(child_context).diff()
     aid = runtime.artifacts.put_bytes(child_id, patch.encode(), "text/x-diff")
-    body = json.loads(row["body"])
+    body = row["body"]
     body.update(
         consumed=True,
         patch_artifact=aid,
@@ -367,9 +375,7 @@ def candidate_result(context, child_id, *, accept=False):
         GitWorkspace(context).snapshot("before-candidate-acceptance")
         result["edit"] = Editor(context).apply_patch(patch)
         body.update(accepted=True, useful=True)
-    runtime.store.db.execute(
-        "UPDATE candidates SET body=? WHERE child_id=?", (encode(body), child_id)
-    )
+    runtime.store.records.update("candidates", {"body": body}, child_id=child_id)
     runtime.store.event(
         context.session_id,
         "candidate_consumed",
@@ -384,12 +390,21 @@ async def recover_workspace_effects(runtime):
 
     from .tools import ToolContext
 
-    records = runtime.store.db.execute(
-        "SELECT session_id,id,type,payload FROM events WHERE type IN ('workspace_observation_started','workspace_effects') ORDER BY seq"
-    ).fetchall()
+    records = runtime.store.records.select(
+        "events",
+        where=lambda row: (
+            row["type"]
+            in (
+                "workspace_observation_started",
+                "workspace_effects",
+            )
+        ),
+        order=(("seq", False),),
+        fields=("session_id", "id", "type", "payload"),
+    )
     pending = {}
     for row in records:
-        body = json.loads(row["payload"])
+        body = row["payload"]
         if row["type"] == "workspace_observation_started":
             pending[body["action_id"]] = (row["session_id"], row["id"], body["checkpoint_id"])
         else:

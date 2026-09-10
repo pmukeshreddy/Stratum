@@ -88,7 +88,11 @@ def test_atomic_save_roundtrip_and_failure(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         save_harness_state(tmp_path, empty_harness_state())
     assert path.read_bytes() == original
-    assert list(tmp_path.iterdir()) == [path]
+    assert {p.name for p in tmp_path.iterdir()} == {
+        "harness_state.json",
+        "state_changes.jsonl",
+        ".harness.lock",
+    }
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -142,12 +146,13 @@ def test_merge_preserves_collisions_without_mutating_inputs():
     assert global_state["entries"]["memory"]["lesson"]["content"] != "changed"
 
 
-def test_jsonl_skips_malformed_and_merges(tmp_path):
+def test_jsonl_reports_corruption_and_merges(tmp_path):
     result = apply(empty_harness_state(), edit(), scope="global")
     append_refinement_history(tmp_path, result)
     with (tmp_path / "refinements.jsonl").open("a") as f:
         f.write('bad\n{"id":"invalid"}\n')
-    assert load_refinement_history(tmp_path) == [result]
+    with pytest.raises(ValueError, match="Invalid JSONL"):
+        load_refinement_history(tmp_path)
     assert merge_refinement_history([result], [{**result, "summary": "new"}])[0]["summary"] == "new"
 
 

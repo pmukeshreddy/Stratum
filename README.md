@@ -100,9 +100,12 @@ not destroy the root.
 The continual harness uses `harness_state.json` as its only active learned state,
 with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
 `DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`. Local
-refinement history is stored as session audit events, separate from model conversation.
-Retired SQLite reinforcement tables and import adapters have been removed.
+Global refinement history appends to `DATA/harness/refinements.jsonl`; local
+history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
+`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
+advances. Interrupted writes recover under a process lock. Runtime persistence uses
+JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
+once, with their original database left untouched.
 
 `await refine.run()` schedules local refinement; optional instructions focus the
 planner, and `global_=True` explicitly requests global changes. `await refine.status()`
@@ -151,7 +154,7 @@ await refine.run("Retain the reusable testing workflow supported by this traject
 Files/Path, shell handles, editing, repository retrieval, MCP, skills and durable
 state are preloaded in roots and children. `tools.catalog()` retrieves optional
 capability schemas into Python. The full instruction is in `context['task']`;
-`context['messages_path']` points to a readable full-history JSONL projection.
+`context['messages_path']` points to a authoritative per-session JSONL event log.
 Only explicitly returned/printed selections enter L1. Normal final text ends/yields
 ordinary interaction; there is no universal coding verifier or finish tool.
 
@@ -220,7 +223,7 @@ Turn/token/time/tool/Python/depth/concurrency limits and accounting include
 descendants; detach/resume does not reset budgets.
 
 New chats store state in the user's XDG data directory (normally
-~/.local/share/threadweave), reuse an existing workspace .threadweave/history.sqlite3,
+~/.local/share/threadweave), reuse an existing workspace .threadweave store,
 or use --data. Automation retains list, status, tree, history, usage, states, input,
 attach, pause, resume, stop, fork and schedule. Explicitly restart an old daemon
 after upgrading: live processes do not reload source changes.

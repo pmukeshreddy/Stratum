@@ -206,7 +206,7 @@ async def test_cron_uses_utc_and_validates_inputs(runtime, tmp_path):
         runtime.schedule(root.id, cron="* * * * *", interval_seconds=1)
     schedule = runtime.schedule(root.id, cron="*/5 * * * *")
     assert (
-        runtime.store.db.execute("SELECT cron FROM schedules WHERE id=?", (schedule,)).fetchone()[0]
+        runtime.store.records.first("schedules", id=schedule, fields=("cron",))["cron"]
         == "*/5 * * * *"
     )
 
