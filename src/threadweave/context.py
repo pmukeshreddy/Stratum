@@ -127,8 +127,9 @@ branches when their evidence can advance your task. For separable investigations
 children without waiting for each to finish:
 left = await rlm('Investigate the first component against its specification.', name='left')
 right = await rlm('Investigate the second component against its specification.', name='right')
-Then continue complementary local work. Use these patterns only when they add useful evidence;
-a small local task needs no child. Optional requirement= describes the task requirement being investigated.
+Then continue complementary local work. Delegate independent investigation or implementation in
+parallel; do a single known lookup, edit, or command inline. Choose by the work that can be
+separated, not the size of the final answer. Optional requirement= describes the task requirement being investigated.
 """
     if config.features.history_retrieval:
         text += "history.search(query), history.get(event_id), context.search(query), artifacts.load(id) retrieve retained evidence.\n"

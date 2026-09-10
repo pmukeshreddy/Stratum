@@ -118,6 +118,25 @@ class KernelState:
                 raise ValueError(f"Recipe did not recreate {name}")
             value = worker.values[name]
         self.used[name] = self.cell
+        # Observability only: keep successful explicit restores out of model context,
+        # checkpoint state and tool results. Recovery already has a runtime receipt.
+        if getattr(worker, "active_id", None):
+            try:
+                with (worker.directory / "restore-events.jsonl").open("a") as stream:
+                    stream.write(
+                        json.dumps(
+                            {
+                                "timestamp": time.time(),
+                                "session_id": self.owner,
+                                "execution_id": worker.active_id,
+                                "name": name,
+                                "action": row.get("action"),
+                            }
+                        )
+                        + "\n"
+                    )
+            except OSError:
+                pass  # Measurement failure must not change a task's execution.
         return value
 
     def restore(self):

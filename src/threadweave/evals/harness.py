@@ -39,11 +39,22 @@ class MatchedProvider:
         self.provider, self.config, self.log = provider, config, Path(log)
         self.gate, self.owner = gate, owner
         self.primary_usages = []
-        self.refinement_config = refinement_provider_config(config)
+        # Mirror the production auxiliary reservations without changing its policy.
+        self.refinement_expected = {
+            purpose: refinement_provider_config(config).model_copy(
+                update={"max_output_tokens": min(config.max_output_tokens, cap)}
+            )
+            for purpose, cap in (("refinement_review", 4096), ("refinement", 32000))
+        }
+        self.refinement_configs = dict(self.refinement_expected)
         self.request_validator = request_validator
 
     async def resolve(self, config, *, reasoning_off=False):
-        expected = refinement_provider_config(self.config) if reasoning_off else self.config
+        expected = (
+            next((c for c in self.refinement_expected.values() if c == config), None)
+            if reasoning_off
+            else self.config
+        )
         if config != expected:
             raise HarnessError(
                 "provider",
@@ -66,7 +77,9 @@ class MatchedProvider:
                 "Subscription model/settings changed after comparison was pinned",
             )
         if reasoning_off:
-            self.refinement_config = resolved
+            for purpose, candidate in self.refinement_expected.items():
+                if candidate == expected:
+                    self.refinement_configs[purpose] = resolved
         return resolved, details
 
     async def invoke(self, request, emit):
@@ -90,7 +103,9 @@ class MatchedProvider:
             and request.reasoning_mode == "off"
             and request.metadata.get("purpose") in {"refinement", "refinement_review"}
         )
-        expected = self.refinement_config if structured else self.config
+        expected = (
+            self.refinement_configs[request.metadata["purpose"]] if structured else self.config
+        )
         if request.config != expected:
             raise HarnessError(
                 "provider",

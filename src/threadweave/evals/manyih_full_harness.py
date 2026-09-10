@@ -26,6 +26,7 @@ from .manyih_coding import (
     records_summary,
     run_config,
 )
+from .observability import summarize, task_observability
 from .schema import BenchmarkSetup, file_digest, save, timestamp
 
 IDS = [str(i) for i in range(100)]
@@ -97,7 +98,7 @@ def aggregate_mechanisms(rows):
 def audit(output, previous):
     manifest = json.loads((output / "manifest.json").read_text())
     assert source_hashes(ROOT / "src") == manifest["source_hashes"], "Runtime changed during run"
-    records, old_metrics = [], []
+    records, old_metrics, details, activities, calls, refinements = [], [], [], [], [], []
     for task_id in IDS:
         directory = output / "full/buffalo" / task_id
         record = json.loads((directory / "result.json").read_text())
@@ -121,6 +122,7 @@ def audit(output, previous):
         config = json.loads((directory / "buffalo-config.json").read_text())
         initial = json.loads((directory / "initial-harness-state.json").read_text())
         assert not any(initial["states"]["entries"].values())
+        assert not initial["states"].get("refinements")
         assert Path(initial["state_directory"]) == directory / "state"
         assert config["refinement"]["enabled"]
         assert all(config["features"].values())
@@ -130,8 +132,8 @@ def audit(output, previous):
         for line in (directory / "provider-calls.jsonl").read_text().splitlines():
             request = json.loads(line)["request"]
             assert request["config"]["model"] == MODEL
-            assert request["config"]["parameters"]["reasoning_effort"] == REASONING
             if request["metadata"].get("purpose", "agent") == "agent":
+                assert request["config"]["parameters"]["reasoning_effort"] == REASONING
                 foundation = request["messages"][0]["content"]
                 for term in (
                     "persistent",
@@ -139,7 +141,6 @@ def audit(output, previous):
                     "agent_message",
                     "prompt",
                     "subagent",
-                    "harness.get",
                     "skills.load",
                     "refine.run()",
                     "compact()",
@@ -147,14 +148,16 @@ def audit(output, previous):
                     assert term in foundation, term
         record["mechanisms"] = mechanisms(directory)
         record["activity"] = activity(directory, record)
+        detail, trace, child_calls, refinement_events = task_observability(directory, record)
+        details.append(detail)
+        activities.append(trace)
+        calls.extend(child_calls)
+        refinements.extend(refinement_events)
         save(directory / "result.json", record)
         records.append(record)
         old_metrics.append(mechanisms(previous / "full/buffalo" / task_id))
     old_records = [
         json.loads(line) for line in (previous / "buffalo-results.jsonl").read_text().splitlines()
-    ]
-    codex_records = [
-        json.loads(line) for line in (previous / "codex-results.jsonl").read_text().splitlines()
     ]
     for name, sha in manifest["existing_results_sha256"].items():
         assert file_digest(previous / name) == sha, "Existing results were changed"
@@ -162,7 +165,6 @@ def audit(output, previous):
         "denominator": 100,
         "old_buffalo": records_summary(old_records),
         "new_buffalo": records_summary(records),
-        "existing_codex": records_summary(codex_records),
         "old_mechanisms": aggregate_mechanisms(old_metrics),
         "new_mechanisms": aggregate_mechanisms([r["mechanisms"] for r in records]),
         "integrity": "PASS",
@@ -172,6 +174,11 @@ def audit(output, previous):
         "source_hashes_unchanged": True,
         "natural_activity": aggregate([r["activity"] for r in records]),
         "optional_feature_usage_affects_validity": False,
+        "observability": summarize(
+            details,
+            old_records,
+            json.loads((output / "experiment-time.json").read_text())["wall_seconds"],
+        ),
     }
     old_by_id = {r["task_id"]: r for r in old_records}
     summary["paired_old_vs_new"] = dict(
@@ -187,13 +194,18 @@ def audit(output, previous):
         )
     )
     assert summary["single_attempts"] == 100
-    assert summary["old_buffalo"]["overall_pass"] == 62
-    assert summary["existing_codex"]["overall_pass"] == 66
+    assert [
+        summary["old_buffalo"][k] for k in ("functional_pass", "style_pass", "overall_pass")
+    ] == [89, 72, 65]
     save(output / "summary.json", summary)
     (output / "buffalo-results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
-    (output / "activity.jsonl").write_text(
-        "".join(json.dumps(r["activity"]) + "\n" for r in records)
-    )
+    for name, rows in (
+        ("task-results.jsonl", details),
+        ("activity.jsonl", activities),
+        ("rlm-calls.jsonl", calls),
+        ("refinement-events.jsonl", refinements),
+    ):
+        (output / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return summary
 
 
@@ -212,10 +224,14 @@ async def execute(args):
     # A new output root is mandatory. There is no task retry, smoke run, baseline or variant path.
     output.mkdir(parents=True, exist_ok=False)
     old_manifest = json.loads((previous / "manifest.json").read_text())
-    codex_inputs = {
+    previous_inputs = {
         r["task_id"]: r
-        for r in map(json.loads, (previous / "codex-results.jsonl").read_text().splitlines())
+        for r in map(json.loads, (previous / "buffalo-results.jsonl").read_text().splitlines())
     }
+    assert [
+        sum(r[k] for r in previous_inputs.values())
+        for k in ("functional_pass", "style_pass", "overall_pass")
+    ] == [89, 72, 65]
     assert old_manifest["task_ids"] == IDS
     assert git(source, "rev-parse", "HEAD") == old_manifest["official"]["starting_state"]["commit"]
     assert not git(source, "status", "--porcelain", "--untracked-files=no")
@@ -241,8 +257,8 @@ async def execute(args):
             hashes = await asyncio.to_thread(prepare_workspace, directory / "workspace", task)
             assert file_digest(directory / "task.json") == old["prompt_sha256"]
             assert hashes == old["workspace_hashes"]
-            assert file_digest(directory / "task.json") == codex_inputs[task_id]["prompt_sha256"]
-            assert hashes == codex_inputs[task_id]["workspace_hashes"]
+            assert file_digest(directory / "task.json") == previous_inputs[task_id]["prompt_sha256"]
+            assert hashes == previous_inputs[task_id]["workspace_hashes"]
             tasks[task_id] = (task, hashes)
         save(output / "task-ids.json", IDS)
         save(output / "buffalo-config.json", config.model_dump(mode="json"))
@@ -254,11 +270,12 @@ async def execute(args):
                 "task_ids": IDS,
                 "model": MODEL,
                 "reasoning": REASONING,
-                "all_auxiliary_reasoning": REASONING,
+                "auxiliary_reasoning_policy": "unchanged production refinement_provider_config",
                 "per_task_timeout": TIMEOUT,
                 "concurrency": 4,
                 "denominator": 100,
                 "attempts_per_task": 1,
+                "tool_choice": "auto",
                 "systems_run": ["buffalo"],
                 "smoke_runs": 0,
                 "cross_task_learning": False,
@@ -271,7 +288,6 @@ async def execute(args):
                     name: file_digest(previous / name)
                     for name in (
                         "buffalo-results.jsonl",
-                        "codex-results.jsonl",
                         "summary.json",
                         "manifest.json",
                     )
@@ -339,6 +355,18 @@ async def execute(args):
                     else "instruction/style violation",
                 }
                 save(directory / "result.json", record)
+                # Export each completed task immediately; preserve all failures.
+                detail, trace, child_calls, refinement_events = await asyncio.to_thread(
+                    task_observability, directory, record
+                )
+                for name, rows in (
+                    ("task-results.jsonl", [detail]),
+                    ("activity.jsonl", [trace]),
+                    ("rlm-calls.jsonl", child_calls),
+                    ("refinement-events.jsonl", refinement_events),
+                ):
+                    with (output / name).open("a") as stream:
+                        stream.writelines(json.dumps(row) + "\n" for row in rows)
                 print(
                     json.dumps(
                         {
@@ -347,6 +375,11 @@ async def execute(args):
                             "overall_pass": record["overall_pass"],
                             "stop_reason": record["stop_reason"],
                             "seconds": record["wall_time_seconds"],
+                            "repl_executions": detail["REPL"]["python_executions"],
+                            "rlm_children": detail["RLM"]["children_spawned"],
+                            "refinements_applied": detail["continual_harness"][
+                                "refinements_applied"
+                            ],
                         }
                     ),
                     flush=True,
