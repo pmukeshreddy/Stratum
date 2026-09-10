@@ -441,6 +441,15 @@ def task_observability(directory, record):
         },
         "raw_trace_directory": str(directory),
     }
+    from .refinement_use import refinement_use
+
+    detail["refinement_use"] = refinement_use(
+        events,
+        root_inputs,
+        sid,
+        task_id,
+        (directory / "answer.txt").read_text() if (directory / "answer.txt").exists() else "",
+    )
     return (
         detail,
         {
@@ -460,6 +469,8 @@ def task_observability(directory, record):
 
 
 def summarize(rows, previous, elapsed):
+    from .refinement_use import use_summary
+
     totals = {}
     for section in (
         "root",
@@ -509,6 +520,7 @@ def summarize(rows, previous, elapsed):
             }
     return {
         "totals": totals,
+        "refinement_use": use_summary(rows),
         "tasks_spawning_children": sum(r["RLM"]["children_spawned"] > 0 for r in rows),
         "runtime": {
             "median_task_seconds": statistics.median(seconds),

@@ -374,15 +374,25 @@ def rollback_proposal(target):
     }
 
 
-def refinement_notice(result, source):
+def refinement_notice(result, source, *, expand=False):
     edits = [e for e in result["appliedEdits"] if e["applied"]]
     if not edits:
         return None
     lines = [f"[{source}-refinement]", compact_text(result["summary"])]
+    if expand and result.get("application"):
+        lines.append("Intended application to remaining work: " + json.dumps(result["application"]))
     for edit in edits:
         entry = edit.get("after") or edit.get("before")
         lines.append(
-            f"- {edit['action']} {edit['kind']} [{entry['scope']}:{edit['id']}] {entry['title']}: {compact_text(entry['content'])}"
+            f"- {edit['action']} {edit['kind']} [{entry['scope']}:{edit['id']}] {entry['title']}: "
+            + (entry["content"] if expand else compact_text(entry["content"]))
+        )
+    if expand:
+        lines.append(
+            "Evaluate these newly changed entries against the original task. Apply relevant "
+            "corrections to remaining work and validate the candidate before finishing. "
+            "If the issue is already corrected or the entry is irrelevant, do not perform "
+            "ceremonial work; its application has no demonstrated in-task effect."
         )
     return "\n".join(lines)
 

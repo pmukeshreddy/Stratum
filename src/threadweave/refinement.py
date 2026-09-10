@@ -19,6 +19,7 @@ from .harness import (
     rollback_proposal,
 )
 from .models import Outcome, new_id
+from .refinement_evidence import opportunity, opportunity_key
 
 # Re-exported for provider integrations that require structured inference settings.
 __all__ = ["RefinementServices", "refinement_provider_config"]
@@ -29,9 +30,11 @@ Skill create/update MUST include reference={"type":"python","import":"package.mo
 Subagents execute through the native runtime: compose a task from the spec and use handle = await rlm('task'). Admission returns a handle, never the answer. Children send evidence with await agent_message.send(message, receiver_role='parent'). Use await rlm.list_subagents() and messaging for follow-ups. Do not invent a child engine or named registry.
 Default scope is local to this persisted session. Global refinement is explicit and only for durable cross-session lessons, preferences, reusable skills/subagents or explicitly project-qualified reusable facts. Global entries are read-only during local refinement: never update/delete them; create a local override instead. All edits apply to the requested store. Strip display-only local:/global: prefixes from IDs.
 Choose the smallest useful component, including correcting or deleting wrong learned behavior. Do not edit source files directly. No useful lesson is a valid result: return edits=[].
-Return JSON only: {"summary":"one sentence","rationale":"trajectory evidence","expectedOutcome":"improvement and validation","edits":[{"action":"create|update|delete","kind":"prompt|memory|skill|subagent","id":"stable bare id, optional for create","title":"required for create/update","content":"required for create/update","path":"optional group","reference":{},"arguments":{},"metadata":{},"reason":"why"}]}.
+Prioritize a correction to CURRENT UNFINISHED WORK. Read in_task_opportunity and the actual observed results, not just the root's claim of success. Identify the unresolved mistake/decision and explain a concrete next action and validation that would resolve it. Check the original instructions independently: do not merely repeat the root's interpretation or its successful workflow. For a failed source/format/type/behavior check, address that specific failure and distinguish a defective candidate from a defective test. Never invent evaluator feedback or task requirements. No official post-completion grading is available here.
+If the root already fixed the issue and there is no remaining use for the lesson, return edits=[] for local refinement. Generic restatements of existing instructions, finished-task summaries and already-followed checklists are redundant. Global/human-requested durable learning remains valid when explicitly requested. For an actionable edit, keep its content focused and include application={"status":"actionable|post_correction","issue":"unresolved issue","evidence_events":["observed event ids when available"],"next_action":"specific remaining work","validation":"observable check"}. Application is a proposed use, not proof that the root used the edit.
+Return JSON only: {"summary":"one sentence","rationale":"trajectory evidence","expectedOutcome":"improvement and validation","application":{"status":"actionable|post_correction","issue":"specific unresolved issue","evidence_events":[],"next_action":"concrete remaining action","validation":"observable check"},"edits":[{"action":"create|update|delete","kind":"prompt|memory|skill|subagent","id":"stable bare id, optional for create","title":"required for create/update","content":"required for create/update","path":"optional group","reference":{},"arguments":{},"metadata":{},"reason":"why"}]}.
 """
-REVIEW_PROMPT = """You are Buffalo's automatic continual harness review gate. Decide whether this checkpoint should run refinement. Approve evidence useful to this session's future turns. Reject one-off noise, unsupported hypotheses and transient tool output. Default refinement is local; global is for durable cross-session or explicitly project-qualified lessons.
+REVIEW_PROMPT = """You are Buffalo's automatic continual harness review gate. Decide whether this checkpoint should run refinement. Approve fresh observed failure or an unresolved decision when a reusable correction can improve remaining work. Name that issue and a concrete next action. Independently inspect the actual contract and evidence rather than echoing the root's conclusions. Reject already-corrected failures with no further use, completed-work summaries, generic checklists, one-off noise and unsupported hypotheses. A completion attempt does not justify a review by itself. Default refinement is local; global is for durable cross-session or explicitly project-qualified lessons.
 Return JSON only: {"shouldRefine":true|false,"rationale":"short reason","instructions":"optional concise instructions when approved"}."""
 
 
@@ -66,6 +69,9 @@ class Checkpoint:
 
 
 class RefinementServices(AuxiliaryServices):
+    def current_refinement_opportunity(self, sid):
+        return opportunity(self.store, sid, self.context.original_task(sid)["messages"])
+
     def refinement_state(self, sid):
         if sid not in self._refinement_states:
             self._refinement_states[sid] = Checkpoint()
@@ -136,7 +142,8 @@ class RefinementServices(AuxiliaryServices):
         return (
             policy.enabled
             and (
-                not state.last_review_at
+                (state.pending_review and state.pending_review[0] == "actionable_evidence")
+                or not state.last_review_at
                 or time.time() - state.last_review_at >= policy.cooldown_seconds
             )
             and (
@@ -214,6 +221,7 @@ class RefinementServices(AuxiliaryServices):
         )
         history = self.store.harness.history(sid)[-20:]
         evidence = {
+            "in_task_opportunity": self.current_refinement_opportunity(sid),
             "conversation": trajectory[-(40_000 if review else 80_000) :],
             "current_harness_state": format_harness_state(
                 harness, entry_limit=40, content_limit=240
@@ -240,6 +248,42 @@ class RefinementServices(AuxiliaryServices):
         if instructions:
             evidence["user_refine_instructions"] = instructions
         return evidence
+
+    def prepare_refinement_opportunity(self, sid, *, completing=False):
+        """Allow one review of fresh evidence while there is time to act on it."""
+        session, state = self.store.session(sid), self.refinement_state(sid)
+        policy = self.store.config(sid)
+        if session.depth or not policy.refinement.enabled or self.has_pending_refinement(sid):
+            return
+        evidence = self.current_refinement_opportunity(sid)
+        key = opportunity_key(evidence)
+        if not key or any(
+            e["payload"].get("key") == key
+            for e in self.store.iter_events(sid, kind="refinement_opportunity")
+        ):
+            return
+        durations = self.store.db.execute(
+            "SELECT ended_at-started_at FROM model_requests WHERE session_id=? "
+            "AND purpose='agent' AND status='completed' ORDER BY started_at DESC LIMIT 8",
+            (sid,),
+        ).fetchall()
+        turn_time = max((r[0] for r in durations), default=1)
+        remaining = policy.limits.wall_seconds - self._elapsed(session.root_id)
+        if policy.limits.max_turns - session.turns < 2 or remaining < 3 * turn_time:
+            self.store.event(
+                sid,
+                "refinement_opportunity_deferred",
+                {"key": key, "reason": "Preserve time for work, validation and final response"},
+            )
+            return
+        self.store.event(
+            sid,
+            "refinement_opportunity",
+            {"key": key, "boundary": "pre_completion" if completing else "work", **evidence},
+        )
+        # Fresh evidence is independent of the periodic-review cooldown. A declined
+        # review is consumed, so an unchanged issue cannot add ceremonial turns.
+        state.pending_review = ("actionable_evidence", None)
 
     async def review_refinement(self, sid, reason):
         response, _ = await self.auxiliary(
@@ -276,6 +320,18 @@ class RefinementServices(AuxiliaryServices):
             directory = path.parent
             global_ = directory.resolve() == self.store.harness.path().resolve()
         baseline = copy.deepcopy(load_harness_state(directory, "global" if global_ else "local"))
+        live_opportunity = self.current_refinement_opportunity(sid)
+        key = opportunity_key(live_opportunity)
+        if key and not any(
+            e["payload"].get("key") == key
+            for e in self.store.iter_events(sid, kind="refinement_opportunity")
+        ):
+            self.store.event(
+                sid,
+                "refinement_opportunity",
+                {"key": key, "boundary": "requested", **live_opportunity},
+            )
+        application = {}
         if target:
             proposal = rollback_proposal(target)
         else:
@@ -287,7 +343,11 @@ class RefinementServices(AuxiliaryServices):
                     sid, instructions=options.get("instructions"), global_=global_
                 ),
             )
-            proposal = normalize_proposal(parse_object(response.text))
+            value = parse_object(response.text)
+            proposal = normalize_proposal(value)
+            application = value.get("application", {})
+            if not isinstance(application, dict):
+                application = {}
         return {
             "id": "refine_" + new_id(),
             "proposal": proposal,
@@ -295,6 +355,8 @@ class RefinementServices(AuxiliaryServices):
             "global_": global_,
             "rollback_of": rollback_id,
             "target_directory": directory,
+            "application": application,
+            "opportunity": live_opportunity,
         }
 
     def count_refinement_turn(self, sid):
@@ -443,7 +505,8 @@ class RefinementServices(AuxiliaryServices):
             if not policy.compact:
                 state.pending_compact = False
             if (
-                state.last_review_at
+                not (state.pending_review and state.pending_review[0] == "actionable_evidence")
+                and state.last_review_at
                 and time.time() - state.last_review_at < policy.cooldown_seconds
             ):
                 return False
@@ -465,13 +528,14 @@ class RefinementServices(AuxiliaryServices):
             if options is None:
                 review = (
                     state.pending_review[1]
-                    if state.pending_review
+                    if state.pending_review and state.pending_review[1] is not None
                     else await self.review_refinement(sid, reason)
                 )
                 if state.branch_version != branch:
                     return False
                 if not review["shouldRefine"]:
                     state.last_review_at, state.turns_since_review = time.time(), 0
+                    state.pending_review = None
                     state.pending_interval = False
                     if reason == "compact":
                         state.pending_compact = False
@@ -491,12 +555,22 @@ class RefinementServices(AuxiliaryServices):
                 state.pending_plan = (plan, options, reason)
                 return False
             state.pending_plan = None
+            application = plan.pop("application", {})
+            evidence = plan.pop("opportunity", {})
             result = self.store.harness.apply(sid, **plan)
-            notice = refinement_notice(result, options.get("source", "self"))
+            result.update(application=application, opportunity=evidence)
+            notice = refinement_notice(result, options.get("source", "self"), expand=True)
             self.store.event(sid, "refine_complete", result)
             if notice:
                 event = self.store.event(
-                    sid, "refinement_notice", {"content": notice, "refinement_id": result["id"]}
+                    sid,
+                    "refinement_notice",
+                    {
+                        "content": notice,
+                        "refinement_id": result["id"],
+                        "expanded": True,
+                        "application": application,
+                    },
                 )
                 self.store.add_context(sid, event, [{"role": "user", "content": notice}])
             state.last_review_at, state.turns_since_review = time.time(), 0

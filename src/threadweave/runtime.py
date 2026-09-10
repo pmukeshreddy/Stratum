@@ -1212,6 +1212,7 @@ class Runtime(RefinementServices):
                     )
                 explicit_ok = verifier_ok = False
                 self.store.update(sid, runnable=True, wake_at=None)
+            self.prepare_refinement_opportunity(sid, completing=completion is not None)
             learned = await self.refinement_checkpoint(sid, completed_turn=True)
             if learned:
                 explicit_ok = verifier_ok = False

@@ -98,8 +98,9 @@ def aggregate_mechanisms(rows):
 def audit(output, previous):
     manifest = json.loads((output / "manifest.json").read_text())
     assert source_hashes(ROOT / "src") == manifest["source_hashes"], "Runtime changed during run"
+    ids = manifest["task_ids"]
     records, old_metrics, details, activities, calls, refinements = [], [], [], [], [], []
-    for task_id in IDS:
+    for task_id in ids:
         directory = output / "full/buffalo" / task_id
         record = json.loads((directory / "result.json").read_text())
         assert record["task_id"] == task_id
@@ -157,12 +158,14 @@ def audit(output, previous):
         records.append(record)
         old_metrics.append(mechanisms(previous / "full/buffalo" / task_id))
     old_records = [
-        json.loads(line) for line in (previous / "buffalo-results.jsonl").read_text().splitlines()
+        r
+        for line in (previous / "buffalo-results.jsonl").read_text().splitlines()
+        if (r := json.loads(line))["task_id"] in ids
     ]
     for name, sha in manifest["existing_results_sha256"].items():
         assert file_digest(previous / name) == sha, "Existing results were changed"
     summary = {
-        "denominator": 100,
+        "denominator": len(ids),
         "old_buffalo": records_summary(old_records),
         "new_buffalo": records_summary(records),
         "old_mechanisms": aggregate_mechanisms(old_metrics),
@@ -193,10 +196,7 @@ def audit(output, previous):
             for r in records
         )
     )
-    assert summary["single_attempts"] == 100
-    assert [
-        summary["old_buffalo"][k] for k in ("functional_pass", "style_pass", "overall_pass")
-    ] == [89, 72, 65]
+    assert summary["single_attempts"] == len(ids)
     save(output / "summary.json", summary)
     (output / "buffalo-results.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
     for name, rows in (
@@ -204,12 +204,17 @@ def audit(output, previous):
         ("activity.jsonl", activities),
         ("rlm-calls.jsonl", calls),
         ("refinement-events.jsonl", refinements),
+        ("refinement-use.jsonl", [u for r in details for u in r["refinement_use"]]),
     ):
         (output / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
     return summary
 
 
 async def execute(args):
+    ids = args.pilot_ids.split(",") if args.pilot_ids else IDS[: args.count]
+    if args.pilot_ids:
+        assert args.count == 10 and len(ids) == len(set(ids)) == 10
+        assert all(i in IDS for i in ids) and ids == sorted(ids, key=int)
     validation = None
     if args.validation:
         validation = json.loads(await asyncio.to_thread(Path(args.validation).read_text))
@@ -231,7 +236,7 @@ async def execute(args):
     assert [
         sum(r[k] for r in previous_inputs.values())
         for k in ("functional_pass", "style_pass", "overall_pass")
-    ] == [89, 72, 65]
+    ] == [91, 70, 65]
     assert old_manifest["task_ids"] == IDS
     assert git(source, "rev-parse", "HEAD") == old_manifest["official"]["starting_state"]["commit"]
     assert not git(source, "status", "--porcelain", "--untracked-files=no")
@@ -249,7 +254,7 @@ async def execute(args):
         assert provenance["starting_state"] == old_manifest["official"]["starting_state"]
         config = experiment_config()
         tasks = {}
-        for task_id in IDS:
+        for task_id in ids:
             task = await official.call("task", task_id=task_id)
             directory = output / "full/buffalo" / task_id
             save(directory / "task.json", task)
@@ -260,20 +265,20 @@ async def execute(args):
             assert file_digest(directory / "task.json") == previous_inputs[task_id]["prompt_sha256"]
             assert hashes == previous_inputs[task_id]["workspace_hashes"]
             tasks[task_id] = (task, hashes)
-        save(output / "task-ids.json", IDS)
+        save(output / "task-ids.json", ids)
         save(output / "buffalo-config.json", config.model_dump(mode="json"))
         save(
             output / "manifest.json",
             {
                 "created_at": timestamp(),
                 "official": provenance,
-                "task_ids": IDS,
+                "task_ids": ids,
                 "model": MODEL,
                 "reasoning": REASONING,
                 "auxiliary_reasoning_policy": "unchanged production refinement_provider_config",
                 "per_task_timeout": TIMEOUT,
                 "concurrency": 4,
-                "denominator": 100,
+                "denominator": len(ids),
                 "attempts_per_task": 1,
                 "tool_choice": "auto",
                 "systems_run": ["buffalo"],
@@ -364,6 +369,7 @@ async def execute(args):
                     ("activity.jsonl", [trace]),
                     ("rlm-calls.jsonl", child_calls),
                     ("refinement-events.jsonl", refinement_events),
+                    ("refinement-use.jsonl", detail["refinement_use"]),
                 ):
                     with (output / name).open("a") as stream:
                         stream.writelines(json.dumps(row) + "\n" for row in rows)
@@ -386,13 +392,13 @@ async def execute(args):
                 )
                 return grade
 
-        launch_directory = Path(args.validation).parent if args.validation else output
+        launch_directory = output
         launch = launch_directory / "manyih-launch.json"
         with launch.open("x") as stream:
             json.dump(
                 {"output": str(output), "started_at": timestamp(), "attempts_per_task": 1}, stream
             )
-        grades = await asyncio.gather(*(one(task_id) for task_id in IDS))
+        grades = await asyncio.gather(*(one(task_id) for task_id in ids))
         summary = await official.call("summarize", grades=grades, profile="buffalo")
         save(output / "official-buffalo-summary.json", summary)
         save(output / "experiment-time.json", {"wall_seconds": time.monotonic() - began})
@@ -407,6 +413,10 @@ def main():
     parser.add_argument("--previous", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--count", type=int, choices=(10, 100), default=100)
+    parser.add_argument(
+        "--pilot-ids", help="Ten canonical IDs in order; available only with --count 10"
+    )
     parser.add_argument(
         "--validation", help="Reviewed targeted live validation receipt for this production source"
     )
