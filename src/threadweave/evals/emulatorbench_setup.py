@@ -19,10 +19,10 @@ def apply_runtime_patches():
     """Apply only the hash-pinned provider compatibility delta in this interpreter."""
     import verifiers
 
-    project = Path(__file__).resolve().parents[3]
+    resources = Path(__file__).resolve().parent
     package = Path(verifiers.__file__).parent
     for patch in pins()["verifiers"].get("patches", []):
-        diff = (project / patch["patch"]).read_bytes()
+        diff = (resources / patch["patch"]).read_bytes()
         if hashlib.sha256(diff).hexdigest() != patch["patch_sha256"]:
             raise ValueError("Verifiers compatibility patch changed")
         destination = package / patch["file"]

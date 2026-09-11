@@ -22,8 +22,8 @@ uv run buffalo
 The default uses the current workspace and `configs/session.json` when available.
 Use `--workspace` or `--config` to override them; coding-specific tools use
 `--config configs/coding.json`. The normal provider reuses the shared Codex login.
-`auth models` lists available models; provider and reasoning settings are described
-in [subscription configuration](docs/subscription.md).
+`auth models` lists available models. Set `provider.model` and
+`provider.parameters.reasoning_effort` in your configuration.
 
 ```text
 > Inspect this project and fix the failing tests.
@@ -68,8 +68,8 @@ within shared limits. Follow-up work can resume the same child session.
 Compaction reduces active model context while retaining history and recoverable
 Python state. Unsupported Python objects need reconstruction recipes. The
 continual harness stores prompt notes, memories, skills and subagent specifications.
-Explicit `await refine.run()` and automatic review use the same safe application
-boundaries; see [refinement](docs/refinement.md).
+Explicit `await refine.run()` and automatic review apply learned changes at safe
+turn boundaries.
 
 `run --mode autonomous` continues within configured limits; `--mode goal` retains
 an objective and `--mode heartbeat` schedules turns. Turn, token, time, tool, depth
@@ -91,9 +91,16 @@ These scores were supplied by the project owner. They are not recomputed by this
 checkout; run reports retain the measured metric, task scope and provenance.
 The EmulatorBench public-source score is separate from its official reward.
 
-- [ARC-AGI-3 setup and scoring](docs/evaluation.md)
-- [EmulatorBench setup, public-source verification and reports](docs/emulatorbench-evaluation.md)
-- [EvoCode integration](docs/evocode-evaluation.md), whose resident worker is also used by EmulatorBench
+Evaluation entry points:
+
+```sh
+buffalo eval arc-agi-3 --config /path/to/evaluation.json
+buffalo-emulatorbench run --config configs/emulatorbench-public.json --output .emulatorbench/runs/new-run
+```
+
+Configure the official sources and environments before running. Example configs
+live in `configs/`; pinned upstream dependencies and the setup helper live in
+`src/threadweave/evals/`. EmulatorBench shares the resident EvoCode worker.
 
 Local results stay under `results/` and `.emulatorbench/runs/`, both ignored by Git.
 
@@ -113,10 +120,3 @@ Local Python and processes execute with the host user's authority. Container
 command execution does not sandbox the host REPL. Back up durable state and treat
 artifacts as private workspace data; arbitrary-object recovery and exactly-once
 external effects are not guaranteed.
-
-## Documentation
-
-- [Architecture](docs/architecture.md) and [recursive execution API](docs/adaptive-orchestration.md)
-- [Python control plane](docs/python-control-plane.md) and [workspace environment](docs/python-environment.md)
-- [Configuration, storage and security](docs/operations.md)
-- [Extensions](docs/extensions.md)

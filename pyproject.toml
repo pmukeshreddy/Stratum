@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/configs", "/docs", "/pyproject.toml", "/uv.lock", "/README.md"]
+include = ["/src", "/tests", "/configs", "/pyproject.toml", "/uv.lock", "/README.md"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/threadweave"]

@@ -225,7 +225,7 @@
         "file": "v1/runtimes/modal.py",
         "original_sha256": "c5d7ac5daf3b42571eb8f1728a28a4a96fa4f15c1f958de79ff9a3eacaefa868",
         "patched_sha256": "a73cd9e28a26d5bfb8c164d07837f69b56ea787e2676acb3c7f9f124d17008a6",
-        "patch": "docs/patches/verifiers-modal-no-egress.patch",
+        "patch": "patches/verifiers-modal-no-egress.patch",
         "patch_sha256": "8a84e89ecaee994fc5823de2fd2565f93f9d4b0cf5fdf9c68f3ef7c3b6f76d8b",
         "reason": "Modal rejects open ports when block_network is true; omit encrypted ports for isolated graders, preserving network isolation.",
         "scope": "provider provisioning only; official verifier and scorer unchanged"
