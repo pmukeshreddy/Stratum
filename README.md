@@ -97,8 +97,8 @@ and shell commands execute with the host user's authority, not in a sandbox.
 
 | Benchmark | Reported Stratum score |
 | --- | ---: |
-| **ARC-AGI-3** | **81** |
-| **EmulatorBench** | **25** |
+| **ARC-AGI-3** | **81.049** |
+| **EmulatorBench** | **25.016** |
 
 These are project-owner-reported results. Run artifacts establish the measured metric,
 task selection, model settings, and provenance. EmulatorBench's public-source score
