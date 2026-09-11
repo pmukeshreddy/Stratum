@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 import sys
+import sysconfig
 from pathlib import Path
 
 from .coding import KINDS, baseline
@@ -97,11 +98,13 @@ class VerificationReceipts:
             kind: getattr(options, field) or original["commands"].get(kind, [])
             for kind, field in KINDS.items()
         }
-        dependency_roots = {
-            Path(__file__).parent,
-            Path(sys.prefix) / "lib",
-            Path(sys.base_prefix) / "lib",
-        }
+        # On system Python, base_prefix/lib is all of /usr/lib, including
+        # unrelated toolchains. Reconcile Python's actual library directories.
+        dependency_roots = {Path(__file__).parent}
+        dependency_roots.update(
+            Path(sysconfig.get_path(name))
+            for name in ("stdlib", "platstdlib", "purelib", "platlib")
+        )
         for variable in ("PYTHONPATH", "NODE_PATH"):
             dependency_roots.update(Path(p) for p in env.get(variable, "").split(os.pathsep) if p)
         if env.get("VIRTUAL_ENV"):

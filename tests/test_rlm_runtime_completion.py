@@ -305,6 +305,44 @@ async def test_receipt_fingerprint_failure_runs_gate_once(
         await runtime.shutdown()
 
 
+async def test_receipt_scans_python_libraries_without_unrelated_system_libraries(
+    tmp_path, repository, coding_config, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from threadweave import verification_receipts
+
+    prefix = tmp_path / "usr"
+    library = prefix / "lib/python3"
+    library.mkdir(parents=True)
+    dependency = library / "dependency.py"
+    dependency.write_text("value = 1\n")
+    unrelated = prefix / "lib/unrelated-toolchain"
+    unrelated.write_text("unrelated\n")
+    update_coding_options(coding_config.task, capture_baseline=False)
+    runtime = Runtime(tmp_path / "state", providers={"test": ScriptedProvider({})})
+    try:
+        root = runtime.create("Inspect verification inputs", repository, config=coding_config)
+        await runtime._prepare(root.id)
+        monkeypatch.setattr(
+            verification_receipts,
+            "sys",
+            SimpleNamespace(prefix=str(prefix), base_prefix=str(prefix), version=sys.version),
+        )
+        monkeypatch.setattr(
+            verification_receipts, "sysconfig", SimpleNamespace(get_path=lambda name: str(library))
+        )
+        receipts = verification_receipts.VerificationReceipts(context(runtime, root.id))
+        before = receipts.fingerprint()
+        files = before["inputs"]["dependency_files"]
+        assert str(dependency) in files
+        assert str(unrelated) not in files
+        dependency.write_text("value = 200\n")
+        assert receipts.fingerprint()["key"] != before["key"]
+    finally:
+        await runtime.shutdown()
+
+
 async def test_failed_child_followup_recovers_own_repl_and_stable_id_messaging(tmp_path):
     provider = ScriptedProvider(
         {
