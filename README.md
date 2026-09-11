@@ -2,14 +2,14 @@
 
 **A persistent agent harness built around Python, recursive agents, and reusable working state.**
 
-Buffalo gives a model a long-lived IPython environment for computation, tools, and
+Stratum gives a model a long-lived IPython environment for computation, tools, and
 agent coordination. A background daemon manages execution; you can steer work,
 detach, and return to the same session. The Python package is `threadweave`;
-`buffalo` and `threadweave` launch the same CLI.
+`Stratum` and `threadweave` launch the same CLI.
 
 ## Architecture
 
-![Buffalo architecture: daemon-managed root and recursive sessions, shared environment, model providers, durable state, and continual harness](assets/architecture.svg)
+![Stratum architecture: daemon-managed root and recursive sessions, shared environment, model providers, durable state, and continual harness](assets/architecture.svg)
 
 The root delegates through `rlm()` while continuing its own work. Children have
 independent contexts and kernels and can recurse within shared resource limits.
@@ -42,18 +42,18 @@ provider also needs the Codex CLI and its shared ChatGPT login. Building the pin
 inference bridge for the first time requires Git and Rust/Cargo.
 
 ```sh
-git clone https://github.com/pmukeshreddy/project-buffalo.git
-cd project-buffalo
+git clone https://github.com/pmukeshreddy/Stratum.git
+cd project-Stratum
 uv sync --extra dev --locked
 
-uv run buffalo auth status
-uv run buffalo auth login           # If you are not already signed in
-uv run buffalo auth install-client  # One-time inference bridge build
-uv run buffalo doctor --config configs/session.json
-uv run buffalo
+uv run Stratum auth status
+uv run Stratum auth login           # If you are not already signed in
+uv run Stratum auth install-client  # One-time inference bridge build
+uv run Stratum doctor --config configs/session.json
+uv run Stratum
 ```
 
-`buffalo auth models` lists available models. Subscription mode needs no API key;
+`Stratum auth models` lists available models. Subscription mode needs no API key;
 the `chat` provider supports separately configured chat-completion APIs.
 
 | Configuration | Use |
@@ -65,19 +65,19 @@ the `chat` provider supports separately configured chat-completion APIs.
 Use `--config` to select a profile. [Configuration models](src/threadweave/models.py)
 define provider settings, reasoning effort, tool permissions, and resource limits.
 
-## Working with Buffalo
+## Working with Stratum
 
 ```sh
 # Open a coding session in your repository
-uv run buffalo --workspace /path/to/repo --config configs/coding.json
+uv run Stratum --workspace /path/to/repo --config configs/coding.json
 
 # Return to the latest session in the current workspace
-uv run buffalo --continue
+uv run Stratum --continue
 ```
 
 Use `/tree`, `/usage`, `/state`, and `/states` to inspect work; `/refine` and
 `/compact` manage learned state and active context. `/exit` detaches; `/help` lists
-all controls. `buffalo run` supports autonomous, goal, and heartbeat modes.
+all controls. `Stratum run` supports autonomous, goal, and heartbeat modes.
 
 Inside the model's persistent Python environment, orchestration looks like:
 
@@ -95,7 +95,7 @@ and shell commands execute with the host user's authority, not in a sandbox.
 
 ## Evaluation
 
-| Benchmark | Reported Buffalo score |
+| Benchmark | Reported Stratum score |
 | --- | ---: |
 | **ARC-AGI-3** | **81** |
 | **EmulatorBench** | **25** |
@@ -108,9 +108,9 @@ The [evaluators](src/threadweave/evals) support ARC-AGI-3, EmulatorBench, and Ev
 Install their pinned dependencies and official task assets before running:
 
 ```sh
-uv run buffalo eval arc-agi-3 --config /path/to/evaluation.json
-uv run buffalo-emulatorbench preflight --config configs/emulatorbench-public.json
-uv run buffalo-emulatorbench run --config configs/emulatorbench-public.json \
+uv run Stratum eval arc-agi-3 --config /path/to/evaluation.json
+uv run Stratum-emulatorbench preflight --config configs/emulatorbench-public.json
+uv run Stratum-emulatorbench run --config configs/emulatorbench-public.json \
   --output .emulatorbench/runs/new-run
 ```
 
