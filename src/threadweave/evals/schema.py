@@ -15,9 +15,6 @@ class BenchmarkSetup(Record):
     source: Path | None = None
     commit: str | None = None
     python: str = sys.executable
-    dataset: Path | None = None
-    dataset_revision: str | None = None
-    dataset_sha256: str | None = None
     task_ids: list[str] = Field(default_factory=list)
     options: dict = Field(default_factory=dict)
 

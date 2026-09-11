@@ -1,259 +1,122 @@
-# Threadweave
+# Threadweave / Buffalo
 
-Threadweave is a persistent recursive agent harness. An interactive Agents View
-attaches to a daemon-owned Root Session. The default model-facing tool is **ipython**.
-The model writes Python to select computation, environment actions, persistent
-recursive children and messages. Each session owns its context and persistent
-IPython kernel; history and reusable state live on disk.
-Ordinary conversation does not require a repository or a coding workflow.
+Buffalo is a persistent recursive agent harness. Its interactive Agents View
+attaches to a daemon-owned root session. The model uses IPython for computation,
+workspace tools, recursive children and messaging. Each session keeps its own
+context, Python kernel, history and reusable learned state.
 
-## Open the Agents View
+## Get started
 
-Prerequisites: Python 3.11+, uv, and Node.js 22.8+ (the supplied Prime minimum).
-Node executes the copied Prime harness formatters and JSON serialization, preserving
-JavaScript ordering, Unicode and numeric behavior without Python approximations.
+Requires Python 3.11+, uv and Node.js 22.8+. Node runs the harness formatters and
+JSON serialization. EmulatorBench and EvoCode setup use Python 3.12.
 
 ```sh
-uv sync --extra dev
-uv run threadweave auth status
-# Only if the shared Codex ChatGPT login is absent:
-uv run threadweave auth login
-uv run threadweave doctor --config configs/session.json
-uv run threadweave
+uv sync --extra dev --locked
+uv run buffalo auth status
+# If the shared Codex ChatGPT login is absent:
+uv run buffalo auth login
+uv run buffalo doctor --config configs/session.json
+uv run buffalo
 ```
 
-The default uses the current directory and configs/session.json when available,
-otherwise an equivalent subscription-backed workspace configuration. It does not
-select configs/coding.json implicitly. --workspace and --config override discovery;
-threadweave chat is the same interface.
+The default uses the current workspace and `configs/session.json` when available.
+Use `--workspace` or `--config` to override them; coding-specific tools use
+`--config configs/coding.json`. The normal provider reuses the shared Codex login.
+`auth models` lists available models; provider and reasoning settings are described
+in [subscription configuration](docs/subscription.md).
 
 ```text
-> hi
-> Use Python to create x = 123 and remember it.
-> Read x from your existing REPL.
-> Create two independent children with rlm(), then continue working locally.
+> Inspect this project and fix the failing tests.
 > /tree
+> /usage
 > /compact
-> Read x again.
-> /state
 > /exit
 ```
 
-Use `uv run threadweave --continue` for the most recent root in this workspace,
-or --resume SESSION_ID to choose one. Attachment does not change execution mode or
-reset accounting. Enter sends; Alt-Enter/Ctrl-J inserts a newline; arrow keys recall
-input. Input stays available during work; interventions are queued at a safe turn
-boundary. Ctrl-C pauses the current turn or clears idle input. Ctrl-D and /exit
-detach without killing work.
+`/help` lists commands. Enter sends; Alt-Enter/Ctrl-J inserts a newline. Input stays
+available during work. Ctrl-C pauses the turn; Ctrl-D and `/exit` detach.
+`buffalo --continue` reattaches to the most recent root in this workspace;
+`--resume SESSION_ID` chooses a session. Attachment preserves its mode and budgets.
 
-/help lists /status, /state, /states, /usage, /tree, /history, /compact, /pause,
-/resume, /new, /exit, and optional Environment inspections /diff and /experiments.
-Model text streams. Large tool outputs remain in artifacts; --json and --verbose
-expose debugging detail.
-
-## Authentication
-
-The normal provider is codex_subscription, reusing the official shared Codex
-ChatGPT login. No OPENAI_API_KEY is required. auth models lists supported models.
-Omit provider.model to resolve the account default, or select a supported model.
-provider.parameters.reasoning_effort overrides account settings.
-
-Authentication/refresh remain owned by Codex. The official-client inference bridge
-makes model requests only: Threadweave supplies context/tool schemas and executes
-returned calls. It does not invoke another agent to solve tasks. There is no API
-billing fallback. Subscription dollar cost is null. The backend does not expose a
-server-enforced output-token cap; a client-observed byte guard and time budgets
-apply. [Provider details and optional API mode](docs/subscription.md).
-auth logout signs out of the shared Codex login.
-
-## Architecture
-
-The root's ordinary action loop chooses how to solve each task. See the
-[execution architecture and Python API](docs/adaptive-orchestration.md) and
-[exact root foundation](docs/root-foundation.txt).
+## Runtime
 
 ```text
-Human ↔ Agents View ↔ Root Session ↔ Environment
-                          ↕ rlm / messages    ↕
-                     Recursive Subagents ────+
-                          ↕       ↕
-                           Daemon
-                              ↕
-                       Continual Harness
+Human ↔ Agents View ↔ Root session ↔ Environment
+                          ↕ rlm / messages
+                     Recursive children
+                          ↕
+                 Daemon / continual harness
 
-L1: selected active context
-L2: persistent REPLs, retained values, recursive sessions/handles
-L3: disk-backed history, artifacts, messages, reusable state, session metadata
-
-Long-horizon controls: autonomous mode, persistent goals, heartbeats, budgets
+L1: selected model context
+L2: persistent Python state and recursive sessions
+L3: disk-backed history, artifacts and learned state
 ```
 
-`await rlm(instruction, name=None)` returns a stable child handle after admission without
-waiting for a child answer. Children have independent contexts, REPLs and histories;
-they can create descendants. Related sessions communicate through durable queues.
-A parent (or human) can send follow-up work to a completed child to continue that
-same session, including after its kernel has been unloaded. History, recoverable
-Python values and accumulated budgets are retained. Paused, cancelled, failed and
-resource-exhausted children are not automatically restarted. A failed child does
-not destroy the root.
-
-The continual harness uses `harness_state.json` as its only active learned state,
-with `prompt`, `memory`, `skill`, and `subagent` entries. Global files live under
-`DATA/harness/`; session-local files live under `DATA/sessions/SESSION_ID/harness/`.
-Global refinement history appends to `DATA/harness/refinements.jsonl`; local
-history appends to `DATA/sessions/SESSION_ID/harness/refinements.jsonl`.
-`state_changes.jsonl` journals learned-state changes before the readable JSON snapshot
-advances. Interrupted writes recover under a process lock. Runtime persistence uses
-JSON documents and direct per-session JSONL logs; existing SQLite stores are imported
-once, with their original database left untouched.
-
-`await refine.run()` schedules local refinement; optional instructions focus the
-planner, and `global_=True` explicitly requests global changes. `await refine.status()`
-returns `pending` and `in_flight`. Planning can overlap tools after the model response
-finishes; the exact plan is applied only at a safe turn boundary.
-Automatic review runs at 25 assistant turns and compaction, with a 20 minute cooldown,
-only in root sessions. The reviewer alone decides whether to run the planner.
-Explicit refinement bypasses review. An empty edits array is valid.
-
-As in the supplied Prime runtime, applying refinement preserves the SYSTEM prefix.
-The audit records the result; an applied-only refinement notice delivers changed state
-to the next legitimate model request. Presentation-only outcomes stay out of model
-context. Cold session/resume boundaries and compaction heads carry the merged harness
-digest as user context. Applied edits do not resume completed or idle tasks.
-Colliding global/local IDs remain visible with
-scope labels; local guidance can override global guidance within the session.
-Skills reference existing Python callables and their argument contracts; reusable
-subagent specifications execute through native `rlm` delegation.
-
-See [the current source-parity specification](docs/prime-refinement-specification.md)
-and [complete Prime test mapping](docs/prime-refinement-test-map.md).
-
-Compaction only changes L1. History, REPL values and children remain intact.
-Recovery restores stable IDs, topology, queues, contexts, versions, goals, schedules,
-accounting and supported Python checkpoint values. Non-serializable objects require
-explicit reconstruction recipes; missing/uncertain state is reported, not invented.
-[Component implementation and connection tests](docs/architecture.md).
-
-## Programmable control plane
-
-These are Python cells chosen by the model, not direct model tool calls:
+The model chooses actions through the same persistent Python environment:
 
 ```python
-x = 123
-py_files = list(workspace.rglob("*.py"))  # retained outside the model prompt
-matches = repo.search("class Session")
-review = await rlm("Inspect persistence; message me your findings.", name="reviewer")
-# Admission returns a handle; the parent can keep computing here.
-status = await agent_observe.get_agent(review.session_id)
-await agent_message.send("Focus on recovery.", receiver_role="child", receiver_name="reviewer")
+files = list(workspace.rglob("*.py"))
+child = await rlm("Inspect persistence and report concrete defects.", name="reviewer")
 result = await bash("uv run pytest -q")
-print(result.exit_code, result.output[-1000:])
-await refine.run("Retain the reusable testing workflow supported by this trajectory.")
+await agent_message.send("Include recovery edge cases.", receiver_role="child", receiver_name="reviewer")
 ```
 
-Files/Path, shell handles, editing, repository retrieval, MCP, skills and durable
-state are preloaded in roots and children. `tools.catalog()` retrieves optional
-capability schemas into Python. The full instruction is in `context['task']`;
-`context['messages_path']` points to a authoritative per-session JSONL event log.
-Only explicitly returned/printed selections enter L1. Normal final text ends/yields
-ordinary interaction; there is no universal coding verifier or finish tool.
+`rlm()` returns a stable handle after admission; the parent can keep working while
+the child runs. Children have independent contexts and kernels and can delegate
+within shared limits. Follow-up work can resume the same child session.
 
-[Exact API, source trace, configuration and boundaries](docs/python-control-plane.md).
-Legacy direct tools require explicit `"control_plane": "direct"`; they are not the default.
+Compaction reduces active model context while retaining history and recoverable
+Python state. Unsupported Python objects need reconstruction recipes. The
+continual harness stores prompt notes, memories, skills and subagent specifications.
+Explicit `await refine.run()` and automatic review use the same safe application
+boundaries; see [refinement](docs/refinement.md).
 
-## Environment capabilities
+`run --mode autonomous` continues within configured limits; `--mode goal` retains
+an objective and `--mode heartbeat` schedules turns. Turn, token, time, tool, depth
+and concurrency limits account for descendants. Detach/resume does not reset them.
 
-Files, processes, repository search/indexing, validated patches, Git checkpoints,
-tests/builds, benchmarks/profilers and durable experiments are Environment tools.
-The model chooses when to use them. Missing prerequisites return errors; a tool's
-existence does not imply a successful run.
-
-For a task explicitly needing coding baseline and independent completion gates:
-
-```sh
-uv run threadweave run "Fix the failing tests without weakening them." \
-  --workspace /path/to/repository --config configs/coding.json --attach
-```
-
-This optional environment captures baseline evidence and verifies completion against
-configured commands and repository constraints. Interactive greetings/inspection
-do not run its baseline. Python `rlm()` defaults to a shared workspace. Its explicit
-`purpose="research"` sets read-only tool policy (not an OS sandbox);
-`purpose="candidate"` creates a coding environment in a Git worktree based on the
-parent's captured dirty state. Inspect with `await rlm.candidate(handle)` and
-explicitly accept with `await rlm.candidate(handle, accept=True)`. Worktrees share
-Git objects, not writable source files. No user branch is committed or stashed;
-harness checkpoints use private Git refs. configs/kernel.json selects compile/correctness/
-performance commands through the same architecture.
-
-Repository definitions/calls/references use persistent Tree-sitter syntax evidence
-for Python, Rust, Go, C/C++/CUDA and JavaScript/TypeScript. Results identify evidence
-quality; unresolved names are not compiler-semantic references. Native filesystem
-events drive warm mutation/index updates, with full reconciliation after recovery
-and at verification boundaries. See the [architecture documentation](docs/architecture.md)
-for runtime APIs and remaining limits.
+New chats use the XDG data directory (normally `~/.local/share/threadweave`), an
+existing workspace `.threadweave` store, or explicit `--data`. Runtime records use
+JSON/JSONL. Existing SQLite stores are imported once with the original preserved.
+Restart an old daemon after upgrading its code.
 
 ## Evaluation
 
-The primary comparison holds **Astra XHigh** (`gpt-6-astra`, `xhigh`) fixed:
+| Benchmark | Buffalo reported score |
+| --- | ---: |
+| ARC-AGI-3 | 81 |
+| EmulatorBench | 25 |
 
-| Harness | Model | Reported score |
-| --- | --- | ---: |
-| ARC Standard harness | Astra XHigh | ≈ 59% |
-| Buffalo harness | Astra XHigh | ≈ 81% |
+These scores were supplied by the project owner. They are not recomputed by this
+checkout; run reports retain the measured metric, task scope and provenance.
+The EmulatorBench public-source score is separate from its official reward.
 
-**59 → 81: approximately +22 percentage points.** Buffalo improves the same
-underlying model by replacing the ARC Standard harness.
+- [ARC-AGI-3 setup and scoring](docs/evaluation.md)
+- [EmulatorBench setup, public-source verification and reports](docs/emulatorbench-evaluation.md)
+- [EvoCode integration](docs/evocode-evaluation.md), whose resident worker is also used by EmulatorBench
 
-These are reported, rounded results; their underlying score artifacts and the ARC
-Standard runner are not included in this checkout.
+Local results stay under `results/` and `.emulatorbench/runs/`, both ignored by Git.
 
-Run `buffalo eval arc-agi-3 --config /absolute/evaluation.json` to evaluate Buffalo
-on the official 25 ARC-AGI-3 environments. Its reports retain the measured scores
-and usage. LongBench v2 and Factorio integrations remain paused.
-
-See [evaluation setup and reproducibility](docs/evaluation.md).
-
-[EvoCode-Bench integration](docs/evocode-evaluation.md) runs one resident Buffalo
-root through an entire evolving project, with isolated host verification and
-Prime-style feedback. It reports an explicitly adapted protocol, separate from
-official leaderboard scores, and retains RLM/refinement evidence across rounds.
-
-## Long-horizon sessions
-
-run --mode autonomous continues until completion, a configured end-condition or
-limits. --mode goal persists the objective across continuations. --mode heartbeat
-executes scheduled turns. schedule_turn supports intervals and UTC cron.
-Turn/token/time/tool/Python/depth/concurrency limits and accounting include
-descendants; detach/resume does not reset budgets.
-
-New chats store state in the user's XDG data directory (normally
-~/.local/share/threadweave), reuse an existing workspace .threadweave store,
-or use --data. Automation retains list, status, tree, history, usage, states, input,
-attach, pause, resume, stop, fork and schedule. Explicitly restart an old daemon
-after upgrading: live processes do not reload source changes.
-
-## Tests and boundaries
+## Development
 
 ```sh
-uv run pytest -q
 uv run ruff check src tests
 uv run ruff format --check src tests
+uv run pytest -q
 uv build
-
-# Real subscription, terminal, root/children, compaction and hard restart:
-env -u OPENAI_API_KEY THREADWEAVE_LIVE_PARITY=1 \
-  THREADWEAVE_PARITY_OUTPUT=/absolute/path/to/acceptance-results \
-  uv run pytest -s tests/test_python_control_live.py
 ```
 
-Deterministic providers exist only in tests. The opt-in test uses the real provider
-and stores raw terminal output, event trajectories and a result summary. Use a new
-output directory for each acceptance run.
+Live provider, Docker and Modal tests are opt-in. The default suite uses test
+providers and does not launch a capability evaluation.
 
-Local Python/processes execute trusted code with the host user's authority: not a
-sandbox. Container command execution does not sandbox host REPLs. Artifacts may
-contain sensitive workspace content and are private by default. This is a
-single-host daemon; arbitrary-object recovery and exactly-once external effects
-are not guaranteed. [Operations/security](docs/operations.md),
-[extensions](docs/extensions.md), [Environment evaluation](docs/evaluation.md).
+Local Python and processes execute with the host user's authority. Container
+command execution does not sandbox the host REPL. Back up durable state and treat
+artifacts as private workspace data; arbitrary-object recovery and exactly-once
+external effects are not guaranteed.
+
+## Documentation
+
+- [Architecture](docs/architecture.md) and [recursive execution API](docs/adaptive-orchestration.md)
+- [Python control plane](docs/python-control-plane.md) and [workspace environment](docs/python-environment.md)
+- [Configuration, storage and security](docs/operations.md)
+- [Extensions](docs/extensions.md)

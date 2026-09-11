@@ -10,8 +10,8 @@ import sys
 
 import pytest
 
+from tests.diagnostics.runtime_upgrade import evaluate
 from threadweave.context import python_instructions
-from threadweave.evals.runtime_upgrade import evaluate
 from threadweave.kernel import Kernel
 from threadweave.models import Action, ModelResponse, Outcome, RunConfig, new_id
 from threadweave.runtime import Runtime

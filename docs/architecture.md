@@ -120,7 +120,7 @@ scope labels; local guidance can override global guidance within the session.
 Skills reference existing Python callables and their argument contracts; reusable
 subagent specifications execute through native `rlm` delegation.
 
-See [the source, deletion, and test mapping](prime-refinement-specification.md).
+See [refinement scheduling, delivery and learning criteria](refinement.md).
 
 ## L1 / L2 / L3
 

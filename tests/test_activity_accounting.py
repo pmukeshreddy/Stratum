@@ -1,4 +1,4 @@
-from threadweave.evals.activity import aggregate
+from tests.diagnostics.activity import aggregate
 
 
 def test_unknown_usage_stays_unknown_and_peaks_are_not_summed():
@@ -28,7 +28,7 @@ def test_unknown_usage_stays_unknown_and_peaks_are_not_summed():
 
 
 async def test_peak_counts_resumed_children_without_counting_completed_idle_time(tmp_path, config):
-    from threadweave.evals.activity import activity
+    from tests.diagnostics.activity import activity
     from threadweave.models import Outcome
     from threadweave.runtime import Runtime
 

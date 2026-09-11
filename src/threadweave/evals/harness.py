@@ -25,7 +25,6 @@ from .schema import NotRun, accounting, digest, save, timestamp
 class EnvironmentAction(Record):
     action: str | None = None
     data: dict = Field(default_factory=dict)
-    code: str | None = None
 
 
 class MatchedProvider:
@@ -191,7 +190,7 @@ async def run_buffalo(
     if action:
         instruction += (
             '\nInteract using await tools.acall("benchmark_action", action=..., data=...)'
-            ' for ARC or await tools.acall("benchmark_action", code=...) for Factorio.'
+            " to interact with ARC."
         )
     # Every invocation, including child/compaction/refinement calls, checks the same provider contract.
     provider = MatchedProvider(

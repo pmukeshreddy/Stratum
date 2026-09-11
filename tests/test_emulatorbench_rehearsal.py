@@ -23,6 +23,7 @@ from .test_evocode_integration import cell
 
 
 def test_public_contract_uses_exact_source_and_only_public_descriptors():
+    pytest.importorskip("emulatorbench")
     from emulatorbench.emulator_common import runners, suite_adapters
 
     for task in discover_tasks():
@@ -39,6 +40,7 @@ def test_public_contract_uses_exact_source_and_only_public_descriptors():
 
 
 async def test_rehearse_fail_unchanged_fix_pass_then_final_same_runtime(tmp_path, monkeypatch):
+    pytest.importorskip("emulatorbench")
     from emulatorbench.emulator_common import runtime as official_runtime
     from emulatorbench.emulator_common.runner_v2 import fail_closed_runner_v1_score
 

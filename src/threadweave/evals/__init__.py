@@ -1,7 +1,3 @@
-"""Official benchmark integrations retained independently of any dataset migration."""
+"""ARC-AGI-3 evaluation and shared benchmark utilities."""
 
-BENCHMARKS = {
-    "longbench-v2": "LongBench v2",
-    "arc-agi-3": "ARC-AGI-3",
-    "factorio": "Factorio",
-}
+BENCHMARKS = {"arc-agi-3": "ARC-AGI-3"}

@@ -4,14 +4,31 @@ import asyncio
 import json
 from collections import Counter
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
+from threadweave.coding_config import update_coding_options
 from threadweave.evals.harness import run_buffalo
-from threadweave.evals.root_loop_validation import validation_config
 from threadweave.file_store import FileStore
 from threadweave.gitops import git
-from threadweave.models import Action, ModelResponse, Usage
+from threadweave.models import Action, ModelResponse, RunConfig, Usage
+
+
+def validation_config():
+    config = RunConfig.model_validate_json(
+        (Path(__file__).resolve().parents[1] / "configs/coding.json").read_text()
+    )
+    config.provider.model = "gpt-6-astra"
+    config.provider.parameters = {"reasoning_effort": "xhigh"}
+    config.provider.max_output_tokens = 32768
+    config.provider.timeout_seconds = 300
+    config.limits.wall_seconds = 300
+    # Read-only audits and data tasks do not require source edits or repository test suites.
+    update_coding_options(
+        config.task, capture_baseline=False, require_tests=False, require_change=False
+    )
+    return config
 
 
 def response(text="", code=None):

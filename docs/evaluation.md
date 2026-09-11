@@ -1,101 +1,67 @@
-# ARC-AGI-3 comparison
+# ARC-AGI-3
 
-The primary comparison holds **Astra XHigh** (`gpt-6-astra`, `xhigh` reasoning) fixed:
+The project owner's reported Buffalo score is **81%** with Astra XHigh
+(`gpt-6-astra`, `xhigh`). The underlying scorecards for that reported value are
+not bundled in this checkout. Fresh runs record their own measured results.
 
-| Harness | Model | Reported score |
-| --- | --- | ---: |
-| ARC Standard harness | Astra XHigh | ≈ 59% |
-| Buffalo harness | Astra XHigh | ≈ 81% |
+## Setup and execution
 
-**59 → 81: approximately +22 percentage points.** Buffalo improves the same
-underlying model by replacing the ARC Standard harness.
-
-The rounded values were supplied by the project owner. The underlying score
-artifacts for these values are not present in this checkout. The ARC Standard
-harness is external; no implementation of that harness is bundled here.
-
-## Run Buffalo
-
-The current evaluation CLI runs **ARC-AGI-3 only**. LongBench v2 and Factorio
-integrations remain paused. No replacement dataset is configured yet.
-
-Install with `uv sync --extra dev --locked`. Authenticate the normal subscription
-provider as described in [subscription transport](subscription.md). Copy
-`configs/evaluation.example.json` outside the checkout and set the official ARC
-source, commit, Python, and environment directory. Install the
-[official ARC toolkit](https://github.com/arcprize/arc-agi) in that Python
-environment and supply its 25 official local game environments.
+Install Buffalo with `uv sync --extra dev --locked` and authenticate its normal
+subscription provider. Copy `configs/evaluation.example.json` outside the checkout
+and set the official ARC source checkout, commit, Python interpreter and environment
+directory. Install the official ARC toolkit in that interpreter and supply its
+25 official local game environments.
 
 ```sh
-# Setup only, with no inference
+# Validate setup without inference.
 uv run buffalo eval arc-agi-3 --config /absolute/evaluation.json --check
 
-# Two-game Buffalo validity check
+# Explicit two-game subset.
 uv run buffalo eval arc-agi-3 --config /absolute/evaluation.json --limit 2 \
   --games-concurrency 4 --inference-concurrency 16
 
-# Complete 25-game Buffalo run
+# Full 25-game run.
 uv run buffalo eval arc-agi-3 --config /absolute/evaluation.json \
   --games-concurrency 16 --inference-concurrency 16
 ```
 
-Each output directory must be empty. A failed setup or invalid execution reports
-its exact reason. The full run requires exactly 25 official environments. Subset
-reports are labeled. No profile selector is needed: the CLI runs Buffalo.
+Use `--output /absolute/new-directory` to choose a fresh output directory; the
+default is `results/evaluation/arc-buffalo-*`. Output directories must be empty.
+Setup failures retain their reason, and subset reports are labeled explicitly.
 
-To retain the fixed-game protocol across subset checks and the full run, add
-`--protocol-policy /absolute/policy.json` with seed zero. Use `--limit 2` for the
-small check and omit `--limit` for all 25 games. `--protocol-validation` remains an
-alias. The policy supplies `instructions`, `guidance`, `continuation_prompt`,
-`max_continuations`, `max_turns`, `max_tokens`, and `wall_seconds`. This mode exposes
-`observe`, `status`, and `act` through a local Python client, limits each game to
-500 actions and each batch to 20, and disables delegation. Every continuation
-retains the same environment, workspace, and Buffalo session. Terminal observations
-stop further inference admission. Infrastructure failures remain failed attempts
-without automatic fresh-game retries.
+## Protocol and isolation
 
-Diagnostic snapshots retain official scores and actual cumulative usage at action,
-continuation, and final boundaries. They neither impose output-token thresholds nor
-claim to reproduce a published scaling curve. The continuation counter uses
-successful root assistant responses and noncached input plus output tokens; the
-separate resource ledger includes all calls, including auxiliary inference.
+`--protocol-policy /absolute/policy.json` selects a fixed-game policy with seed
+zero; `--protocol-validation` is an alias. The policy supplies `instructions`,
+`guidance`, `continuation_prompt`, `max_continuations`, `max_turns`, `max_tokens`
+and `wall_seconds`. Use the same policy for subset and full runs.
 
-## Isolation and budgets
-
-Every game attempt owns an official worker process, Arcade/environment instance,
-scorecard, recordings, workspace, agent state, and result directory. Hashes verify
-identical initial observations across retries. Observation checks before each
-action detect changes outside that worker's action stream. The run records the
-task, lossless observation encoding, environment version, seed, model, reasoning
-level, cumulative token budget, model-call budget, tool/action budget, and wall-clock
-budget. An independently reproduced ARC Standard comparison must match these
-conditions before attributing a measured difference to the harness.
-
-At most 16 games run concurrently. A single inference gate admits every Buffalo
-root, descendant, compaction, and refinement call. Transport instability reduces
-capacity with recorded decisions. The runner never raises the configured capacity.
-
+Fixed-game mode exposes `observe`, `status` and `act` through a local Python client,
+limits each game to 500 actions and each batch to 20, and disables delegation.
+Continuations retain the same environment, workspace and session. Terminal states
+stop further inference admission. Infrastructure failures remain failed attempts.
 Outside fixed-game mode, only infrastructure-invalidated attempts can retry, up to
-three attempts total. Completed low scores are never rerun. Failed attempts retain
-their trajectories and separate usage accounting.
+three attempts total; completed low scores are never rerun.
 
-## Scoring and provenance
+Each attempt owns an official worker, Arcade instance, scorecard, recordings,
+workspace and agent state. Initial-state hashes and observation checks detect
+unintended environment changes. One inference gate admits root, descendant,
+compaction and refinement calls, with a maximum configured concurrency of 16.
 
-RHAE is computed by the official SDK: disjoint game scorecards are merged, then
-`EnvironmentScorecard.from_scorecard` produces the aggregate. Scores are never
-replaced by level counts, custom averages, or selected best attempts.
+## Scoring and artifacts
 
-Each run records the official source commit, environment file hashes, game IDs,
-starting-state hashes, resolved configuration and budgets, Buffalo source identity,
-UTC timestamps, raw official scorecards, recordings, and trajectories. Provider
-journals retain request provenance while opaque reasoning continuation is stored
-privately in Buffalo's durable state.
+The official SDK merges disjoint game scorecards and computes RHAE using
+`EnvironmentScorecard.from_scorecard`. Level counts, custom averages and selected
+best attempts do not replace the official score.
 
-Resource accounting includes input/output/total tokens, model calls, and elapsed
-time for the complete agent tree. Interrupted requests without final provider usage
-are explicitly marked as estimated. Subscription API cost is unavailable and remains
-null. Final-attempt usage, failed-attempt usage, and all-attempt totals are distinct.
-Profile elapsed time and summed game durations are both retained.
+Run reports retain source commits, environment hashes, game IDs, seed, starting
+states, model/reasoning configuration, budgets, timestamps, raw official scorecards,
+recordings and trajectories. Diagnostic snapshots preserve scores and cumulative
+usage at action, continuation and final boundaries.
 
-Large run directories are local and ignored by Git. GitHub Actions runs engineering
-checks only; it never runs capability benchmarks or inference.
+Accounting separates final-attempt, failed-attempt and total usage. It includes
+root, descendant and auxiliary calls, input/output tokens and elapsed time.
+Interrupted calls with incomplete provider usage are marked as estimated.
+Subscription API cost remains null. Local run directories are ignored by Git.
+
+See [EmulatorBench](emulatorbench-evaluation.md) for the other reported benchmark.

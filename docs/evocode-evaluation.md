@@ -4,12 +4,7 @@ This is **EvoCode-Bench + Prime-style autonomous feedback**, an adapted interact
 protocol. Its scores are not official EvoCode leaderboard scores. The dataset's
 instructions, reference solutions, cumulative tests and reward files remain unchanged.
 
-## Source and lifecycle mapping
-
-Inspected supplied `prime-agent-main`: `core/autonomous.ts`, `core/agent-session.ts`,
-`core/settings-manager.ts`, `core/prompts/rlm.ts`, `core/refinement/refinement.ts`,
-the refine skill and Python wrapper, and `prime-agent-runtime/src/rlm/`.
-Source hashes are recorded alongside the integration's upstream pins.
+## Lifecycle and isolation
 
 Upstream Harbor 0.22.0, commit `191d1b989bbba1d77c2db23e17aec308d7c08046`, uses
 `MultiStepTrial._run_step`, `_run_agent_phase`, `BaseAgent.setup/run/resume`, and
@@ -142,29 +137,6 @@ inside each original task image adds isolated Python 3.12.12, uv 0.11.8 and Node
 22.16.0 under `/opt/buffalo-evaluation`, outside the project. Task PATH entries are
 retained. No project packages or reference solutions are installed by the adapter.
 
-Full evaluation requires a separate user instruction.
-
-## Validation performed
-
-Implementation preceded testing. The focused integration run passed 15 tests;
-the existing Buffalo regression suite ran once: 754 passed, 8 skipped. Final
-failure-export/scoring/cleanup fixes passed three targeted checks. Ruff and
-`git diff --check` passed. The official dataset validator accepted all 26 tasks
-and 227 steps.
-
-The released-task Docker smoke passed on 2026-09-10 (278.41 seconds). An initial
-Python bootstrap failure was corrected before this successful run. Across two
-rounds it recorded the same root `88ca9de12245499196c95a3c6f35c5dc`, kernel PID
-127, workspace inode 33593438 and runtime identity. A REPL value of 937 survived;
-the refinement counter progressed from 5 to 10. Each round ran four real
-cumulative verifiers and delivered three bounded ordinary-user failure messages.
-Harbor resolved the round deadline to 1,800 seconds and verifier timeout to 600
-seconds; those values appear in the manifest. Task input hashes were unchanged.
-No smoke-owned containers or snapshot images remained after cleanup.
-
-The scripted smoke intentionally performed no project implementation and earned
-zero round rewards. It establishes execution-path behavior, not RLM/refinement
-uptake or self-improvement by a live model. The native integration fixtures cover
-recursive child admission/messages/artifacts, applied local refinement, later
-state visibility, 25-turn review and refinement barriers. No full evaluation has
-been launched. Local logs and audits are under `results/evocode-validation/`.
+Source and API hashes are recorded in `src/threadweave/evals/evocode_sources.json`
+and checked at setup. EmulatorBench reuses `evocode_worker.PersistentWorker` and
+the resident RPC transport; these modules are shared evaluation infrastructure.

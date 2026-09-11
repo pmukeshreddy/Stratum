@@ -8,8 +8,8 @@ import pytest
 
 from threadweave.evals.bridge import OfficialWorker
 from threadweave.evals.harness import MatchedProvider, discard, run_buffalo
-from threadweave.evals.official_worker import Official, check_docker
-from threadweave.evals.runner import contract, resolve
+from threadweave.evals.official_worker import Official
+from threadweave.evals.runner import contract, load, resolve
 from threadweave.evals.schema import (
     BenchmarkSetup,
     EvaluationConfig,
@@ -312,48 +312,38 @@ def test_arc_uses_official_scorecard_percent_without_recomputing():
     assert worker.finish_profile()["primary_score"] == 31.25
 
 
-def test_factorio_research_uses_authoritative_environment_state():
-    state = SimpleNamespace(
-        technologies={
-            "a": SimpleNamespace(researched=True),
-            "b": SimpleNamespace(researched=False),
-        },
-        current_research="b",
-        research_progress=0.4,
+@pytest.mark.parametrize("benchmark", ["longbench-v2", "factorio"])
+def test_removed_benchmarks_fail_before_environment_setup(tmp_path, benchmark):
+    manifest = tmp_path / "evaluation.json"
+    manifest.write_text(json.dumps({"run": {}, "benchmarks": {benchmark: {}}}))
+    with pytest.raises(NotRun, match="Unsupported benchmark configuration"):
+        load(manifest)
+    with pytest.raises(ValueError, match="Unsupported benchmark"):
+        Official().prepare(benchmark, BenchmarkSetup().model_dump(mode="json"), tmp_path)
+
+
+def test_arc_manifest_resolves_environment_paths_relative_to_config(tmp_path):
+    manifest = tmp_path / "evaluation.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "run": {},
+                "benchmarks": {
+                    "arc-agi-3": {
+                        "source": "official",
+                        "python": "venv/bin/python",
+                        "options": {"environments_dir": "games"},
+                    }
+                },
+            }
+        )
     )
-    # Real FLE types are dataclasses. A local dataclass verifies our boundary without a game substitute.
-    from dataclasses import make_dataclass
-
-    Research = make_dataclass("Research", ["technologies", "current_research", "research_progress"])
-    state = Research(state.technologies, state.current_research, state.research_progress)
-    worker = Official()
-    worker.instance = SimpleNamespace(
-        first_namespace=SimpleNamespace(_save_research_state=lambda: state)
-    )
-    assert worker.research()["technologies_completed"] == 1
-    assert worker.research()["current_research_progress_pct"] == 40
-
-
-def test_factorio_disconnected_docker_with_zero_exit_is_not_available(monkeypatch):
-    monkeypatch.setattr("threadweave.evals.official_worker.shutil.which", lambda _: "/docker")
-    monkeypatch.setattr(
-        "threadweave.evals.official_worker.subprocess.run",
-        lambda *a, **kw: SimpleNamespace(
-            returncode=0, stdout="", stderr="Cannot connect to Docker daemon"
-        ),
-    )
-    with pytest.raises(ValueError, match="Docker daemon unavailable: Cannot connect"):
-        check_docker()
-
-
-def test_factorio_changed_starting_save_is_rejected_before_server_mutation(tmp_path):
-    worker = Official()
-    worker.benchmark = "factorio"
-    worker.world = tmp_path / "save.zip"
-    worker.world.write_bytes(b"changed bytes")
-    worker.provenance = {"dataset_environment_version": {"world_sha256": "original hash"}}
-    with pytest.raises(ValueError, match="starting world changed"):
-        worker.start_task("world")
+    config, error = load(manifest)
+    assert error is None
+    setup = config.benchmarks["arc-agi-3"]
+    assert setup.source == (tmp_path / "official").resolve()
+    assert setup.python == str(tmp_path / "venv/bin/python")
+    assert setup.options["environments_dir"] == str((tmp_path / "games").resolve())
 
 
 def test_comparison_contract_changes_when_any_required_setting_changes():

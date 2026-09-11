@@ -58,16 +58,15 @@ def load(path):
     if unknown:
         raise NotRun(f"Unsupported benchmark configuration: {sorted(unknown)}")
     for setup in config.benchmarks.values():
-        for field in ("source", "dataset"):
-            value = getattr(setup, field)
-            if value and not value.is_absolute():
-                setattr(setup, field, (path.resolve().parent / value).resolve())
+        if setup.source and not setup.source.is_absolute():
+            setup.source = (path.resolve().parent / setup.source).resolve()
         if "/" in setup.python and not Path(setup.python).is_absolute():
             setup.python = str((path.resolve().parent / setup.python).absolute())
-        for field in ("world_save", "environments_dir"):
-            value = setup.options.get(field)
-            if value and not Path(value).is_absolute():
-                setup.options[field] = str((path.resolve().parent / value).resolve())
+        environments = setup.options.get("environments_dir")
+        if environments and not Path(environments).is_absolute():
+            setup.options["environments_dir"] = str(
+                (path.resolve().parent / environments).resolve()
+            )
     return config, None
 
 

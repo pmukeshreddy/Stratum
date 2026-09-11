@@ -44,7 +44,6 @@ class OfficialWorker:
                         "TMPDIR",
                         "SYSTEMROOT",
                         "ARC_API_KEY",
-                        "FACTORIO_RCON_PASSWORD",
                     }
                 },
             )

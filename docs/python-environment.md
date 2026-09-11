@@ -11,10 +11,6 @@ The persistent worker sends both synchronous `tools.call` and asynchronous
 `tests.run` are synchronous Python convenience methods; `edit`, `rlm` and MCP
 use asynchronous host RPC. Their origin does not exempt them from Environment.
 
-Previously, `context.from_python` bypassed external-effect observation. The
-watched-action list also omitted `ipython`. Finally, the generic `host_request`
-envelope hid the effective capability's permission/policy identity from hooks.
-
 The registry now resolves a host operation (such as `edit`, `rlm.run`, or
 `mcp.call`) before admission. Standard permission, read-only, feature and explicit
 tool-allowlist checks apply, followed by operation-specific ownership, path,
@@ -107,7 +103,7 @@ misclassified as agent source edits.
   Non-UTF-8 Git path output fails observation rather than being silently decoded
   to a different path. Missing repositories or lost access are reported failures.
 
-## Validation and measured overhead
+## Validation
 
 `tests/test_python_environment.py` exercises real Git repositories, persistent
 workers, a local MCP server, subprocesses, kernel termination and abrupt daemon

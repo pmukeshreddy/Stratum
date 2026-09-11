@@ -139,7 +139,7 @@ scope labels; local guidance can override global guidance within the session.
 Skills reference existing Python callables and their argument contracts; reusable
 subagent specifications execute through native `rlm` delegation.
 
-See [the source, deletion, and test mapping](prime-refinement-specification.md).
+See [refinement scheduling, delivery and learning criteria](refinement.md).
 
 Installed skills remain ordinary Python modules. Read SKILL.md and invoke the
 documented callable directly; `skills.list()` and `skills.load(name)` provide
@@ -210,17 +210,7 @@ completion subject to configured task gates. Heartbeat text yields without
 destroying the recurring session. Waiting for all children is an explicit
 `task.wait_for_children` gate, not the default.
 
-## Deliberate boundaries and remaining differences
-
-The completed-child follow-up and interactive `/refine` fixes are behavioral bugs,
-not reasons to change other policies. Model-controlled BM25 history search,
-ripgrep/Python repository search and arbitrary Python processing are retained.
-Refinement defaults, global-state write permissions, context sizing, checkpoint
-limits and run budgets are Threadweave implementation choices and are unchanged.
-An unspecified paper detail is not evidence that these choices are defects.
-
-This is a source-traced implementation of the default Python control plane, not
-byte-for-byte API equivalence to every reference extension. Important limits:
+## Runtime boundaries
 
 - Python executes trusted host code. Tool path/permission checks are not a Python
   sandbox. Shell processes use the configured environment allowlist, not arbitrary

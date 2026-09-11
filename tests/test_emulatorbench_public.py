@@ -20,6 +20,7 @@ from .test_evocode_integration import cell
 async def test_public_source_same_root_continuation_preserves_both_scores(
     tmp_path, monkeypatch, broken
 ):
+    pytest.importorskip("emulatorbench")
     from emulatorbench.emulator_common import runtime as official_runtime
     from emulatorbench.emulator_common.runner_v2 import fail_closed_runner_v1_score
 
@@ -93,6 +94,7 @@ async def test_public_source_same_root_continuation_preserves_both_scores(
 
 
 def test_public_feedback_omits_expected_states():
+    pytest.importorskip("emulatorbench")
     score = {
         "build": {"cargo_build": {"ok": False, "stderr": "compilation failed"}},
         "case_runs": [
@@ -121,7 +123,7 @@ def test_public_configuration_preserves_experiment_and_native_mechanisms():
 def test_runtime_patch_is_exact_idempotent_and_does_not_change_shared_files(tmp_path, monkeypatch):
     import os
 
-    import verifiers
+    verifiers = pytest.importorskip("verifiers")
 
     from threadweave.evals.emulatorbench import pins
     from threadweave.evals.emulatorbench_setup import apply_runtime_patches
@@ -130,7 +132,10 @@ def test_runtime_patch_is_exact_idempotent_and_does_not_change_shared_files(tmp_
     package = tmp_path / "verifiers"
     destination = package / "v1/runtimes/modal.py"
     destination.parent.mkdir(parents=True)
-    original = Path(".emulatorbench/sources/verifiers/verifiers/v1/runtimes/modal.py").read_bytes()
+    source = Path(".emulatorbench/sources/verifiers/verifiers/v1/runtimes/modal.py")
+    if not source.is_file():
+        pytest.skip("requires the pinned Verifiers source checkout")
+    original = source.read_bytes()
     shared = tmp_path / "shared-original.py"
     shared.write_bytes(original)
     os.link(shared, destination)
@@ -143,7 +148,8 @@ def test_runtime_patch_is_exact_idempotent_and_does_not_change_shared_files(tmp_
 
 @pytest.mark.parametrize("network", [False, True])
 async def test_patched_official_modal_runtime_preserves_network_policy(monkeypatch, network):
-    import modal
+    modal = pytest.importorskip("modal")
+    pytest.importorskip("verifiers")
     from verifiers.v1.runtimes import ModalConfig
     from verifiers.v1.runtimes.modal import ModalRuntime
 
