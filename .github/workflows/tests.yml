@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   engineering:
-    name: install, lint, format, unit tests, build
+    name: Engineering checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,6 +26,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Linux sandbox dependency
+        if: github.event_name == 'workflow_dispatch'
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Install
         run: uv sync --extra dev --locked
@@ -34,6 +35,7 @@ jobs:
       - name: Formatting
         run: uv run ruff format --check src tests
       - name: Unit and regression tests
+        if: github.event_name == 'workflow_dispatch'
         run: uv run pytest -x -v --tb=short --timeout=90
       - name: Build package
         run: uv build

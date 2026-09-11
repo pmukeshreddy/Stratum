@@ -129,3 +129,5 @@ uv build
 
 The default suite uses test providers. Live model and external-runtime checks have
 separate prerequisites or explicit opt-ins.
+Pushes run lint, formatting, and package builds. Tests run only when the GitHub
+Actions workflow is triggered manually.
