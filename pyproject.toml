@@ -56,6 +56,7 @@ semantic = [
 threadweave = "threadweave.cli:main"
 buffalo = "threadweave.cli:main"
 buffalo-evocode = "threadweave.evals.evocode:main"
+buffalo-emulatorbench = "threadweave.evals.emulatorbench:main"
 
 [tool.hatch.metadata]
 allow-direct-references = true

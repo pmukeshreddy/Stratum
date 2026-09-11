@@ -171,12 +171,13 @@ class AutonomousCycle:
         usage = response.usage
         self.tokens += max(0, usage.input_tokens - usage.cached_input_tokens) + usage.output_tokens
 
-    def limit_reason(self):
+    def limit_reason(self, *, now=None):
+        now = time.monotonic() if now is None else now
         for exhausted, reason in (
             (self.continuations >= self.policy.max_continuations, "maxContinuations"),
             (self.turns >= self.policy.max_turns, "maxTurns"),
             (self.tokens >= self.policy.max_tokens, "maxTokens"),
-            (time.monotonic() - self.started >= self.policy.timeout_seconds, "timeoutMs"),
+            (now - self.started >= self.policy.timeout_seconds, "timeoutMs"),
         ):
             if exhausted:
                 return reason
@@ -189,6 +190,10 @@ class AutonomousCycle:
         snapshot: Callable[[], Awaitable[dict | None]],
         run_gate: Callable[[str, float], Awaitable[GateResult]],
     ) -> str | None:
+        # Prime captures `now` on entering nextAutonomousContinuation, before
+        # running the quality gate. A slow gate must not retroactively withdraw
+        # a continuation that was within its wall budget at this boundary.
+        boundary_time = time.monotonic()
         if not self.policy.enabled or stop_reason in {"error", "aborted"}:
             self.stop_reason = stop_reason or "disabled"
             return None
@@ -219,7 +224,9 @@ class AutonomousCycle:
             self.last_failure = {"command": command, "attempt": attempt, **asdict(result)}
             self.last_snapshot = current
             self.stop_reason = (
-                "retry_exhausted" if attempt > self.policy.max_retries else self.limit_reason()
+                "retry_exhausted"
+                if attempt > self.policy.max_retries
+                else self.limit_reason(now=boundary_time)
             )
             if self.stop_reason:
                 return None
@@ -229,7 +236,7 @@ class AutonomousCycle:
             self.last_failure = self.last_snapshot = None
             self.stop_reason = "passed"
             return None
-        self.stop_reason = self.limit_reason()
+        self.stop_reason = self.limit_reason(now=boundary_time)
         if self.stop_reason:
             return None
         self.continuations += 1

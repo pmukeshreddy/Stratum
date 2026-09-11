@@ -1,0 +1,11 @@
+--- a/verifiers/v1/runtimes/modal.py
++++ b/verifiers/v1/runtimes/modal.py
+@@ -105,7 +105,7 @@
+                     region=self.config.region,
+                     block_network=not self.config.network_access,
+                     timeout=int(self.config.timeout),
+-                    encrypted_ports=[SERVICE_PORT],
++                    encrypted_ports=[SERVICE_PORT] if self.config.network_access else [],
+                 )
+             self.info.id = self._sandbox.object_id
+             logger.info(

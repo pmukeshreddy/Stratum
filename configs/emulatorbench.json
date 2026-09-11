@@ -1,0 +1,76 @@
+{
+  "task_concurrency": 1,
+  "controller_directory": ".emulatorbench/controller",
+  "runtime": {
+    "type": "modal",
+    "network_access": true
+  },
+  "autonomous": {
+    "enabled": true,
+    "max_continuations": 3,
+    "max_turns": 12,
+    "max_tokens": 80000,
+    "timeout_seconds": 1800,
+    "max_retries": 3,
+    "gate_timeout_seconds": 300
+  },
+  "run": {
+    "provider": {
+      "name": "codex_subscription",
+      "model": "gpt-6-astra",
+      "parameters": {
+        "reasoning_effort": "xhigh"
+      },
+      "streaming": true,
+      "max_output_tokens": 8192,
+      "timeout_seconds": 900
+    },
+    "task": {
+      "adapter": "workspace",
+      "verifier": "none"
+    },
+    "control_plane": "python",
+    "serialized_refine": true,
+    "permissions": [
+      "workspace.read",
+      "workspace.write",
+      "python",
+      "process",
+      "agents",
+      "state"
+    ],
+    "execution": {
+      "backend": "local",
+      "environment_allowlist": [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "CARGO_HOME",
+        "RUSTUP_HOME"
+      ],
+      "environment": {
+        "CARGO_HOME": "/usr/local/cargo",
+        "RUSTUP_HOME": "/usr/local/rustup"
+      }
+    },
+    "context": {
+      "max_tokens": 96000,
+      "summary_chars": 6000,
+      "result_chars": 131072
+    },
+    "limits": {
+      "max_turns": 1000,
+      "token_budget": 8000000,
+      "wall_seconds": 27000,
+      "concurrency": 4,
+      "max_subagents": 30,
+      "max_depth": 3,
+      "max_model_calls": 1000,
+      "max_python_executions": 1000,
+      "max_tool_calls": 5000,
+      "tool_timeout_seconds": 600,
+      "python_timeout_seconds": 600
+    }
+  }
+}
