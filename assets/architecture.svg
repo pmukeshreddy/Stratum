@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="810" viewBox="0 0 1200 810" role="img" aria-labelledby="title desc">
+  <title id="title">Buffalo architecture</title>
+  <desc id="desc">The Agents View and CLI connect to a daemon that manages root and recursive child sessions. Each session has model context and a persistent IPython kernel. Sessions act through a shared Environment. The daemon connects to model providers, durable disk state, and a continual harness for learned prompt notes, memories, skills, and subagent specifications.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#64748b" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #17253b; }
+      .label { font-size: 14px; font-weight: 700; letter-spacing: 2px; fill: #52637c; }
+      .title { font-size: 23px; font-weight: 650; }
+      .body { font-size: 18px; fill: #455570; }
+      .small { font-size: 15px; fill: #52637c; }
+      .edge { fill: none; stroke: #64748b; stroke-width: 2; stroke-linejoin: round; marker-end: url(#arrow); }
+      .both { marker-start: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1200" height="810" rx="20" fill="#f7f9fc"/>
+  <text x="44" y="45" class="label" style="fill:#087e80">BUFFALO</text>
+  <text x="44" y="85" font-size="32" font-weight="700">Persistent, recursive execution</text>
+  <text x="44" y="116" class="body">One runtime. Independent sessions. Retained working state.</text>
+  <rect x="837" y="34" width="319" height="93" rx="14" fill="#fff" stroke="#ccd6e3"/>
+  <text x="859" y="69" class="title">Agents View + CLI</text>
+  <text x="859" y="99" class="small">Prompts · streaming · interventions</text>
+  <path d="M 997 132 L 997 168" class="edge both"/>
+
+  <rect x="28" y="176" width="1144" height="355" rx="20" fill="#edf2fa" stroke="#cad5e6"/>
+  <text x="56" y="211" class="label">DAEMON / RUNTIME</text>
+  <text x="400" y="211" class="body">Scheduling · budgets · permissions · session lifecycle</text>
+
+  <rect x="64" y="253" width="326" height="184" rx="14" fill="#fff" stroke="#9cb5da"/>
+  <rect x="64" y="253" width="6" height="184" rx="3" fill="#477ac2"/>
+  <text x="88" y="290" class="title">Root session</text>
+  <text x="88" y="326" class="body">L1 · active model context</text>
+  <text x="88" y="355" class="body">L2 · persistent IPython</text>
+  <text x="88" y="408" class="small">Reason → act → observe → continue</text>
+
+  <rect x="456" y="253" width="326" height="184" rx="14" fill="#fff" stroke="#9cb5da"/>
+  <rect x="456" y="253" width="6" height="184" rx="3" fill="#477ac2"/>
+  <text x="480" y="290" class="title">Recursive child sessions</text>
+  <text x="480" y="326" class="body">Own context + IPython kernel</text>
+  <text x="480" y="355" class="body">Stable handles + message queues</text>
+  <text x="480" y="408" class="small">Children can create children</text>
+  <path d="M 398 333 L 448 333" class="edge both"/>
+  <text x="423" y="314" text-anchor="middle" class="small">rlm()</text>
+  <text x="423" y="359" text-anchor="middle" font-size="12" fill="#52637c">messages</text>
+
+  <rect x="848" y="253" width="288" height="184" rx="14" fill="#e5f5f1" stroke="#94c8bc"/>
+  <text x="871" y="290" class="title">Environment</text>
+  <text x="871" y="326" class="body">Files · shell · Git · code index</text>
+  <text x="871" y="355" class="body">Tools · skills · MCP</text>
+  <text x="871" y="384" class="body">Tests · builds · verifiers</text>
+  <text x="871" y="413" class="small">Adapter-selected capabilities</text>
+  <path d="M 227 445 L 227 480 L 992 480 L 992 445" class="edge both"/>
+  <path d="M 619 445 L 619 480" fill="none" stroke="#64748b" stroke-width="2" marker-start="url(#arrow)"/>
+  <circle cx="619" cy="480" r="4" fill="#64748b"/>
+  <text x="620" y="511" text-anchor="middle" class="small">Sessions use the Environment; observations return to the session</text>
+
+  <path d="M 206 537 L 206 594" class="edge both"/>
+  <path d="M 600 537 L 600 594" class="edge both"/>
+  <path d="M 994 537 L 994 594" class="edge both"/>
+  <rect x="149" y="554" width="114" height="23" fill="#f7f9fc"/>
+  <text x="206" y="571" text-anchor="middle" class="small">model calls</text>
+  <rect x="529" y="554" width="142" height="23" fill="#f7f9fc"/>
+  <text x="600" y="571" text-anchor="middle" class="small">persist / recover</text>
+  <rect x="895" y="554" width="198" height="23" fill="#f7f9fc"/>
+  <text x="994" y="571" text-anchor="middle" class="small">review → plan → apply</text>
+
+  <rect x="28" y="602" width="356" height="151" rx="14" fill="#fff" stroke="#ccd6e3"/>
+  <text x="52" y="639" class="title">Model providers</text>
+  <text x="52" y="674" class="body">Codex subscription / configured API</text>
+  <text x="52" y="703" class="body">Fixed or role-based routing</text>
+  <text x="52" y="732" class="small">Accounted root, child and auxiliary calls</text>
+
+  <rect x="422" y="602" width="356" height="151" rx="14" fill="#fff" stroke="#ccd6e3"/>
+  <text x="446" y="639" class="title">Durable state · L3</text>
+  <text x="446" y="674" class="body">History · artifacts · checkpoints</text>
+  <text x="446" y="703" class="body">Messages · goals · usage</text>
+  <text x="446" y="732" class="small">JSON / JSONL records + snapshot files</text>
+
+  <rect x="816" y="602" width="356" height="151" rx="14" fill="#fff4e2" stroke="#e1c18a"/>
+  <text x="840" y="639" class="title">Continual harness</text>
+  <text x="840" y="674" class="body">Prompt notes · memories</text>
+  <text x="840" y="703" class="body">Skills · subagent specifications</text>
+  <text x="840" y="732" class="small">Local / global state · safe-boundary edits</text>
+  <text x="600" y="787" text-anchor="middle" class="small">Compaction reduces L1; kernels, checkpoints and durable history retain recoverable state.</text>
+</svg>

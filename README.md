@@ -1,108 +1,122 @@
-# Threadweave / Buffalo
+# Buffalo
 
-Buffalo is a persistent recursive agent harness. Its interactive Agents View
-attaches to a daemon-owned root session. The model uses IPython for computation,
-workspace tools, recursive children and messaging. Each session keeps its own
-context, Python kernel, history and reusable learned state.
+**A persistent agent harness built around Python, recursive agents, and reusable working state.**
 
-## Get started
+Buffalo gives a model a long-lived IPython environment for computation, tools, and
+agent coordination. A background daemon manages execution; you can steer work,
+detach, and return to the same session. The Python package is `threadweave`;
+`buffalo` and `threadweave` launch the same CLI.
 
-Requires Python 3.11+, uv and Node.js 22.8+. Node runs the harness formatters and
-JSON serialization. EmulatorBench and EvoCode setup use Python 3.12.
+## Architecture
+
+![Buffalo architecture: daemon-managed root and recursive sessions, shared environment, model providers, durable state, and continual harness](assets/architecture.svg)
+
+The root delegates through `rlm()` while continuing its own work. Children have
+independent contexts and kernels and can recurse within shared resource limits.
+
+**L1** holds active model context, **L2** persistent Python state, and **L3** durable
+history and artifacts. Compaction reduces L1; checkpoints and reconstruction recipes
+support recovery after kernel restarts.
+
+## Features
+
+| Capability | What it provides |
+| --- | --- |
+| **Persistent Python** | Variables, functions, task data, and agent handles survive across turns. Large results can remain outside the model prompt. |
+| **Recursive agents** | Concurrent child sessions, parent/child/sibling messaging, follow-up work on existing children, and configurable depth and concurrency. |
+| **Continual harness** | Local and global prompt notes, memories, Python skills, and subagent specifications; explicit refinement, automatic review, version history, and rollback. |
+| **Coding environment** | Repository search, multilingual syntax indexes, symbol and reference queries, validated edits, Git checkpoints, and isolated candidate workspaces. |
+| **Verification and experiments** | Targeted tests, build/lint/type checks, completion gates, profiling, repeated benchmarks, and recorded experiment comparisons. |
+| **Session control** | Streaming chat, interventions, pause/resume, detach/reattach, session forks, persistent goals, and interval or cron scheduling. |
+| **Extensibility** | Task adapters, capability providers, importable Python skills, MCP over stdio or HTTP, and explicit model/role routing. |
+| **Inspectable execution** | Searchable history, optional semantic retrieval, artifacts, provenance, and resource accounting across root, child, and auxiliary calls. |
+
+Automatic refinement reviews root activity every 25 assistant turns and at compaction,
+with a configurable cooldown. It can decline changes; accepted edits must identify
+reusable behavioral value and apply at safe turn boundaries.
+
+## Quick start
+
+Requires **Python 3.11+**, **uv**, and **Node.js 22.8+**. The default subscription
+provider also needs the Codex CLI and its shared ChatGPT login. Building the pinned
+inference bridge for the first time requires Git and Rust/Cargo.
 
 ```sh
+git clone https://github.com/pmukeshreddy/project-buffalo.git
+cd project-buffalo
 uv sync --extra dev --locked
+
 uv run buffalo auth status
-# If the shared Codex ChatGPT login is absent:
-uv run buffalo auth login
+uv run buffalo auth login           # If you are not already signed in
+uv run buffalo auth install-client  # One-time inference bridge build
 uv run buffalo doctor --config configs/session.json
 uv run buffalo
 ```
 
-The default uses the current workspace and `configs/session.json` when available.
-Use `--workspace` or `--config` to override them; coding-specific tools use
-`--config configs/coding.json`. The normal provider reuses the shared Codex login.
-`auth models` lists available models. Set `provider.model` and
-`provider.parameters.reasoning_effort` in your configuration.
+`buffalo auth models` lists available models. Subscription mode needs no API key;
+the `chat` provider supports separately configured chat-completion APIs.
 
-```text
-> Inspect this project and fix the failing tests.
-> /tree
-> /usage
-> /compact
-> /exit
+| Configuration | Use |
+| --- | --- |
+| [`configs/session.json`](configs/session.json) | General workspace sessions with Python, processes, agents, and MCP. |
+| [`configs/coding.json`](configs/coding.json) | Coding workflows with baseline capture, test protection, and verification. |
+| [`configs/kernel.json`](configs/kernel.json) | Performance work with correctness gates and repeated measurements. |
+
+Use `--config` to select a profile. [Configuration models](src/threadweave/models.py)
+define provider settings, reasoning effort, tool permissions, and resource limits.
+
+## Working with Buffalo
+
+```sh
+# Open a coding session in your repository
+uv run buffalo --workspace /path/to/repo --config configs/coding.json
+
+# Return to the latest session in the current workspace
+uv run buffalo --continue
 ```
 
-`/help` lists commands. Enter sends; Alt-Enter/Ctrl-J inserts a newline. Input stays
-available during work. Ctrl-C pauses the turn; Ctrl-D and `/exit` detach.
-`buffalo --continue` reattaches to the most recent root in this workspace;
-`--resume SESSION_ID` chooses a session. Attachment preserves its mode and budgets.
+Use `/tree`, `/usage`, `/state`, and `/states` to inspect work; `/refine` and
+`/compact` manage learned state and active context. `/exit` detaches; `/help` lists
+all controls. `buffalo run` supports autonomous, goal, and heartbeat modes.
 
-## Runtime
-
-```text
-Human ↔ Agents View ↔ Root session ↔ Environment
-                          ↕ rlm / messages
-                     Recursive children
-                          ↕
-                 Daemon / continual harness
-
-L1: selected model context
-L2: persistent Python state and recursive sessions
-L3: disk-backed history, artifacts and learned state
-```
-
-The model chooses actions through the same persistent Python environment:
+Inside the model's persistent Python environment, orchestration looks like:
 
 ```python
 files = list(workspace.rglob("*.py"))
-child = await rlm("Inspect persistence and report concrete defects.", name="reviewer")
-result = await bash("uv run pytest -q")
-await agent_message.send("Include recovery edge cases.", receiver_role="child", receiver_name="reviewer")
+reviewer = await rlm("Review persistence and report concrete defects.", name="reviewer")
+# The handle returns at admission, so local work can continue.
+result = await bash("git status --short")
+await agents.followup(reviewer, "Also inspect recovery after interruption.")
 ```
 
-`rlm()` returns a stable handle after admission; the parent can keep working while
-the child runs. Children have independent contexts and kernels and can delegate
-within shared limits. Follow-up work can resume the same child session.
-
-Compaction reduces active model context while retaining history and recoverable
-Python state. Unsupported Python objects need reconstruction recipes. The
-continual harness stores prompt notes, memories, skills and subagent specifications.
-Explicit `await refine.run()` and automatic review apply learned changes at safe
-turn boundaries.
-
-`run --mode autonomous` continues within configured limits; `--mode goal` retains
-an objective and `--mode heartbeat` schedules turns. Turn, token, time, tool, depth
-and concurrency limits account for descendants. Detach/resume does not reset them.
-
-New chats use the XDG data directory (normally `~/.local/share/threadweave`), an
-existing workspace `.threadweave` store, or explicit `--data`. Runtime records use
-JSON/JSONL. Existing SQLite stores are imported once with the original preserved.
-Restart an old daemon after upgrading its code.
+State uses JSON/JSONL plus artifact and checkpoint files. Chat uses the XDG data
+directory, an existing workspace `.threadweave` store, or `--data`. Local Python
+and shell commands execute with the host user's authority, not in a sandbox.
 
 ## Evaluation
 
-| Benchmark | Buffalo reported score |
+| Benchmark | Reported Buffalo score |
 | --- | ---: |
-| ARC-AGI-3 | 81 |
-| EmulatorBench | 25 |
+| **ARC-AGI-3** | **81** |
+| **EmulatorBench** | **25** |
 
-These scores were supplied by the project owner. They are not recomputed by this
-checkout; run reports retain the measured metric, task scope and provenance.
-The EmulatorBench public-source score is separate from its official reward.
+These are project-owner-reported results. Run artifacts establish the measured metric,
+task selection, model settings, and provenance. EmulatorBench's public-source score
+is recorded separately from its official trusted reward.
 
-Evaluation entry points:
+The [evaluators](src/threadweave/evals) support ARC-AGI-3, EmulatorBench, and EvoCode.
+Install their pinned dependencies and official task assets before running:
 
 ```sh
-buffalo eval arc-agi-3 --config /path/to/evaluation.json
-buffalo-emulatorbench run --config configs/emulatorbench-public.json --output .emulatorbench/runs/new-run
+uv run buffalo eval arc-agi-3 --config /path/to/evaluation.json
+uv run buffalo-emulatorbench preflight --config configs/emulatorbench-public.json
+uv run buffalo-emulatorbench run --config configs/emulatorbench-public.json \
+  --output .emulatorbench/runs/new-run
 ```
 
-Configure the official sources and environments before running. Example configs
-live in `configs/`; pinned upstream dependencies and the setup helper live in
-`src/threadweave/evals/`. EmulatorBench shares the resident EvoCode worker.
-
-Local results stay under `results/` and `.emulatorbench/runs/`, both ignored by Git.
+EmulatorBench/EvoCode hosts use Python 3.12. See [`configs/`](configs) and the
+[EmulatorBench setup helper](src/threadweave/evals/emulatorbench_setup.py).
+Local results in `results/` and `.emulatorbench/runs/` are ignored by Git.
 
 ## Development
 
@@ -113,10 +127,5 @@ uv run pytest -q
 uv build
 ```
 
-Live provider, Docker and Modal tests are opt-in. The default suite uses test
-providers and does not launch a capability evaluation.
-
-Local Python and processes execute with the host user's authority. Container
-command execution does not sandbox the host REPL. Back up durable state and treat
-artifacts as private workspace data; arbitrary-object recovery and exactly-once
-external effects are not guaranteed.
+The default suite uses test providers. Live model and external-runtime checks have
+separate prerequisites or explicit opt-ins.
