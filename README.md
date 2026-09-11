@@ -1,4 +1,4 @@
-# Buffalo
+# Stratum
 
 **A persistent agent harness built around Python, recursive agents, and reusable working state.**
 
